@@ -25,7 +25,9 @@ use tokio::sync::{
 };
 
 use crate::config::Auth;
-use crate::terminal::{EventHandler, Listener, Session, SessionEvent, Shared, TermSize};
+use crate::terminal::{
+    feed_program_output, EventHandler, Listener, Session, SessionEvent, Shared, TermSize,
+};
 
 use known_hosts::{default_known_hosts_path, HostKeyVerifier};
 
@@ -237,6 +239,15 @@ pub fn connect_remote_with_cancel(
                 let _ = tx.send(ConnectResult::Failed(format!("申请 PTY 失败：{e}")));
                 return;
             }
+            // COLORTERM=truecolor：omp 的颜色档位只认该变量（`getColorMode`
+            // 实证，`TERM=xterm-256color` 只判 256 色）；sshd 默认不透传该
+            // 变量，`AcceptEnv` 未放行时 set_env 失败也不阻塞建连（want_reply
+            // 取 false，失败静默忽略）。
+            let _ = cancellable_connect(
+                &thread_cancel,
+                channel.set_env(false, "COLORTERM", "truecolor"),
+            )
+            .await;
             if let Err(e) = cancellable_connect(&thread_cancel, channel.request_shell(true)).await {
                 if e == CONNECT_CANCELLED {
                     return;
@@ -252,7 +263,10 @@ pub fn connect_remote_with_cancel(
             // ============ 3. 创建终端状态机 ============
             let shared = Arc::new(Shared::default());
             let term: Arc<FairMutex<Term<Listener>>> = Arc::new(FairMutex::new(Term::new(
-                term::Config::default(),
+                term::Config {
+                    kitty_keyboard: true,
+                    ..term::Config::default()
+                },
                 &TermSize {
                     rows: rows as usize,
                     cols: cols as usize,
@@ -405,10 +419,14 @@ async fn remote_loop(
                 match msg {
                     Some(ChannelMsg::Data { data }) => {
                         log::debug!("远程收到 {} 字节", data.len());
-                        let mut guard = term.lock();
-                        parser.advance(&mut *guard, &data);
-                        drop(guard);
-                        (on_event)(&SessionEvent::Wakeup);
+                        if feed_program_output(&term, &shared, &data) {
+                            (on_event)(&SessionEvent::Wakeup);
+                        } else {
+                            let mut guard = term.lock();
+                            parser.advance(&mut *guard, &data);
+                            drop(guard);
+                            (on_event)(&SessionEvent::Wakeup);
+                        }
                     }
                     Some(ChannelMsg::ExtendedData { data, .. }) => {
                         // stderr 也喂入解析器（保持输出顺序完整）。

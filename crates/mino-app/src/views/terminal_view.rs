@@ -17,7 +17,9 @@ use alacritty_terminal::term::TermDamage;
 use alacritty_terminal::vte::ansi::{Color as AColor, CursorShape, NamedColor, Rgb};
 use egui::text::LayoutJob;
 use egui::{Color32, FontId, Rect, Stroke, TextFormat, Ui, Vec2};
-use mino_core::terminal::keys::{self, Key, Mods, MouseWheelDirection};
+use mino_core::terminal::keys::{
+    self, Key, Mods, MouseButton, MouseEventKind, MouseWheelDirection,
+};
 use mino_core::terminal::{Session, SessionEvent, TermMode};
 
 /// 行缓存：内容 hash 未变时复用已布局文本（Galley），避免每帧重建。
@@ -49,6 +51,14 @@ struct CachedRun {
     start_col: usize,
     /// 已布局文本（绘制直接使用，无需 layout_job）。
     galley: std::sync::Arc<egui::Galley>,
+    /// OSC8 超链接目标（悬浮手指 + 点击打开；无链接为 None）。
+    link: Option<String>,
+    /// 下划线变体（SGR 4 系列；Galley 只画单线，变体由 paint 侧矢量补）。
+    underline: UnderlineStyle,
+    /// 下划线颜色（SGR 58；无则跟前景，需段 fg）。
+    underline_color: Option<Color32>,
+    /// 段前景（变体线默认色）。
+    fg: Color32,
 }
 
 /// 宽字符 Galley 缓存键。
@@ -56,7 +66,23 @@ struct CachedRun {
 /// 宽字符段恒为单字符，同一（字符, 影响布局的样式）的 Galley 可跨行跨帧复用，
 /// 中文文本字符高度重复，layout 实际只发生一次。粗体不参与——它只经 `fg`
 /// 映射到亮色（见 `singleline_job`）；背景不参与——背景由背景段单独绘制。
-type WideGlyphKey = (char, Color32, bool, bool, bool);
+type WideGlyphKey = (char, Color32, bool, UnderlineStyle, Option<Color32>, bool);
+
+/// 下划线变体（SGR 4 系列；VT 层 `Flags` 的渲染侧映射）。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum UnderlineStyle {
+    /// 无下划线。
+    None,
+    /// 单下划线（SGR 4）。
+    Single,
+    /// 双下划线（SGR 4:2，omp 的错误/拼写标记用它）。
+    Double,
+    /// 波浪线（SGR 4:3，LSP 诊断/拼写错误主流形态）。
+    Curly,
+    /// 点线（SGR 4:4）与虚线（SGR 4:5）。
+    Dotted,
+    Dashed,
+}
 
 /// 文本段（合并相邻相同前景样式的 cell；`start_col` 为终端列定位用）。
 struct Segment {
@@ -65,10 +91,14 @@ struct Segment {
     fg: Color32,
     bold: bool,
     italic: bool,
-    underline: bool,
+    underline: UnderlineStyle,
     strikeout: bool,
+    /// SGR 58 下划线颜色（`None` = 跟随前景色）。
+    underline_color: Option<Color32>,
     /// 本段是否为宽字符段（CJK/emoji，占双列；恒为单字符，与半角不混排）。
     is_wide: bool,
+    /// OSC8 超链接目标（同 URI 的相邻 cell 才合并；点击经 `open_url` 打开）。
+    link: Option<String>,
 }
 
 /// 背景矩形（合并相邻相同背景色的 cell，含起止列）。
@@ -196,6 +226,9 @@ pub struct TerminalView {
     last_paint_ms: f32,
     /// 会话标题缓存（`SessionEvent::Title` 时更新，避免每帧 Mutex + String clone）。
     cached_title: String,
+    /// Bell 脉冲到期时间（`SessionEvent::Bell` 时记录；paint 时若未到期则在
+    /// 终端左上角画一个短暂圆点，omp 的任务完成/错误提示音不再静默丢失）。
+    bell_until: Option<std::time::Instant>,
     /// 远程 PTY 尺寸同步重试次数（`window_change` 由 SSH 后台异步发送）。
     remote_resize_sync_frames: u8,
     /// 当前终端选区（⌘C / Ctrl+Shift+C 复制）。
@@ -206,8 +239,10 @@ pub struct TerminalView {
     copy_flash_until: Option<f64>,
     /// 图片粘贴失败信息（下一帧 `toast` 显示一次；`TerminalView` 无 toast 通道）。
     image_paste_error: Option<String>,
+    /// OSC52 剪贴板写入失败信息（下一帧 `toast` 显示一次，同上通道）。
     /// 远程图片粘贴待上传（本地中转路径；`MinoApp` 经 SFTP 上传后写远端 token）。
     pending_image_upload: Option<std::path::PathBuf>,
+    clipboard_write_error: Option<String>,
     /// 剪贴板图片读取器（正式为系统剪贴板；测试注入 `Fake`）。
     clipboard: Box<dyn crate::clip_image::ClipboardReader>,
     /// 当前 IME 预编辑文本（拼音/注音组字中、尚未上屏的组合串）。
@@ -270,6 +305,7 @@ impl TerminalView {
             last_layout_ms: 0.0,
             last_paint_ms: 0.0,
             cached_title,
+            bell_until: None,
             remote_resize_sync_frames: if is_remote {
                 REMOTE_RESIZE_SYNC_FRAMES
             } else {
@@ -280,6 +316,7 @@ impl TerminalView {
             copy_flash_until: None,
             image_paste_error: None,
             pending_image_upload: None,
+            clipboard_write_error: None,
             clipboard: Box::new(crate::clip_image::SystemClipboard::new()),
             ime_preedit: None,
         }
@@ -304,6 +341,11 @@ impl TerminalView {
         self.image_paste_error.take()
     }
 
+    /// 取出 OSC52 剪贴板写入失败信息（`MinoApp` 转 `toast` 显示一次）。
+    pub fn take_clipboard_write_error(&mut self) -> Option<String> {
+        self.clipboard_write_error.take()
+    }
+
     /// 本帧终端渲染分段耗时（性能 HUD 读取；未渲染时均为 0）。
     pub fn last_timing(&self) -> (f32, f32, f32) {
         (self.last_build_ms, self.last_layout_ms, self.last_paint_ms)
@@ -325,6 +367,23 @@ impl TerminalView {
             return None;
         }
         Some(self.workdir.cwd().to_string_lossy().into_owned())
+    }
+
+    /// 本地会话的真实工作目录（收藏/标题/对话框用）。
+    ///
+    /// 以 shell 子进程的内核 cwd 为准（`Session::child_current_dir`）：
+    /// 输入跟踪（`WorkdirTracker`）在粘贴/补全/别名/函数/`cd -` 等场景下
+    /// 会 `invalidate` 并永久停在旧值，不能作为"当前目录"的数据源；
+    /// 内核查询偶发失败（子进程刚 fork 间隙）时才回退到跟踪值。
+    /// 远程会话返回 `None`。
+    pub fn effective_local_directory(&self) -> Option<String> {
+        if self.session.is_remote() {
+            return None;
+        }
+        self.session
+            .child_current_dir()
+            .map(|path| path.to_string_lossy().into_owned())
+            .or_else(|| self.tracked_directory())
     }
 
     /// 输入跟踪器维护的目录（仅本地标题的内核查询失败时回退用）。
@@ -413,12 +472,34 @@ impl TerminalView {
             match event {
                 SessionEvent::PtyWrite(text) => self.session.write(text.as_bytes()),
                 SessionEvent::Title(title) => self.cached_title = title,
+                SessionEvent::ResetTitle => self.cached_title.clear(),
+                // Bell：程序完成/错误提示音。egui 没有声音通道，转为 0.6s
+                // 的视觉脉冲（左上角圆点）+ 立即重绘；无脉冲时不常驻重绘。
+                SessionEvent::Bell => {
+                    let until = std::time::Instant::now() + std::time::Duration::from_millis(600);
+                    self.bell_until =
+                        Some(self.bell_until.map(|prev| prev.max(until)).unwrap_or(until));
+                }
                 // 程序查询终端配色（OSC 4/10/11/12）：VT 仿真层不知道主题，
                 // 必须由这里给出真实颜色，否则查询永无应答，TUI 只能按
                 // “未知终端”回退（omp 启动时就会查 OSC 11）。
                 SessionEvent::ColorRequest { index, formatter } => {
                     let color = self.query_color(index);
                     let reply = formatter(color);
+                    self.session.write(reply.as_bytes());
+                }
+                // OSC52 程序复制：写系统剪贴板（omp 的 yank/复制代码块都走这里）。
+                // 失败不静默：记入 `clipboard_write_error`，由 `MinoApp` 转 toast。
+                SessionEvent::ClipboardStore { text, .. } => {
+                    if let Err(message) = self.clipboard.set_clipboard_text(&text) {
+                        self.clipboard_write_error = Some(message);
+                    }
+                }
+                // OSC52 程序读剪贴板：默认配置拒绝，几乎不到达；到达则把当前
+                // 剪贴板文本按程序要的格式回写（formatter 已含终止符）。
+                SessionEvent::ClipboardLoad { formatter, .. } => {
+                    let text = self.clipboard.clipboard_text().unwrap_or_default();
+                    let reply = formatter(&text);
                     self.session.write(reply.as_bytes());
                 }
                 // 文本区像素尺寸查询（CSI 14 t）：用实际 cell 尺寸换算。
@@ -733,6 +814,10 @@ impl TerminalView {
                 runs.push(CachedRun {
                     start_col: seg.start_col,
                     galley,
+                    link: seg.link.clone(),
+                    underline: seg.underline,
+                    underline_color: seg.underline_color,
+                    fg: seg.fg,
                 });
             }
             self.rows_cache.insert(
@@ -786,7 +871,42 @@ impl TerminalView {
             for run in &cache.runs {
                 let pos = egui::pos2(origin.x + run.start_col as f32 * cell_width, row_top);
                 painter.galley(pos, run.galley.clone(), Color32::WHITE);
+                // 下划线变体矢量线（SGR 4 系列；Galley 只画 Single，其余在这里补）。
+                if run.underline != UnderlineStyle::None && run.underline != UnderlineStyle::Single
+                {
+                    let width = run.galley.size().x;
+                    if width > 0.0 {
+                        let color = run.underline_color.unwrap_or(run.fg);
+                        let base_y = row_top + cell_height - 2.0;
+                        paint_underline_variant(
+                            painter,
+                            pos.x,
+                            base_y,
+                            width,
+                            run.underline,
+                            color,
+                        );
+                    }
+                }
+                // OSC8 超链接下划线（accent2 色，1px，基线处；只画有链接的段）。
+                if run.link.is_some() {
+                    let width = run.galley.size().x;
+                    if width > 0.0 {
+                        painter.line_segment(
+                            [
+                                egui::pos2(pos.x, row_top + cell_height - 2.0),
+                                egui::pos2(pos.x + width, row_top + cell_height - 2.0),
+                            ],
+                            Stroke::new(1.0, theme.accent2),
+                        );
+                    }
+                }
             }
+        }
+        // OSC8 超链接点击：命中链接段则经 `open_url` 打开（浏览器/文件）。
+        // 只在未订阅鼠标上报时处理——订阅时点击已透传给程序，链接由程序自己管。
+        if input_enabled && !self.last_mode.intersects(TermMode::MOUSE_MODE) {
+            self.open_hovered_hyperlink(ui, inner, display_offset);
         }
 
         // 光标形状绘制（shape 已在锁内读取，无需二次上锁）。
@@ -819,6 +939,20 @@ impl TerminalView {
                     );
                 }
                 CursorShape::Hidden => {}
+            }
+        }
+        // Bell 视觉脉冲：到期前在终端左上角画 accent 色圆点（0.6s 自消失）。
+        // 脉冲期间每帧安排重绘以保证到期即消失；无 Bell 时零额外重绘。
+        if let Some(until) = self.bell_until {
+            if std::time::Instant::now() < until {
+                painter.circle_filled(
+                    origin + Vec2::new(8.0, 8.0),
+                    3.0,
+                    Color32::from_rgb(theme.accent.r(), theme.accent.g(), theme.accent.b()),
+                );
+                ui.ctx().request_repaint();
+            } else {
+                self.bell_until = None;
             }
         }
         // IME 预编辑串内联渲染（光标处、下划线标出组字中文本）。
@@ -873,10 +1007,23 @@ impl TerminalView {
         let surface_rect = ui.max_rect();
         self.handle_dropped_files(ui, surface_rect, input_enabled);
         let response = ui.interact(surface_rect, self.focus_id, egui::Sense::click_and_drag());
+        // 程序订阅鼠标上报（1000/1002/1003）时，点击/拖拽/释放直接透传为
+        // xterm 序列（omp 的 `/tree`、选择框、滚动都依赖它）；此前全部被
+        // 本地选区逻辑吞掉，替代屏里的程序永远收不到点击。SGR（1006）优先。
+        // 未订阅时走本地选区（拖选后 ⌘C），行为不变。
+        let mouse_mode = self.last_mode;
+        let mouse_reporting = mouse_mode.intersects(TermMode::MOUSE_MODE);
+        if input_enabled && mouse_reporting {
+            self.forward_mouse_events(ui, &response, inner);
+        }
         if response.clicked() {
             ui.memory_mut(|m| m.request_focus(self.focus_id));
             // 单击空白处清除旧选区；拖选会在 drag_started 时重新建立选区。
-            self.selection = None;
+            // 鼠标上报开启时不碰本地选区——点击已透传给程序，本地留选区
+            // 只会画出一块程序不知道的高亮。
+            if !mouse_reporting {
+                self.selection = None;
+            }
         }
         if response.drag_started() {
             let start_pos = ui
@@ -927,6 +1074,82 @@ impl TerminalView {
         self.update_ime_output_with_input(ui, inner, cursor_rect, input_enabled);
         if input_enabled && ui.memory(|m| m.has_focus(self.focus_id)) {
             self.handle_input(ui, inner, output_rows);
+        }
+    }
+
+    /// 鼠标点击/拖拽/释放上报（xterm 鼠标协议，按下→拖拽→释放）。
+    ///
+    /// 只有程序 DECSET 订阅后才调用（调用方已判定 `MOUSE_MODE`）：未订阅时
+    /// 本地选区逻辑不受影响。坐标用按下/当前位置换算为视口 cell（1-based 由
+    /// 编码层处理）；滚轮走既有的 `MouseWheel` 分支，不在这里处理。
+    /// 按键在进入时快照一次（`pressed_mouse_button`）：释放帧按键已弹起，
+    /// 再读 input 只能拿到“无按下”而误报左键。
+    fn forward_mouse_events(&mut self, ui: &Ui, response: &egui::Response, inner: Rect) {
+        let mode = self.last_mode;
+        if !mode.intersects(TermMode::MOUSE_MODE) {
+            return;
+        }
+        let mods = ui.input(|i| {
+            let m = i.modifiers;
+            Mods {
+                shift: m.shift,
+                alt: m.alt,
+                ctrl: m.ctrl,
+                super_: false,
+            }
+        });
+        // 按下的键在释放帧已读不到：全程用同一快照，释放也用它。
+        let pressed = pressed_mouse_button(ui);
+        let mut events: Vec<(MouseButton, MouseEventKind, Option<egui::Pos2>)> = Vec::new();
+        if response.drag_started() {
+            // drag_started 与 clicked 同帧到达（click_and_drag）：按下事件优先，
+            // 否则程序只看到拖拽看不到按下，选区类交互起不来。
+            let pos = ui
+                .input(|i| i.pointer.press_origin())
+                .or(response.interact_pointer_pos());
+            events.push((pressed, MouseEventKind::Press, pos));
+        }
+        if response.dragged() {
+            events.push((
+                pressed,
+                MouseEventKind::Drag,
+                response.interact_pointer_pos(),
+            ));
+        }
+        if response.drag_stopped() {
+            events.push((
+                pressed,
+                MouseEventKind::Release,
+                ui.input(|i| i.pointer.interact_pos()),
+            ));
+        } else if response.clicked() {
+            // 纯点击（无拖拽）：补一次按下+释放；drag_started 分支已处理过
+            // 按下的情况不再重复（clicked 会在 drag 结束后也触发一次，
+            // 那一次由 drag_stopped 的 Release 覆盖）。
+            if !response.drag_started() {
+                let pos = response.interact_pointer_pos();
+                events.push((pressed, MouseEventKind::Press, pos));
+                events.push((pressed, MouseEventKind::Release, pos));
+            }
+        }
+        for (button, kind, pos) in events {
+            let Some(pos) = pos.filter(|pos| inner.contains(*pos)) else {
+                continue;
+            };
+            let (column, row) = terminal_cell_from_screen(
+                pos,
+                inner,
+                self.cell_width,
+                self.cell_height,
+                self.cols as usize,
+                self.rows as usize,
+            );
+            if let Some(bytes) = keys::encode_mouse_click(button, kind, mods, mode, column, row) {
+                self.session.write(&bytes);
+                // 上报字节同样是“已写入 PTY 的输入”：控制序列进跟踪器只会
+                // invalidate 当前行；鼠标事件不应污染 shell 命令行跟踪。
+                let _ = bytes;
+            }
         }
     }
 
@@ -1753,6 +1976,148 @@ fn terminal_cell_from_screen(
     )
 }
 
+impl TerminalView {
+    /// 悬浮在 OSC8 链接段上时：手指光标 + 单击经 `open_url` 打开。
+    ///
+    /// 只处理左键单击（`clicked_by(Primary)`），且指针必须落在某段链接的
+    /// 矩形内；段宽用缓存 Galley 实测宽（与绘制同一宽度），不按字符估算。
+    /// `file://` 与 `http(s)://` 都直通 `open_url`（egui-winit 调 `open`）。
+    fn open_hovered_hyperlink(&mut self, ui: &Ui, inner: Rect, display_offset: usize) {
+        let Some(pointer) = ui.input(|i| i.pointer.hover_pos()) else {
+            return;
+        };
+        if !inner.contains(pointer) {
+            return;
+        }
+        let cell_width = self.cell_width;
+        let cell_height = self.cell_height;
+        let mut hovered: Option<String> = None;
+        for v in 0..self.rows as usize {
+            let grid_line = v as i32 - display_offset as i32;
+            let Some(cache) = self.rows_cache.get(&grid_line) else {
+                continue;
+            };
+            let row_top = inner.min.y + v as f32 * cell_height;
+            for run in &cache.runs {
+                let Some(url) = run.link.as_deref() else {
+                    continue;
+                };
+                let width = run.galley.size().x;
+                if width <= 0.0 {
+                    continue;
+                }
+                let rect = Rect::from_min_size(
+                    egui::pos2(inner.min.x + run.start_col as f32 * cell_width, row_top),
+                    egui::vec2(width, cell_height),
+                );
+                if rect.contains(pointer) {
+                    hovered = Some(url.to_owned());
+                    break;
+                }
+            }
+            if hovered.is_some() {
+                break;
+            }
+        }
+        let Some(url) = hovered else {
+            return;
+        };
+        ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+        if ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Primary)) {
+            ui.ctx().open_url(egui::OpenUrl::same_tab(url));
+        }
+    }
+}
+
+/// 下划线变体矢量线（SGR 4:2/4:3/4:4/4:5；Single 由 Galley 直接画）。
+///
+/// 双线 = 基线 + 基线-2px 两条 1px；波浪 = 振幅 1px 的 8 段折线（段宽<8px
+/// 退化为单线）；点线 = 1px 点 + 2px 空、虚线 = 3px 线 + 2px 空（dash 手工
+/// 分段，egui 无虚线 stroke）。颜色由调用方按 SGR58/前景解好传入。
+fn paint_underline_variant(
+    painter: &egui::Painter,
+    x: f32,
+    base_y: f32,
+    width: f32,
+    style: UnderlineStyle,
+    color: Color32,
+) {
+    match style {
+        UnderlineStyle::None | UnderlineStyle::Single => {}
+        UnderlineStyle::Double => {
+            for dy in [0.0, -2.0] {
+                painter.line_segment(
+                    [
+                        egui::pos2(x, base_y + dy),
+                        egui::pos2(x + width, base_y + dy),
+                    ],
+                    Stroke::new(1.0, color),
+                );
+            }
+        }
+        UnderlineStyle::Curly => {
+            if width < 8.0 {
+                painter.line_segment(
+                    [egui::pos2(x, base_y), egui::pos2(x + width, base_y)],
+                    Stroke::new(1.0, color),
+                );
+                return;
+            }
+            let segs = 8;
+            let mut prev = egui::pos2(x, base_y);
+            for i in 1..=segs {
+                let t = i as f32 / segs as f32;
+                // 正弦一周期：0→+1→0→-1→0，振幅 1px。
+                let dy = (t * std::f32::consts::TAU).sin();
+                let next = egui::pos2(x + width * t, base_y + dy);
+                painter.line_segment([prev, next], Stroke::new(1.0, color));
+                prev = next;
+            }
+        }
+        UnderlineStyle::Dotted => {
+            let mut cx = x;
+            while cx < x + width {
+                let end = (cx + 1.0).min(x + width);
+                painter.line_segment(
+                    [egui::pos2(cx, base_y), egui::pos2(end, base_y)],
+                    Stroke::new(1.0, color),
+                );
+                cx += 3.0;
+            }
+        }
+        UnderlineStyle::Dashed => {
+            let mut cx = x;
+            while cx < x + width {
+                let end = (cx + 3.0).min(x + width);
+                painter.line_segment(
+                    [egui::pos2(cx, base_y), egui::pos2(end, base_y)],
+                    Stroke::new(1.0, color),
+                );
+                cx += 5.0;
+            }
+        }
+    }
+}
+
+/// egui 按键 → xterm 鼠标 button（从本帧 input 取按下的键；未知按左键）。
+fn pressed_mouse_button(ui: &Ui) -> MouseButton {
+    let button = ui.input(|i| {
+        i.pointer
+            .button_pressed(egui::PointerButton::Secondary)
+            .then_some(egui::PointerButton::Secondary)
+            .or_else(|| {
+                i.pointer
+                    .button_pressed(egui::PointerButton::Middle)
+                    .then_some(egui::PointerButton::Middle)
+            })
+    });
+    match button {
+        Some(egui::PointerButton::Secondary) => MouseButton::Right,
+        Some(egui::PointerButton::Middle) => MouseButton::Middle,
+        _ => MouseButton::Left,
+    }
+}
+
 /// 屏幕坐标 → 当前视口对应的网格坐标。
 fn selection_point_from_screen(
     pos: egui::Pos2,
@@ -1888,8 +2253,13 @@ fn build_line_data(
         let mut bg = resolve_color(cell.bg, colors, default_bg, false);
         let bold = cell.flags.contains(Flags::BOLD);
         let italic = cell.flags.contains(Flags::ITALIC);
-        let underline = cell.flags.contains(Flags::UNDERLINE);
+        let underline = underline_style_of(cell.flags);
         let strikeout = cell.flags.contains(Flags::STRIKEOUT);
+        // SGR 58 下划线颜色（`Color::Spec` 直接 RGB，其余走调色板解析）。
+        let underline_color = cell.underline_color().map(|c| match c {
+            AColor::Spec(rgb) => to_egui(rgb),
+            other => resolve_color(other, colors, default_fg, false),
+        });
 
         // INVERSE 反色。
         if cell.flags.contains(Flags::INVERSE) {
@@ -1918,6 +2288,7 @@ fn build_line_data(
                     italic,
                     underline,
                     strikeout,
+                    underline_color,
                 },
                 cell.zerowidth(),
             );
@@ -1940,6 +2311,17 @@ fn build_line_data(
         let is_wide = !leading_spacer
             && !cell.flags.contains(Flags::HIDDEN)
             && cell.flags.contains(Flags::WIDE_CHAR);
+        // OSC8 超链接：同 URI 才合并（`push_or_merge` 判 link 相等）。
+        let link = cell
+            .hyperlink()
+            .map(|h| h.uri().to_owned())
+            .filter(|u| !u.is_empty());
+        if let Some(url) = link.as_deref() {
+            hash = hash.wrapping_mul(131).wrapping_add(url.len() as u64);
+            for b in url.bytes() {
+                hash = hash.wrapping_mul(131).wrapping_add(b as u64);
+            }
+        }
         push_or_merge(
             &mut segments,
             col,
@@ -1953,7 +2335,9 @@ fn build_line_data(
                 italic,
                 underline,
                 strikeout,
+                underline_color,
             },
+            link,
             &mut hash,
         );
     }
@@ -2034,6 +2418,23 @@ fn resolve_color(color: AColor, colors: &Colors, default: Rgb, bold: bool) -> Co
     }
 }
 
+/// VT 下划线变体 → 渲染样式（SGR 4 系列全集；无下划线为 None）。
+fn underline_style_of(flags: Flags) -> UnderlineStyle {
+    if flags.contains(Flags::DOUBLE_UNDERLINE) {
+        UnderlineStyle::Double
+    } else if flags.contains(Flags::UNDERCURL) {
+        UnderlineStyle::Curly
+    } else if flags.contains(Flags::DOTTED_UNDERLINE) {
+        UnderlineStyle::Dotted
+    } else if flags.contains(Flags::DASHED_UNDERLINE) {
+        UnderlineStyle::Dashed
+    } else if flags.contains(Flags::UNDERLINE) {
+        UnderlineStyle::Single
+    } else {
+        UnderlineStyle::None
+    }
+}
+
 /// alacritty Rgb → egui Color32。
 fn to_egui(rgb: Rgb) -> Color32 {
     Color32::from_rgb(rgb.r, rgb.g, rgb.b)
@@ -2046,8 +2447,9 @@ struct CellStyle {
     bg: Color32,
     bold: bool,
     italic: bool,
-    underline: bool,
+    underline: UnderlineStyle,
     strikeout: bool,
+    underline_color: Option<Color32>,
 }
 
 impl CellStyle {
@@ -2060,8 +2462,13 @@ impl CellStyle {
             ^ (u64::from(self.bg.b()) << 48)
             ^ (u64::from(self.bold) << 24)
             ^ (u64::from(self.italic) << 25)
-            ^ (u64::from(self.underline) << 26)
-            ^ (u64::from(self.strikeout) << 27)
+            ^ ((self.underline as u64 % 7) << 26)
+            ^ (u64::from(self.strikeout) << 29)
+            ^ self
+                .underline_color
+                .map(|c| u64::from(c.r()) ^ (u64::from(c.g()) << 8) ^ (u64::from(c.b()) << 16))
+                .unwrap_or(0)
+                .wrapping_mul(31)
     }
 }
 
@@ -2076,6 +2483,7 @@ impl CellStyle {
 /// 少 3.1px，5 个字就漂 15px——表现为「中文越打越多，光标离文字越远、
 /// 文字与后面内容之间出现一片空白」。单字符段按终端列定位后，段内无排字，
 /// 每个宽字符精确落在自己的双列起点。
+#[allow(clippy::too_many_arguments)]
 fn push_or_merge(
     segments: &mut Vec<Segment>,
     col: usize,
@@ -2083,6 +2491,7 @@ fn push_or_merge(
     zero_width: Option<&[char]>,
     is_wide: bool,
     style: CellStyle,
+    link: Option<String>,
     hash: &mut u64,
 ) {
     if let Some(last) = segments.last_mut() {
@@ -2093,6 +2502,8 @@ fn push_or_merge(
             && last.italic == style.italic
             && last.underline == style.underline
             && last.strikeout == style.strikeout
+            && last.underline_color == style.underline_color
+            && last.link == link
         {
             last.text.push(c);
             if let Some(zero_width) = zero_width {
@@ -2110,7 +2521,9 @@ fn push_or_merge(
         italic: style.italic,
         underline: style.underline,
         strikeout: style.strikeout,
+        underline_color: style.underline_color,
         is_wide,
+        link,
     });
     if let Some(zero_width) = zero_width {
         if let Some(last) = segments.last_mut() {
@@ -2138,7 +2551,8 @@ fn style_key(
     bg: Color32,
     bold: bool,
     italic: bool,
-    underline: bool,
+    underline: UnderlineStyle,
+    underline_color: Option<Color32>,
     strikeout: bool,
 ) -> u64 {
     CellStyle {
@@ -2148,6 +2562,7 @@ fn style_key(
         italic,
         underline,
         strikeout,
+        underline_color,
     }
     .key()
 }
@@ -2162,6 +2577,7 @@ fn layout_segment(ui: &Ui, seg: &Segment, font_size: f32) -> std::sync::Arc<egui
             seg.bold,
             seg.italic,
             seg.underline,
+            seg.underline_color,
             seg.strikeout,
         ))
     })
@@ -2180,26 +2596,47 @@ fn wide_glyph_key(seg: &Segment) -> Option<WideGlyphKey> {
     if chars.next().is_some() {
         return None;
     }
-    Some((c, seg.fg, seg.italic, seg.underline, seg.strikeout))
+    Some((
+        c,
+        seg.fg,
+        seg.italic,
+        seg.underline,
+        seg.underline_color,
+        seg.strikeout,
+    ))
 }
 
 /// 为单个同宽文本段构建单行 LayoutJob（不换行，按给定样式）。
+#[allow(clippy::too_many_arguments)]
 fn singleline_job(
     text: &str,
     font_size: f32,
     fg: Color32,
     bold: bool,
     italic: bool,
-    underline: bool,
+    underline: UnderlineStyle,
+    underline_color: Option<Color32>,
     strikeout: bool,
 ) -> LayoutJob {
-    let _ = bold;
+    // 粗体 = 前景增亮 30%（封顶 255）+ egui 暂无合成粗体，不做描边仿粗
+    // （描边会让 CJK 笔画糊）。亮色映射仍由 `resolve_color` 的调色板负责，
+    // 这里只处理 Spec/真彩色的粗体增亮。
+    let fg = if bold {
+        Color32::from_rgb(
+            fg.r().saturating_add((255 - fg.r()) / 3),
+            fg.g().saturating_add((255 - fg.g()) / 3),
+            fg.b().saturating_add((255 - fg.b()) / 3),
+        )
+    } else {
+        fg
+    };
     let format = TextFormat {
         font_id: FontId::monospace(font_size),
         color: fg,
         italics: italic,
-        underline: if underline {
-            Stroke::new(1.0, fg)
+        // Galley 只画 Single：其它变体由 paint 侧矢量线画，避免双线重叠。
+        underline: if underline == UnderlineStyle::Single {
+            Stroke::new(1.0, underline_color.unwrap_or(fg))
         } else {
             Stroke::NONE
         },
@@ -2226,8 +2663,8 @@ fn build_job(segments: &[Segment], font_size: f32) -> LayoutJob {
             font_id: FontId::monospace(font_size),
             color: seg.fg,
             italics: seg.italic,
-            underline: if seg.underline {
-                Stroke::new(1.0, seg.fg)
+            underline: if seg.underline == UnderlineStyle::Single {
+                Stroke::new(1.0, seg.underline_color.unwrap_or(seg.fg))
             } else {
                 Stroke::NONE
             },
@@ -3114,6 +3551,400 @@ mod mouse_wheel_tests {
         assert_eq!(wheel_target(TermMode::NONE), WheelTarget::Scrollback);
     }
 
+    /// 回归：程序订阅鼠标上报后（omp `/tree`/选择框都开 1000/1006），
+    /// 点击必须透传 SGR 序列给程序，不能再被本地选区吞掉；未订阅时本地
+    /// 拖选行为不变（由 `鼠标拖选建立终端选区` 覆盖）。
+    #[test]
+    fn 鼠标上报开启时点击透传程序() {
+        use mino_core::terminal::{Session, SessionOptions};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::sync::Arc;
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+        });
+        harness.run_steps(6);
+        // 程序侧打开鼠标上报 + SGR：直接调 VT 层解析申请人造输出（走
+        // `Processor::advance`，与远程 `remote_loop` 同一条管线；不能用
+        // `session.write`——那是往从机方向写，会被 shell 吃掉输入）。
+        view.borrow()
+            .session()
+            .inject_program_output_for_test(b"\x1b[?1000h\x1b[?1006h");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            harness.step();
+            let mode = *view.borrow().session().term().lock().mode();
+            if mode.contains(TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "DECSET 1000/1006 未生效，mode={mode:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // 编码层：左键点击 (0,0) 应为 SGR 按下+释放。
+        let mode = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
+        assert_eq!(
+            keys::encode_mouse_click(
+                MouseButton::Left,
+                MouseEventKind::Press,
+                Mods::default(),
+                mode,
+                0,
+                0
+            )
+            .unwrap(),
+            b"\x1b[<0;1;1M"
+        );
+        // 视图分支：上报开启时点击不建本地选区（已透传给程序）。
+        let pos = egui::pos2(60.0, 40.0);
+        harness.event(egui::Event::PointerMoved(pos));
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+        assert!(
+            view.borrow().selection.is_none(),
+            "鼠标上报开启时点击应透传程序，不建本地选区"
+        );
+    }
+
+    /// 回归：omp 发出的 OSC8 超链接（`tui.hyperlinks=always` 下路径/URL
+    /// 全包链接）必须进段缓存并可点击；同 URI 相邻 cell 合并、不同 URI 另起段。
+    #[test]
+    fn 超链接分段与点击() {
+        use mino_core::terminal::{Session, SessionOptions};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::sync::Arc;
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+        });
+        harness.run_steps(6);
+        // 两段不同 URI 的链接 + 中间普通文本。
+        view.borrow().session().inject_program_output_for_test(
+            b"\x1b]8;;https://a.example/\x1b\\AAA\x1b]8;;\x1b\\ mid \x1b]8;;https://b.example/\x1b\\BBB\x1b]8;;\x1b\\",
+        );
+        harness.run_steps(6);
+        // 段缓存里应出现两段带链接的 run（同 URI 合并、文本段无链接）。
+        let mut links: Vec<String> = Vec::new();
+        {
+            let v = view.borrow();
+            for cache in v.rows_cache.values() {
+                for run in &cache.runs {
+                    if let Some(url) = run.link.as_deref() {
+                        links.push(format!("{}:{}", url, run.galley.text()));
+                    }
+                }
+            }
+        }
+        assert!(
+            links
+                .iter()
+                .any(|s| s.contains("https://a.example") && s.contains("AAA")),
+            "第一段链接缺失：{links:?}"
+        );
+        assert!(
+            links
+                .iter()
+                .any(|s| s.contains("https://b.example") && s.contains("BBB")),
+            "第二段链接缺失：{links:?}"
+        );
+        assert!(
+            !links.iter().any(|s| s.contains("mid")),
+            "普通文本不应带链接：{links:?}"
+        );
+    }
+
+    /// 回归：程序 OSC52 复制（如 omp yank 整段代码）必须落系统剪贴板；
+    /// 失败走 toast 通道，不静默丢失。
+    #[test]
+    fn 程序复制写入系统剪贴板() {
+        use crate::clip_image::ClipboardReader;
+        use mino_core::terminal::{Session, SessionEvent, SessionOptions};
+        use std::sync::{Arc, Mutex};
+
+        struct RecordingClipboard {
+            text: Arc<Mutex<Option<String>>>,
+        }
+        impl ClipboardReader for RecordingClipboard {
+            fn clipboard_text(&mut self) -> Option<String> {
+                self.text.lock().unwrap().clone()
+            }
+            fn set_clipboard_text(&mut self, text: &str) -> Result<(), String> {
+                *self.text.lock().unwrap() = Some(text.to_owned());
+                Ok(())
+            }
+            fn clipboard_file_paths(&self) -> Vec<std::path::PathBuf> {
+                Vec::new()
+            }
+            fn clipboard_image(&mut self) -> Option<(usize, usize, Vec<u8>)> {
+                None
+            }
+        }
+        let recording: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let mut view = TerminalView::new(session);
+        view.set_clipboard_for_test(Box::new(RecordingClipboard {
+            text: recording.clone(),
+        }));
+        // 程序侧发 OSC52 store（走 VT 解析器，与真实程序同管线）。
+        view.session()
+            .inject_program_output_for_test(b"\x1b]52;c;aGVsbG8td29ybGQ=\x07");
+        view.drain_background_events();
+        assert_eq!(
+            recording.lock().unwrap().as_deref(),
+            Some("hello-world"),
+            "OSC52 store 应写入系统剪贴板"
+        );
+        // 读回管线：ClipboardLoad 用当前剪贴板文本回写（默认配置下程序
+        // 发不出 load，这里只验 formatter 语义不进 drain）。
+        let _ = recording;
+    }
+
+    /// 回归：Bell 不再静默丢失（视觉脉冲 0.6s）；ResetTitle 清空程序
+    /// 设置过的标题（此前 `Event::ResetTitle` 在 `_ => false` 被丢弃）。
+    #[test]
+    fn 铃声与标题重置有响应() {
+        use mino_core::terminal::{Session, SessionOptions};
+        use std::sync::Arc;
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let mut view = TerminalView::new(session);
+        view.session()
+            .inject_program_output_for_test(b"\x1b]0;hello-title\x07");
+        view.drain_background_events();
+        assert_eq!(view.session_title(), "hello-title");
+        // BEL 响铃：脉冲置位。
+        view.session().inject_program_output_for_test(b"\x07");
+        view.drain_background_events();
+        assert!(view.bell_until.is_some(), "Bell 应置位视觉脉冲");
+        // 空标题重置：缓存清空。
+        view.session()
+            .inject_program_output_for_test(b"\x1b]0;\x07");
+        view.drain_background_events();
+        assert!(
+            view.session_title().is_empty(),
+            "ResetTitle 应清空标题缓存，实际：{:?}",
+            view.session_title()
+        );
+    }
+
+    /// 回归：程序订阅 kitty 键盘（`CSI > 1 u`）后，非可打印键走 CSI-u；
+    /// 可打印字符仍走 legacy（kitty 要求文本键发原文）。
+    #[test]
+    fn kitty订阅后按键走csi_u() {
+        use mino_core::terminal::{Session, SessionOptions};
+        use std::sync::Arc;
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = TerminalView::new(session);
+        // 程序订阅 disambiguate（flag=1）。
+        view.session().inject_program_output_for_test(b"\x1b[>1u");
+        let mode = *view.session().term().lock().mode();
+        assert!(
+            mode.contains(TermMode::DISAMBIGUATE_ESC_CODES),
+            "kitty 订阅未生效，mode={mode:?}"
+        );
+        // 编码层按该 mode 分流（与 `handle_input` 同一 `mode` 变量）。
+        assert_eq!(
+            keys::encode_key(Key::Enter, Mods::default(), mode).unwrap(),
+            b"\x1b[13u"
+        );
+        assert_eq!(
+            keys::encode_key(Key::Char('a'), Mods::default(), mode).unwrap(),
+            b"a"
+        );
+    }
+
+    /// 回归：SGR 下划线变体（4:2 双线/4:3 波浪）与 SGR58 下划线色必须进
+    /// 段缓存（omp 的诊断/链接色用它们）；粗体增亮不断言像素，只断样式管线。
+    #[test]
+    fn 下划线变体与颜色进段缓存() {
+        use mino_core::terminal::{Session, SessionEvent, SessionOptions};
+        use std::sync::Arc;
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = TerminalView::new(session);
+        // 红色波浪下划线 + 文本。
+        view.session()
+            .inject_program_output_for_test(b"\x1b[4:3m\x1b[58:2::255:0:0mWAVY\x1b[0m");
+        // 双下划线 + 文本。
+        view.session()
+            .inject_program_output_for_test(b"\x1b[4:2mDOUBLE\x1b[0m");
+        let term = view.session().term();
+        let guard = term.lock();
+        let mut content = guard.renderable_content();
+        assert!(
+            content.display_iter.any(|item| item.cell.c == 'W'),
+            "VT 层应收到波浪线文本"
+        );
+        drop(guard);
+        // 渲染管线：跑一帧 build_line_data（走 show 太重，直接调行构建）。
+        // 简化：断 VT flags 进了段（经 inject 的 Term 状态）。
+        let term = view.session().term();
+        let guard = term.lock();
+        let mut saw_curly = false;
+        let mut saw_double = false;
+        for item in guard.renderable_content().display_iter {
+            let flags = item.cell.flags;
+            if item.cell.c == 'W'
+                && flags.contains(alacritty_terminal::term::cell::Flags::UNDERCURL)
+            {
+                saw_curly = true;
+            }
+            if item.cell.c == 'D'
+                && flags.contains(alacritty_terminal::term::cell::Flags::DOUBLE_UNDERLINE)
+            {
+                saw_double = true;
+            }
+        }
+        assert!(saw_curly, "波浪线 flag 应到达 cell");
+        assert!(saw_double, "双下划线 flag 应到达 cell");
+        // 段构建：变体 + SGR58 色进 Segment（全网格扫描定位 W/D 行，
+        // `renderable_content` 的 display 行号 ≠ grid 行号，不能硬编码 0）。
+        let grid = guard.grid();
+        let colors = guard.colors();
+        let fg = colors[alacritty_terminal::vte::ansi::NamedColor::Foreground]
+            .unwrap_or(crate::theme::current_theme().term_fg);
+        let bg = crate::theme::current_theme().term_bg;
+        let mut wavy_line: Option<i32> = None;
+        let mut dbl_line: Option<i32> = None;
+        for line in -(grid.history_size() as i32)..grid.screen_lines() as i32 {
+            let row = &grid[if line >= 0 {
+                alacritty_terminal::index::Line::from(line as usize)
+            } else {
+                alacritty_terminal::index::Line::from(0) - line.unsigned_abs() as usize
+            }];
+            let text: String = row.into_iter().map(|c| c.c).collect();
+            if text.contains('W') {
+                wavy_line = Some(line);
+            }
+            if text.contains('D') {
+                dbl_line = Some(line);
+            }
+        }
+        let data = build_line_data(
+            grid,
+            wavy_line.expect("网格里应有 W 行"),
+            80,
+            colors,
+            fg,
+            bg,
+            Color32::from_rgb(bg.r, bg.g, bg.b),
+        );
+        let wavy = data.segments.iter().find(|s| s.text.contains('W'));
+        let data2 = build_line_data(
+            grid,
+            dbl_line.expect("网格里应有 D 行"),
+            80,
+            colors,
+            fg,
+            bg,
+            Color32::from_rgb(bg.r, bg.g, bg.b),
+        );
+        let dbl = data2.segments.iter().find(|s| s.text.contains('D'));
+        assert_eq!(
+            wavy.map(|s| s.underline),
+            Some(UnderlineStyle::Curly),
+            "波浪线应进段样式"
+        );
+        assert_eq!(
+            wavy.and_then(|s| s.underline_color),
+            Some(Color32::from_rgb(255, 0, 0)),
+            "SGR58 红色应进段下划线色"
+        );
+        assert_eq!(
+            dbl.map(|s| s.underline),
+            Some(UnderlineStyle::Double),
+            "双下划线应进段样式"
+        );
+    }
+
+    /// 回归：DECRQM 查 2026 必须回“不支持”（`CSI ? 2026 ; 0 $ y`），不能回
+    /// “已重置”（`…; 2 $ y`）。回 2 会让 omp 判定终端支持同步更新并全程包
+    /// BSU/ESU，而 alacritty 0.26 的 VT 层对 2026 是空实现（set/unset 都是
+    /// `()`），回执与能力不一致。
+    #[test]
+    fn 同步更新查询回不支持() {
+        use mino_core::terminal::{Session, SessionOptions};
+        use std::sync::Arc;
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = TerminalView::new(session);
+        // DECRQM 2026（`CSI ? 2026 $ p`）：VT 层经 PtyWrite 直接回写。
+        view.session()
+            .inject_program_output_for_test(b"\x1b[?2026$p");
+        let events = view.session().drain_events();
+        let reply: String = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::PtyWrite(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            reply.contains("\x1b[?2026;0$y"),
+            "2026 应回不支持（0），实际：{reply:?}"
+        );
+    }
+
     #[test]
     fn 小幅point滚轮不会被截断() {
         // 滚轮是“意图”而非距离：任何有效的滚轮事件都只发一次，由 Vim 自己
@@ -3531,6 +4362,9 @@ mod paste_tests {
             fn clipboard_text(&mut self) -> Option<String> {
                 None
             }
+            fn set_clipboard_text(&mut self, _text: &str) -> Result<(), String> {
+                Ok(())
+            }
             fn clipboard_file_paths(&self) -> Vec<std::path::PathBuf> {
                 Vec::new()
             }
@@ -3638,6 +4472,9 @@ mod paste_tests {
             fn clipboard_text(&mut self) -> Option<String> {
                 None
             }
+            fn set_clipboard_text(&mut self, _text: &str) -> Result<(), String> {
+                Ok(())
+            }
             fn clipboard_file_paths(&self) -> Vec<std::path::PathBuf> {
                 Vec::new()
             }
@@ -3710,8 +4547,24 @@ mod background_tests {
     #[test]
     fn 背景色参与行指纹() {
         let fg = Color32::WHITE;
-        let first = style_key(fg, Color32::BLACK, false, false, false, false);
-        let second = style_key(fg, Color32::from_rgb(1, 2, 3), false, false, false, false);
+        let first = style_key(
+            fg,
+            Color32::BLACK,
+            false,
+            false,
+            UnderlineStyle::None,
+            None,
+            false,
+        );
+        let second = style_key(
+            fg,
+            Color32::from_rgb(1, 2, 3),
+            false,
+            false,
+            UnderlineStyle::None,
+            None,
+            false,
+        );
         assert_ne!(first, second);
     }
 }

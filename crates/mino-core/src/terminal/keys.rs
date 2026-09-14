@@ -33,6 +33,30 @@ pub enum MouseWheelDirection {
     Down,
 }
 
+/// 鼠标按键（xterm 鼠标协议的 button 编号，不含修饰位）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseButton {
+    /// 左键（button 0）。
+    Left,
+    /// 中键（button 1）。
+    Middle,
+    /// 右键（button 2）。
+    Right,
+    /// 释放（button 3，仅上报释放的协议用；X10 不发）。
+    Release,
+}
+
+/// 鼠标按下/释放事件（点击与拖拽上报用；移动上报暂不需要）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseEventKind {
+    /// 按下。
+    Press,
+    /// 释放。
+    Release,
+    /// 按住拖动（button = 拖动中的按键 + 32）。
+    Drag,
+}
+
 /// 修饰键集合。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Mods {
@@ -129,15 +153,34 @@ fn encode_char(c: char, mods: Mods) -> Option<Vec<u8>> {
 /// 将按键编码为要写入 PTY 的字节序列。
 ///
 /// 返回 None 表示该按键不产生输出（如纯修饰键组合）。
+///
+/// kitty 键盘协议（`CSI > flags u`，`DISAMBIGUATE_ESC_CODES` 位）优先：
+/// 程序订阅后，所有“修饰键 + 非可打印键”（Enter/Tab/方向键/功能键/编辑键）
+/// 都走 CSI-u（`ESC[unicode;mods:event u`），不再走 legacy xterm 序列——后者
+/// 在该模式下会有歧义（程序按 kitty 语义解码，legacy 会被误读）。
+/// 可打印字符（`Key::Char`，含 Ctrl/Alt 组合的控制字符形态）永远走 legacy：
+/// kitty 要求文本键仍发原文（`REPORT_ASSOCIATED_TEXT` 另行处理，不在此展开）。
 pub fn encode_key(key: Key, mods: Mods, mode: TermMode) -> Option<Vec<u8>> {
+    if mode.contains(TermMode::DISAMBIGUATE_ESC_CODES) {
+        if let Some(bytes) = encode_kitty(key, mods) {
+            return Some(bytes);
+        }
+    }
     match key {
         Key::Char(c) => encode_char(c, mods),
         Key::Enter => {
-            // 主键盘 Enter 永远发 CR（`\r`）。应用键盘模式（APP_KEYPAD / DECPAM）
-            // 只影响数字小键盘（小键盘 Enter 才是 SS3 `ESC O M`），主键盘 Enter
-            // 不受影响——曾把主键盘 Enter 按 APP_KEYPAD 编码成 `\x1bOM`，导致
-            // zsh 启用应用键盘模式（TERM=xterm-256color 下 zle 自动开启）后
-            // 回车不执行（命令停在命令行）。
+            // 主键盘 Enter 永远发 CR（`\r`，不受 APP_KEYPAD 影响；曾误编
+            // 码成小键盘 `ESC O M` 致回车不执行）。Shift/Ctrl+Enter 必须与裸
+            // Enter 区分：omp 把 `tui.input.submit` 绑裸 Enter、`newLine` 绑
+            // Shift+Enter/Ctrl+J——三者同发 `\r` 时 agent 永远走提交分支。
+            // `ESC[13;2~`（Shift+Enter）与 Ctrl+J（换行符）是 omp 明确兼容的
+            // 两种形态（changelog #8821 实证），无 kitty CSI-u 时也可用。
+            if mods.shift && !mods.ctrl && !mods.alt {
+                return Some(b"\x1b[13;2~".to_vec());
+            }
+            if mods.ctrl && !mods.shift && !mods.alt {
+                return Some(vec![b'\n']);
+            }
             Some(vec![b'\r'])
         }
         Key::Tab => {
@@ -241,6 +284,78 @@ pub fn encode_key(key: Key, mods: Mods, mode: TermMode) -> Option<Vec<u8>> {
     }
 }
 
+/// kitty 键盘协议 CSI-u 编码（`CSI unicode-key-code:alternate ; mods:event u`）。
+///
+/// 只处理非可打印键：可打印字符返回 `None`，由 legacy 路径继续处理。
+/// unicode 编码按 kitty 规范：Enter=13、Tab=9、Backspace=127、Escape=27、
+/// 功能键 F1-F12 = `0x10 + n`（F1=17…F12=28，对应 `57344+n` 私用区）、
+/// 方向/Home/End/PageUp/PageDown/Insert/Delete 用同名功能键编号
+/// （Insert=2、Delete=3、Left=1…与 legacy `~` 参数同值域，便于记忆）。
+/// 修饰位 = 1+shift+2*alt+4*ctrl（与 xterm `csi_modifier` 同值）；`event`
+/// 恒为 1（press，释放事件由调用方经 `encode_kitty_release` 显式发送）。
+fn encode_kitty(key: Key, mods: Mods) -> Option<Vec<u8>> {
+    // Kitty 要求 Shift+Enter 等仍可区分：unicode=13 + mods 位。
+    // 纯修饰键（legacy 返回 None 的 F13+ 等）同样返回 None。
+    let code: u32 = match key {
+        Key::Char(_) => return None,
+        Key::Enter => 13,
+        Key::Tab => 9,
+        Key::Backspace => 127,
+        Key::Escape => 27,
+        Key::Up => 57358,
+        Key::Down => 57359,
+        Key::Right => 57360,
+        Key::Left => 57361,
+        Key::End => 57362,
+        // kitty：Begin(keypad 5)=57363，留空不用。
+        Key::Home => 57364,
+        Key::Insert => 57365,
+        Key::Delete => 57366,
+        Key::PageUp => 57369,
+        Key::PageDown => 57370,
+        Key::F(n) => match n {
+            1 => 57345,
+            2 => 57346,
+            3 => 57347,
+            4 => 57348,
+            5 => 57349,
+            6 => 57350,
+            7 => 57351,
+            8 => 57352,
+            9 => 57353,
+            10 => 57354,
+            11 => 57355,
+            12 => 57356,
+            _ => return None,
+        },
+    };
+    let mods_bit = mods.csi_modifier();
+    if mods_bit == 1 && !has_xterm_mods(mods) {
+        // 无修饰：短形态 `CSI code u`（与 legacy 无修饰序列等价信息量，
+        // 但 kitty 程序按 CSI-u 解码；Shift+Tab 等仍带修饰位走长形态）。
+        return Some(format!("\x1b[{code}u").into_bytes());
+    }
+    Some(format!("\x1b[{code};{mods_bit}u").into_bytes())
+}
+
+/// kitty 键盘释放事件（`CSI code;mods:3 u`，event=3 表释放）。
+///
+/// egui 只给 press 事件（`pressed=true` 才处理，释放帧 `continue` 跳过），
+/// 当前调用方发不出释放；该函数为协议完整性保留（后续释放透传时启用），
+/// 测试覆盖编码正确性。
+#[allow(dead_code)]
+pub fn encode_kitty_release(key: Key, mods: Mods) -> Option<Vec<u8>> {
+    let press = encode_kitty(key, mods)?;
+    // `ESC[code u` → `ESC[code;1:3u`；`ESC[code;mods u` → `ESC[code;mods:3u`。
+    let text = String::from_utf8(press).ok()?;
+    let inner = text.strip_prefix("\x1b[")?.strip_suffix("u")?;
+    let (code, mods_bit) = match inner.split_once(';') {
+        Some((code, mods_bit)) => (code, mods_bit),
+        None => (inner, "1"),
+    };
+    Some(format!("\x1b[{code};{mods_bit}:3u").into_bytes())
+}
+
 /// 将鼠标滚轮事件编码为 xterm 鼠标上报序列。
 ///
 /// `column` 与 `row` 为从零开始的当前视口 cell 坐标。只有终端程序已通过
@@ -261,11 +376,71 @@ pub fn encode_mouse_wheel(
         MouseWheelDirection::Up => 64,
         MouseWheelDirection::Down => 65,
     } + mouse_modifier_bits(mods);
+    Some(encode_mouse_button(button, mods, mode, column, row, false))
+}
+
+/// 将鼠标按键/滚轮事件编码为 xterm 鼠标上报序列。
+///
+/// `column` 与 `row` 为从零开始的当前视口 cell 坐标。只有终端程序已通过
+/// DECSET 启用鼠标上报时才返回字节；优先使用 SGR（1006），并兼容 X10 与
+/// UTF-8（1005）编码。`is_release` 只在 SGR/1005 下有意义：X10 没有释放
+/// 编码（button 3 会被老程序误读为“中键+右键同时按”），此时返回 `None`。
+pub fn encode_mouse_click(
+    button: MouseButton,
+    kind: MouseEventKind,
+    mods: Mods,
+    mode: TermMode,
+    column: usize,
+    row: usize,
+) -> Option<Vec<u8>> {
+    if !mode.intersects(TermMode::MOUSE_MODE) {
+        return None;
+    }
+    // 拖拽上报（1002）与任意移动上报（1003）是递进订阅：只开了点击（1000）
+    // 就发 Drag/Motion 会让程序收到它从未订阅的事件。
+    if kind == MouseEventKind::Drag {
+        let drag_enabled =
+            mode.contains(TermMode::MOUSE_DRAG) || mode.intersects(TermMode::MOUSE_MOTION);
+        if !drag_enabled {
+            return None;
+        }
+    }
+    let base = match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+        MouseButton::Release => 3,
+    };
+    let button = match kind {
+        MouseEventKind::Press => base,
+        MouseEventKind::Release => 3,
+        MouseEventKind::Drag => base + 32,
+    } + mouse_modifier_bits(mods);
+    Some(encode_mouse_button(
+        button,
+        mods,
+        mode,
+        column,
+        row,
+        kind == MouseEventKind::Release,
+    ))
+}
+
+/// 按原始 button 编号编码（滚轮 64/65 与点击共用 SGR/X10 后端）。
+fn encode_mouse_button(
+    button: usize,
+    _mods: Mods,
+    mode: TermMode,
+    column: usize,
+    row: usize,
+    is_release: bool,
+) -> Vec<u8> {
     let column = column.saturating_add(1);
     let row = row.saturating_add(1);
 
     if mode.contains(TermMode::SGR_MOUSE) {
-        return Some(format!("\x1b[<{button};{column};{row}M").into_bytes());
+        let marker = if is_release { 'm' } else { 'M' };
+        return format!("\x1b[<{button};{column};{row}{marker}").into_bytes();
     }
 
     let mut output = b"\x1b[M".to_vec();
@@ -273,7 +448,7 @@ pub fn encode_mouse_wheel(
     push_legacy_mouse_component(&mut output, button, utf8);
     push_legacy_mouse_component(&mut output, column, utf8);
     push_legacy_mouse_component(&mut output, row, utf8);
-    Some(output)
+    output
 }
 
 /// xterm 鼠标修饰位：Shift=4、Alt=8、Ctrl=16。
@@ -442,6 +617,64 @@ mod tests {
     }
 
     #[test]
+    fn kitty模式下非可打印键走csi_u() {
+        let kitty = TermMode::DISAMBIGUATE_ESC_CODES;
+        // Enter 无修饰走短形态。
+        assert_eq!(
+            encode_key(Key::Enter, no_mods(), kitty).unwrap(),
+            b"\x1b[13u"
+        );
+        // Shift+Enter 带修饰位（shift=2）。
+        let shift = Mods {
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(encode_key(Key::Enter, shift, kitty).unwrap(), b"\x1b[13;2u");
+        // 方向键走功能键编号（Up=57358）。
+        assert_eq!(
+            encode_key(Key::Up, no_mods(), kitty).unwrap(),
+            b"\x1b[57358u"
+        );
+        // F1=57345。
+        assert_eq!(
+            encode_key(Key::F(1), no_mods(), kitty).unwrap(),
+            b"\x1b[57345u"
+        );
+        // 可打印字符不受影响（仍 legacy）。
+        assert_eq!(encode_key(Key::Char('a'), no_mods(), kitty).unwrap(), b"a");
+        // 释放事件 event=3。
+        assert_eq!(
+            encode_kitty_release(Key::Enter, no_mods()).unwrap(),
+            b"\x1b[13;1:3u"
+        );
+        assert_eq!(
+            encode_kitty_release(Key::F(1), shift).unwrap(),
+            b"\x1b[57345;2:3u"
+        );
+    }
+
+    #[test]
+    fn shift_ctrl_enter区分于裸回车() {
+        let shift = Mods {
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            encode_key(Key::Enter, shift, TermMode::NONE).unwrap(),
+            b"\x1b[13;2~"
+        );
+        let ctrl = Mods {
+            ctrl: true,
+            ..Default::default()
+        };
+        assert_eq!(encode_key(Key::Enter, ctrl, TermMode::NONE).unwrap(), b"\n");
+        assert_eq!(
+            encode_key(Key::Enter, no_mods(), TermMode::NONE).unwrap(),
+            b"\r"
+        );
+    }
+
+    #[test]
     fn enter应用键盘模式() {
         // 主键盘 Enter 不受应用键盘模式影响，永远发 CR（\r）。
         // 曾误编码为 \x1bOM（数字小键盘 Enter 序列），导致 zsh 启用
@@ -495,6 +728,71 @@ mod tests {
         )
         .unwrap();
         assert_eq!(bytes, vec![0x1b, b'[', b'M', 96, 0xc4, 0x80, 37]);
+    }
+
+    #[test]
+    fn 鼠标点击按xterm协议编码() {
+        let sgr = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
+        // 左键按下 (0,0) → SGR 1-based 坐标。
+        assert_eq!(
+            encode_mouse_click(
+                MouseButton::Left,
+                MouseEventKind::Press,
+                no_mods(),
+                sgr,
+                0,
+                0
+            )
+            .unwrap(),
+            b"\x1b[<0;1;1M"
+        );
+        // 右键释放用小写 m 终止符。
+        assert_eq!(
+            encode_mouse_click(
+                MouseButton::Right,
+                MouseEventKind::Release,
+                no_mods(),
+                sgr,
+                2,
+                4
+            )
+            .unwrap(),
+            b"\x1b[<3;3;5m"
+        );
+        // 左键拖拽 button = 0 + 32。
+        let drag = TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::SGR_MOUSE;
+        assert_eq!(
+            encode_mouse_click(
+                MouseButton::Left,
+                MouseEventKind::Drag,
+                no_mods(),
+                drag,
+                1,
+                1
+            )
+            .unwrap(),
+            b"\x1b[<32;2;2M"
+        );
+        // 只订阅点击（1000）时不发拖拽：程序从未订阅该事件。
+        assert!(encode_mouse_click(
+            MouseButton::Left,
+            MouseEventKind::Drag,
+            no_mods(),
+            sgr,
+            1,
+            1
+        )
+        .is_none());
+        // 未启用上报时不编码。
+        assert!(encode_mouse_click(
+            MouseButton::Left,
+            MouseEventKind::Press,
+            no_mods(),
+            TermMode::NONE,
+            0,
+            0
+        )
+        .is_none());
     }
 
     #[test]

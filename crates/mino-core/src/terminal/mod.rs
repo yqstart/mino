@@ -20,6 +20,7 @@ use alacritty_terminal::term::{self, Term};
 use alacritty_terminal::tty;
 
 pub use alacritty_terminal::term::TermMode;
+use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 
 /// 终端尺寸（实现 alacritty 的 `Dimensions`）。
 #[derive(Clone, Copy, Debug)]
@@ -69,6 +70,25 @@ pub enum SessionEvent {
     },
     /// 程序查询文本区像素尺寸（CSI 14 t）。
     TextAreaSizeRequest(Arc<dyn Fn(WindowSize) -> String + Send + Sync>),
+    /// 程序请求恢复默认窗口标题（`OSC 0/1/2` 空值或 `TitleStack` 弹空；
+    /// alacritty 的 `Event::ResetTitle`，此前在 `_ => false` 被静默丢弃，
+    /// 标题会永久停在程序设置过的旧值）。
+    ResetTitle,
+    /// 程序请求写入系统剪贴板（OSC52 store，`]`+`c`/`p`/`s` 剪贴板类型已由
+    /// VT 层解析为 `ClipboardType`，这里只透传文本；默认配置只接受 copy）。
+    ClipboardStore {
+        /// 剪贴板类型（`Clipboard` / `Selection`，透传给 UI 层记录）。
+        clipboard: alacritty_terminal::term::ClipboardType,
+        /// 解码后的文本内容。
+        text: String,
+    },
+    /// 程序请求读取系统剪贴板（OSC52 load；默认配置拒绝，事件不会到达）。
+    ClipboardLoad {
+        /// 剪贴板类型。
+        clipboard: alacritty_terminal::term::ClipboardType,
+        /// 应答格式化函数（输入剪贴板文本，输出完整 OSC52 回复序列）。
+        formatter: Arc<dyn Fn(&str) -> String + Send + Sync>,
+    },
 }
 
 impl std::fmt::Debug for SessionEvent {
@@ -84,6 +104,11 @@ impl std::fmt::Debug for SessionEvent {
                 .field("index", index)
                 .finish(),
             SessionEvent::TextAreaSizeRequest(_) => f.write_str("TextAreaSizeRequest"),
+            SessionEvent::ClipboardStore { text, .. } => {
+                f.debug_tuple("ClipboardStore").field(text).finish()
+            }
+            SessionEvent::ClipboardLoad { .. } => f.write_str("ClipboardLoad"),
+            SessionEvent::ResetTitle => f.write_str("ResetTitle"),
         }
     }
 }
@@ -211,6 +236,33 @@ pub(crate) struct Shared {
     pub(crate) wakeup: AtomicBool,
 }
 
+/// 程序侧输出 → VT 解析器之前的改写层（本地测试注入与远程读循环共用）。
+///
+/// DECRQM 查 2026（同步更新）改写为“不支持”：alacritty 0.26 对 2026 的
+/// set/unset 是空实现（`()`），却按“已重置”回 `CSI ? 2026 ; 2 $ y`——程序
+/// （omp）据此判定支持同步更新并全程包 BSU/ESU，而终端实际不支持，回执与
+/// 能力不一致。改写只动这一条查询（`ModeState::NotSupported = 0`，与 VT 层
+/// 同格式 `CSI ? mode ; state $ y`），其它字节原样透传。
+/// 返回 true 表示已消费（调用方不再进解析器，但仍需发一次 Wakeup 重绘信号）。
+pub(crate) fn feed_program_output(
+    term: &Arc<FairMutex<Term<Listener>>>,
+    shared: &Arc<Shared>,
+    bytes: &[u8],
+) -> bool {
+    if bytes == b"\x1b[?2026$p" {
+        shared
+            .pending
+            .lock()
+            .unwrap()
+            .push(SessionEvent::PtyWrite("\x1b[?2026;0$y".to_string()));
+        return true;
+    }
+    // 混合包（含 2026 查询与其它输出同一 TCP 段到达）暂不拆包：整包透传，
+    // VT 层对 2026 回 2（旧行为）。omp 的 DECRQM 是独立短查询，实测独包。
+    let _ = term;
+    false
+}
+
 /// alacritty 事件监听器：把事件记录到共享状态并通知回调。
 pub struct Listener {
     pub(crate) shared: Arc<Shared>,
@@ -321,6 +373,47 @@ impl EventListener for Listener {
                         false
                     } else {
                         pending.push(SessionEvent::TextAreaSizeRequest(formatter));
+                        true
+                    }
+                }
+                // OSC52 剪贴板写入：程序复制（如 omp 的 yank）必须到达系统
+                // 剪贴板，否则“复制了但 ⌘V 粘不出来”。文本可能较长（整段
+                // 代码），与 PtyWrite 同级保护：不受状态事件上限限制。
+                Event::ClipboardStore(clipboard, text) => {
+                    pending.push(SessionEvent::ClipboardStore { clipboard, text });
+                    true
+                }
+                // OSC52 剪贴板读取：默认配置拒绝（OnlyCopy），几乎不会到达；
+                // 到达则按普通状态事件入队（丢一条只让程序读不到剪贴板）。
+                Event::ClipboardLoad(clipboard, formatter)
+                    if pending.len() < MAX_PENDING_EVENTS =>
+                {
+                    pending.push(SessionEvent::ClipboardLoad {
+                        clipboard,
+                        formatter,
+                    });
+                    true
+                }
+                // 标题重置是最新状态（与 Title 同级）：已有 Title 就地替换，
+                // 否则按普通状态事件入队；队列满时回收一个可丢弃的 Bell。
+                Event::ResetTitle => {
+                    if let Some(existing) = pending
+                        .iter_mut()
+                        .find(|event| matches!(event, SessionEvent::Title(_)))
+                    {
+                        *existing = SessionEvent::ResetTitle;
+                        true
+                    } else if pending.len() < MAX_PENDING_EVENTS {
+                        pending.push(SessionEvent::ResetTitle);
+                        true
+                    } else if let Some(index) = pending
+                        .iter()
+                        .position(|event| matches!(event, SessionEvent::Bell))
+                    {
+                        pending[index] = SessionEvent::ResetTitle;
+                        true
+                    } else {
+                        pending.push(SessionEvent::ResetTitle);
                         true
                     }
                 }
@@ -453,7 +546,10 @@ impl Session {
         on_event: EventHandler,
     ) -> io::Result<Session> {
         let shared = Arc::new(Shared::default());
-        let config = term::Config::default();
+        let config = term::Config {
+            kitty_keyboard: true,
+            ..term::Config::default()
+        };
 
         // 创建 PTY（macOS/Unix 平台）。
         let shell = options
@@ -585,6 +681,20 @@ impl Session {
         self.shared.wakeup.store(false, Ordering::Release);
         let mut pending = self.shared.pending.lock().unwrap();
         std::mem::take(&mut *pending)
+    }
+
+    /// 测试用：把程序侧输出直接喂给 VT 解析器（与远程 `remote_loop` 同管线）。
+    ///
+    /// `session.write` 是往从机方向写（会被 shell 吃掉输入），开鼠标上报
+    /// 这类 DECSET 必须从程序侧进入解析器；公开的 `Term` API 没有 mode
+    /// setter，只能走字节流注入。
+    pub fn inject_program_output_for_test(&self, bytes: &[u8]) {
+        if feed_program_output(&self.term, &self.shared, bytes) {
+            return;
+        }
+        let mut parser: Processor<StdSyncHandler> = Processor::new();
+        let mut guard = self.term.lock();
+        parser.advance(&mut *guard, bytes);
     }
 
     /// 当前窗口标题。
@@ -829,7 +939,10 @@ mod tests {
         assert_eq!(events, 0);
         let _ = Session {
             term: Arc::new(FairMutex::new(Term::new(
-                term::Config::default(),
+                term::Config {
+                    kitty_keyboard: true,
+                    ..term::Config::default()
+                },
                 &TermSize { rows: 1, cols: 1 },
                 Listener {
                     shared: shared.clone(),

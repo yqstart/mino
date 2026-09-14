@@ -40,6 +40,8 @@ pub struct PastedImage {
 pub trait ClipboardReader {
     /// 剪贴板文本（`arboard::get_text` 语义；失败/无内容返回 `None`）。
     fn clipboard_text(&mut self) -> Option<String>;
+    /// 写入剪贴板文本（OSC52 程序复制用；失败返回 `Err`，调用方 toast）。
+    fn set_clipboard_text(&mut self, text: &str) -> Result<(), String>;
     /// macOS 文件路径（`NSFilenamesPboardType`；非 macOS 或无文件返回空）。
     fn clipboard_file_paths(&self) -> Vec<PathBuf>;
     /// 剪贴板像素（`arboard::get_image` 语义；`width/height/RGBA`）。
@@ -69,6 +71,14 @@ impl ClipboardReader for SystemClipboard {
     fn clipboard_text(&mut self) -> Option<String> {
         let text = self.clipboard.as_mut()?.get_text().ok()?;
         (!text.is_empty()).then_some(text)
+    }
+
+    fn set_clipboard_text(&mut self, text: &str) -> Result<(), String> {
+        self.clipboard
+            .as_mut()
+            .ok_or_else(|| "剪贴板不可用".to_string())?
+            .set_text(text)
+            .map_err(|e| format!("写入剪贴板失败：{e}"))
     }
 
     #[cfg(target_os = "macos")]
@@ -379,6 +389,11 @@ mod tests {
     impl ClipboardReader for FakeClipboard {
         fn clipboard_text(&mut self) -> Option<String> {
             self.text.clone()
+        }
+
+        fn set_clipboard_text(&mut self, text: &str) -> Result<(), String> {
+            self.text = Some(text.to_owned());
+            Ok(())
         }
 
         fn clipboard_file_paths(&self) -> Vec<PathBuf> {

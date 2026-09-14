@@ -180,19 +180,13 @@ impl TerminalTab {
     }
 
     /// 本地会话的 `(末级目录名, 全路径)`；远程会话返回 `None`。
+    ///
+    /// 数据源是 `TerminalView::effective_local_directory`（内核 cwd 优先、
+    /// 跟踪值回退）：输入跟踪在粘贴/补全/别名等场景下会停在旧目录，
+    /// 标题不能依赖它；也不采用 shell 上报的窗口标题（oh-my-zsh 的标题是
+    /// 截断过的 `%15<..<%~%<<`）。
     fn local_dir(&self) -> Option<(String, String)> {
-        if self.terminal.session().is_remote() {
-            return None;
-        }
-        // 本地目录以 shell 子进程的内核 cwd 为准（`source`/别名/函数/多行粘贴/
-        // `cd -` 等场景下输入跟踪都会失效或保守放弃，标题不能依赖它）。
-        // 内核查询偶发失败（子进程刚 fork 间隙）时才回退到输入跟踪值。
-        let full = self
-            .terminal
-            .session()
-            .child_current_dir()
-            .map(|path| path.to_string_lossy().into_owned())
-            .or_else(|| self.terminal.tracked_directory())?;
+        let full = self.terminal.effective_local_directory()?;
         Some((dir_display_name(&full), full))
     }
 }
@@ -333,6 +327,10 @@ fn local_session_options_at(dir: Option<PathBuf>) -> SessionOptions {
         // socket=绿、管道=黄、块/字符设备=蓝（默认底色）。
         env: [
             ("TERM".to_string(), "xterm-256color".to_string()),
+            // omp 的颜色档位：`COLORTERM=truecolor/24bit` 才判 24（`getColorMode`
+            // 实证）；`TERM=xterm-256color` 只判 8。mino 渲染层本就走真彩
+            // （`resolve_color` 直接 RGB），此前缺这一行让 omp 全程降级 256 色。
+            ("COLORTERM".to_string(), "truecolor".to_string()),
             ("CLICOLOR".to_string(), "1".to_string()),
             ("LSCOLORS".to_string(), "Gxfxcxdxbxegedabagacad".to_string()),
         ]
@@ -855,10 +853,11 @@ impl MinoApp {
             }
         }
     }
-
     /// 收藏当前终端目录为项目（⌘D 与快捷菜单空态入口共用）。
     ///
-    /// 仅本地标签可用：目录取 `TerminalView::current_directory`（SFTP 定位同源）；
+    /// 仅本地标签可用：目录取 `TerminalView::effective_local_directory`
+    /// （内核 cwd 优先、跟踪值回退）——纯跟踪值在粘贴/补全/别名场景下会
+    /// 停在启动目录，标题与 SFTP 定位都不依赖它；
     /// 去重只看规范路径（重名允许），默认名取末级目录名。
     fn bookmark_current_directory(&mut self) {
         let Some(tab) = self.tabs.get(self.active_tab) else {
@@ -869,7 +868,7 @@ impl MinoApp {
             self.show_toast("仅支持收藏本地终端目录", true);
             return;
         }
-        let Some(cwd) = tab.terminal.current_directory() else {
+        let Some(cwd) = tab.terminal.effective_local_directory() else {
             self.show_toast("当前目录未知，稍后再试", true);
             return;
         };
@@ -1512,6 +1511,9 @@ impl MinoApp {
                 }
             }
             if let Some(message) = tab.terminal.take_image_paste_error() {
+                paste_errors.push(message);
+            }
+            if let Some(message) = tab.terminal.take_clipboard_write_error() {
                 paste_errors.push(message);
             }
         }
@@ -3161,7 +3163,7 @@ impl MinoApp {
                     .tabs
                     .get(self.active_tab)
                     .filter(|t| !t.terminal.session().is_remote())
-                    .and_then(|t| t.terminal.current_directory())
+                    .and_then(|t| t.terminal.effective_local_directory())
                 {
                     Some(dir) => e.path = dir,
                     None => self.show_toast("当前无本地终端目录", true),
@@ -6012,8 +6014,12 @@ mod tab_tests {
         let project = base.join("proj-alpha");
         std::fs::create_dir_all(&project).expect("创建测试目录失败");
 
+        let home_dir = PathBuf::from(std::env::var("HOME").expect("测试环境应有 HOME"));
         let session = Session::spawn_local(
-            SessionOptions::default(),
+            SessionOptions {
+                working_directory: Some(home_dir),
+                ..Default::default()
+            },
             80,
             24,
             Arc::new(|_ev: &SessionEvent| {}),
@@ -6339,6 +6345,13 @@ mod tab_tests {
             opts.env.get("TERM").map(String::as_str),
             Some("xterm-256color"),
             "本地会话必须注入 TERM=xterm-256color（避免继承 TERM=dumb）"
+        );
+        // 必须注入 COLORTERM：omp 只认该变量判 24-bit（`getColorMode` 实证），
+        // 缺了它 agent 全程降级 256 色。
+        assert_eq!(
+            opts.env.get("COLORTERM").map(String::as_str),
+            Some("truecolor"),
+            "本地会话必须注入 COLORTERM=truecolor（omp 24-bit 开关）"
         );
     }
 
@@ -7306,6 +7319,81 @@ mod project_tests {
         );
 
         std::fs::remove_file(&config_path).ok();
+    }
+    /// 回归（用户报告“cd 后收藏的还是启动目录”）：粘贴 `cd` 让输入跟踪
+    /// `invalidate` 后，收藏必须用 shell 真正所在的目录（内核 cwd，与标题
+    /// 同源），不能停在跟踪旧值。仅 macOS：Linux 无内核 cwd 接口。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn 粘贴cd后收藏真实目录() {
+        use std::time::{Duration, Instant};
+        let base = project_base("bookmark-stale");
+        let target = base.join("real");
+        std::fs::create_dir_all(&target).unwrap();
+        let config_path = test_config_path("projects-bookmark-stale");
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            MinoApp::new_with_config(cc, config_path.clone())
+        });
+        harness.run_steps(6);
+        harness.event(egui::Event::Text("printf __MINO_BOOKMARK_READY__".into()));
+        harness.event(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut ready = false;
+        while Instant::now() < deadline {
+            harness.step();
+            let text = crate::views::terminal_view::tests_grid_text(
+                harness.state().tabs[harness.state().active_tab]
+                    .terminal
+                    .session(),
+            );
+            if text.contains("__MINO_BOOKMARK_READY__") {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        assert!(ready, "zsh 未就绪");
+        harness.event(egui::Event::Paste(format!("cd {}", target.display())));
+        harness.event(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.run_steps(6);
+        let expected = std::fs::canonicalize(&target).expect("规范化测试目录失败");
+        let expected_text = expected.to_string_lossy().into_owned();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            harness.step();
+            let dir = harness.state().tabs[harness.state().active_tab]
+                .terminal
+                .effective_local_directory();
+            if dir.as_deref() == Some(expected_text.as_str()) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "内核 cwd 未跟随到目标目录，当前：{dir:?}（期望 {expected_text}）"
+            );
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        harness.state_mut().bookmark_current_directory();
+        assert_eq!(harness.state().config.projects.len(), 1, "应收藏一项");
+        assert_eq!(
+            harness.state().config.projects[0].path,
+            expected,
+            "粘贴 cd 后收藏的应是真实目录"
+        );
+        std::fs::remove_file(&config_path).ok();
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// 项目启动命令在打开后自动执行（终端输出出现标记）。
