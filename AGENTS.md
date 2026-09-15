@@ -193,6 +193,11 @@ cargo clippy --workspace --all-targets   # 零警告
 cargo fmt --all
 ```
 
+## 发布流程
+
+- 版本发布必须先把代码合并到 `main`，再在 `main` 上打 `v<主>.<次>.<补丁>` 标签触发 Release 工作流；禁止在功能/诊断分支上直接打 tag 发布
+- 发布门禁三件套必须一致：`Cargo.toml [workspace.package] version` == tag 去掉 `v` == `CHANGELOG.md` 顶部的 `## [版本]` 段落（Release 工作流 `Validate release tag and version` 会强制校验）
+
 **UI 测试必须串行**（`-- --test-threads=1`，CI 与 Release 工作流都这样跑）：并行时 kittest 争抢全局状态（主题静态、图形后端）会出现假失败——曾实测 `拖入文件目录应用路径写入终端` 失败、`超链接分段与点击` 挂起 60s+，串行后全部通过。
 
 窗口圆角为运行时原生效果（kittest 无真实窗口句柄，无法单测断言）；验证方式：`cargo run -p mino-app` 后 `screencapture -l <CGWindowID>` 截窗，四角像素应全透明（RGBA alpha=0）。
