@@ -9,13 +9,17 @@ description = "Mino 轻量终端与 SFTP GUI 应用"
 mino-core = { path = "../mino-core" }
 eframe = { workspace = true }
 egui = { workspace = true }
+epaint = { workspace = true }
+bytemuck = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 tokio = { workspace = true }
 alacritty_terminal = "0.26"
 arboard = { version = "3.6", features = ["image-data"] }
 rfd = "0.15"
-image = "0.25"
+# 只保留 PNG 编解码：图标解码与剪贴板截图编码都用 PNG，
+# 默认特性会拉入 avif/bmp/gif/jpeg/... 全套编解码器（编译时间与体积）。
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 # macOS 原生窗口圆角（无边框窗口 contentView layer cornerRadius）。
 # features 全局合并：追加 objc2-quartz-core 不会影响 eframe/winit 的既有实例。

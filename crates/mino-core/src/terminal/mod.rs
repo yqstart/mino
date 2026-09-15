@@ -116,6 +116,19 @@ impl std::fmt::Debug for SessionEvent {
 /// 事件回调：后台有数据时由监听器线程调用（用于触发 UI 重绘）。
 pub type EventHandler = Arc<dyn Fn(&SessionEvent) + Send + Sync>;
 
+/// 合并式唤醒通知：两次 `drain_events` 之间最多回调一次。
+///
+/// 每次回调都会经 `EventLoopProxy` 唤醒 UI 并请求重绘（一次 Context 写锁 +
+/// 一条重绘缘由）。远程读循环按 SSH 数据包逐包到达，`cat` 大文件时可达
+/// 每帧数十包——逐包回调会把重绘请求放大到与包数同阶，而一帧只需要一次
+/// 重绘。标志位由 `Session::drain_events` 复位，语义与本地 alacritty
+/// 事件循环的 `Event::Wakeup` 合并完全一致。
+pub(crate) fn notify_wakeup(shared: &Shared, on_event: &EventHandler) {
+    if !shared.wakeup.swap(true, Ordering::AcqRel) {
+        (on_event)(&SessionEvent::Wakeup);
+    }
+}
+
 /// 读取本地 shell 当前工作目录（macOS `PROC_PIDVNODEPATHINFO`）。
 ///
 /// 内核态真实值，与 shell 是否内建、是否输出无关：`source`/别名/函数、
@@ -272,9 +285,7 @@ pub struct Listener {
 impl EventListener for Listener {
     fn send_event(&self, event: Event) {
         if matches!(event, Event::Wakeup) {
-            if !self.shared.wakeup.swap(true, Ordering::AcqRel) {
-                (self.on_event)(&SessionEvent::Wakeup);
-            }
+            notify_wakeup(&self.shared, &self.on_event);
             return;
         }
         // 只在锁内更新共享状态；UI 回调可能触发事件循环唤醒，不能在
@@ -342,14 +353,48 @@ impl EventListener for Listener {
                     }
                 }
                 Event::PtyWrite(text) => {
-                    if let Some(SessionEvent::PtyWrite(previous)) = pending.last_mut() {
-                        previous.push_str(&text);
+                    // PtyWrite 是终端能力应答（DA/kitty/DECRQM/OSC 查询回执），
+                    // 不是用户数据：单条很短（<100B），但多 tab 高输出并发时
+                    // 后台标签长期不消费会无界追加；旧注释称"用户数据"有误。
+                    // 字节上限 64KB：超限丢最旧的应答（程序按"未知终端"回退，
+                    // 不破坏终端状态），保证后台队列内存有界。
+                    const MAX_PTY_WRITE_BYTES: usize = 64 * 1024;
+                    let queued: usize = pending
+                        .iter()
+                        .filter_map(|event| match event {
+                            SessionEvent::PtyWrite(text) => Some(text.len()),
+                            _ => None,
+                        })
+                        .sum();
+                    let mut overflow = queued
+                        .saturating_add(text.len())
+                        .saturating_sub(MAX_PTY_WRITE_BYTES);
+                    // 丢最旧的应答给新应答腾位；单条超限则直接丢新应答。
+                    let accepted = if overflow == 0 {
+                        true
                     } else {
-                        // PtyWrite 不受普通状态事件上限限制，避免粘贴/OSC
-                        // 回写数据在后台标签页积压时被静默丢失。
-                        pending.push(SessionEvent::PtyWrite(text));
+                        pending.retain_mut(|event| {
+                            if overflow == 0 {
+                                return true;
+                            }
+                            let SessionEvent::PtyWrite(previous) = event else {
+                                return true;
+                            };
+                            let drop = previous.len().min(overflow);
+                            previous.drain(..drop);
+                            overflow -= drop;
+                            !previous.is_empty()
+                        });
+                        overflow == 0
+                    };
+                    if accepted {
+                        if let Some(SessionEvent::PtyWrite(previous)) = pending.last_mut() {
+                            previous.push_str(&text);
+                        } else {
+                            pending.push(SessionEvent::PtyWrite(text));
+                        }
                     }
-                    true
+                    accepted
                 }
                 Event::Bell if pending.len() < MAX_PENDING_EVENTS => {
                     pending.push(SessionEvent::Bell);
@@ -620,6 +665,9 @@ impl Session {
         let resizer_channel = channel.clone();
         let shuttor_channel = channel.clone();
         let writer = Writer::new(move |bytes: &[u8]| {
+            // 通道本身就要所有权，这里一次小拷贝是底线；批量合并由调用方
+            // 在调用前完成（`TerminalView::handle_input` 把一帧的输入攒成
+            // 一次 `write`，滚轮 steps 循环这类 N 次发送已消除）。
             let _ = writer_channel.send(Msg::Input(bytes.to_vec().into()));
         });
         let resizer = Resizer::new(move |cols: u16, rows: u16| {
@@ -664,12 +712,27 @@ impl Session {
 
     /// 调整终端尺寸（窗口 resize 时调用）。
     pub fn resize(&mut self, cols: u16, rows: u16) {
+        self.resize_grid(cols, rows);
+        // 通知后台（PTY/SSH channel）。
+        self.resizer.resize(cols, rows);
+    }
+
+    /// 只同步终端状态机网格，不通知后台。
+    ///
+    /// 窗口拖拽中每帧都在变化：本地网格必须立即跟上（否则字越界/显示错位），
+    /// 但后台通知（本地 `SIGWINCH`/PTY ioctl、远程 SSH `window_change` 网络
+    /// 包）可以节流——由 `TerminalView` 按 50ms 合并后补发最终尺寸。
+    /// 无条件重入开销为一次 `Term::resize`（网格引用更新，空网格时便宜）。
+    pub fn resize_grid(&mut self, cols: u16, rows: u16) {
         // 同步更新终端状态机网格。
         self.term.lock().resize(TermSize {
             rows: rows as usize,
             cols: cols as usize,
         });
-        // 通知后台（PTY/SSH channel）。
+    }
+
+    /// 只通知后台当前网格尺寸（拖拽节流的 trailing 补发）。
+    pub fn notify_backend_size(&self, cols: u16, rows: u16) {
         self.resizer.resize(cols, rows);
     }
 
@@ -834,6 +897,58 @@ mod tests {
             .any(|event| { matches!(event, SessionEvent::PtyWrite(text) if text == "payload!") }));
     }
 
+    /// 回归：PtyWrite 队列字节有界——后台标签长期不消费时丢最旧的终端能力
+    /// 应答，不无界追加；超限后新应答仍通知 UI 轮询（程序按"未知终端"回退，
+    /// 不破坏终端状态）。用户现象：多 tab 高输出并发时整窗冻结。
+    #[test]
+    fn 写回队列超限丢最旧应答且有界() {
+        let shared = Arc::new(Shared::default());
+        let callback_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_count_clone = callback_count.clone();
+        let listener = Listener {
+            shared: shared.clone(),
+            on_event: Arc::new(move |_event| {
+                callback_count_clone.fetch_add(1, Ordering::Relaxed);
+            }),
+        };
+        // 每条 1KB，先压 64 条占满 64KB 上限。
+        let chunk = "x".repeat(1024);
+        for _ in 0..64 {
+            listener.send_event(Event::PtyWrite(chunk.clone()));
+        }
+        let bytes: usize = shared
+            .pending
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::PtyWrite(text) => Some(text.len()),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(bytes, 64 * 1024, "64 条 1KB 应答应占满上限");
+        // 再压一条：丢最旧 1KB、新数据完整保留，总量仍为上限。
+        listener.send_event(Event::PtyWrite("NEW".into()));
+        let pending = shared.pending.lock().unwrap();
+        let bytes: usize = pending
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::PtyWrite(text) => Some(text.len()),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(bytes, 64 * 1024, "超限后总量应仍为上限");
+        let merged: String = pending
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::PtyWrite(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(merged.ends_with("NEW"), "新应答必须保留");
+        assert_eq!(merged.len(), 64 * 1024);
+    }
+
     #[test]
     fn 队列已满时仍通知子进程退出() {
         let shared = Arc::new(Shared::default());
@@ -960,5 +1075,31 @@ mod tests {
         }
         .drain_events();
         assert!(!shared.wakeup.load(Ordering::Acquire));
+    }
+
+    /// 远程读循环按 SSH 数据包逐包到达（`cat` 大文件时每帧数十包），
+    /// 逐包回调会把重绘请求放大到与包数同阶；`notify_wakeup` 必须与本地
+    /// `Event::Wakeup` 走同一套合并语义（一次 drain 间隔内最多一次）。
+    #[test]
+    fn 远程数据包合并为一次重绘通知() {
+        let shared = Arc::new(Shared::default());
+        let callback_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = callback_count.clone();
+        let on_event: EventHandler = Arc::new(move |_event| {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+
+        // 模拟连续三个 SSH 数据包：只应产生一次回调。
+        for _ in 0..3 {
+            notify_wakeup(&shared, &on_event);
+        }
+        assert_eq!(callback_count.load(Ordering::Relaxed), 1);
+        assert!(shared.wakeup.load(Ordering::Acquire));
+
+        // drain 周期复位（与 `Session::drain_events` 的第一步同语义）后，
+        // 下一个数据包必须再次触发一次回调——否则终端内容更新后没有下一帧。
+        shared.wakeup.store(false, Ordering::Release);
+        notify_wakeup(&shared, &on_event);
+        assert_eq!(callback_count.load(Ordering::Relaxed), 2);
     }
 }

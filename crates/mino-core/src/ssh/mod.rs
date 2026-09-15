@@ -9,7 +9,7 @@ pub mod sftp;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, LazyLock,
 };
 use std::time::Duration;
 
@@ -26,10 +26,48 @@ use tokio::sync::{
 
 use crate::config::Auth;
 use crate::terminal::{
-    feed_program_output, EventHandler, Listener, Session, SessionEvent, Shared, TermSize,
+    feed_program_output, notify_wakeup, EventHandler, Listener, Session, SessionEvent, Shared,
+    TermSize,
 };
 
 use known_hosts::{default_known_hosts_path, HostKeyVerifier};
+
+/// 进程级共享 tokio runtime（远程终端与 SFTP 后台任务共用）。
+///
+/// 此前每个远程连接与每个 SFTP 连接各建一个 2-worker runtime：N 个远程
+/// 标签 = 2N 个 runtime + 2N 个常驻 worker 线程，线程数、内存与上下文
+/// 切换开销随标签数线性增长。共享 runtime 只建一次（worker 数 = CPU 数，
+/// 上限 8），所有连接任务经 `spawn` 提交。
+///
+/// 初始化失败以 `Err` 返回而不是 panic：调用方需要像以前一样把失败回传
+/// 给 UI（不能让窗口永久停在"正在连接…"）。`LazyLock` 持有结果本身，
+/// 失败后不会每次访问都重新尝试创建。
+pub(crate) static SHARED_RUNTIME: LazyLock<Result<tokio::runtime::Runtime, String>> =
+    LazyLock::new(|| {
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get().clamp(2, 8))
+            .unwrap_or(4);
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(workers)
+            .thread_name("mino-async")
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())
+    });
+
+/// 在一个只做阻塞等待的轻量 runtime 上等一个共享 runtime 任务结束。
+///
+/// 共享 runtime 的 worker 里不能 `block_on`（会占住 worker 甚至自锁），
+/// 而调用方历史上拿到的是一个可被丢弃的线程句柄；等待线程自身不需要
+/// reactor，`current_thread` runtime 只用来 `block_on` 那个 JoinHandle。
+pub(crate) fn wait_for_task(task: tokio::task::JoinHandle<()>) {
+    match tokio::runtime::Builder::new_current_thread().build() {
+        Ok(runtime) => {
+            let _ = runtime.block_on(task);
+        }
+        Err(e) => log::warn!("创建等待任务的 runtime 失败，后台任务改由进程退出回收：{e}"),
+    }
+}
 
 /// 远程会话后台命令。
 enum SessionCmd {
@@ -164,23 +202,46 @@ pub fn connect_remote_with_cancel(
     };
     let thread_cancel = cancel.clone();
     let profile = profile.clone();
+    // 共享 runtime 上提交连接任务：不再为每个连接建 2-worker runtime + 线程。
+    // 外层线程只等待任务结束（调用方历史上拿到线程句柄，仅持有不 join）。
     let handle = std::thread::spawn(move || {
-        // runtime 创建失败（资源耗尽等极端情况）也必须回传失败事件，
+        // runtime 不可用（资源耗尽等极端情况）也必须回传失败事件，
         // 不能 panic 在后台线程让 UI 永久停在"正在连接…"。
-        let runtime = match tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-        {
+        let runtime = match SHARED_RUNTIME.as_ref() {
             Ok(runtime) => runtime,
             Err(e) => {
                 let _ = tx.send(ConnectResult::Failed(format!("初始化连接运行时失败：{e}")));
                 return;
             }
         };
+        wait_for_task(runtime.spawn(connect_and_serve_remote(
+            profile,
+            cols,
+            rows,
+            on_event,
+            thread_cancel,
+            tx,
+        )));
+    });
+    (handle, rx, cancel)
+}
+
+/// 远程建连与会话服务（共享 runtime 上的任务体）。
+///
+/// 建连阶段每一步都经 `cancellable_connect` 响应取消；成功后 `remote_loop`
+/// 接管 channel，会话关闭（`session_done`）即任务结束，等待线程随之退出。
+async fn connect_and_serve_remote(
+    profile: crate::config::HostProfile,
+    cols: u16,
+    rows: u16,
+    on_event: EventHandler,
+    thread_cancel: ConnectCancel,
+    tx: mpsc::UnboundedSender<ConnectResult>,
+) {
+    {
         let session_done = Arc::new(tokio::sync::Notify::new());
         let session_done_loop = session_done.clone();
-        runtime.block_on(async move {
+        {
             // ============ 1. TCP 连接与认证（含主机密钥 TOFU 校验） ============
             let config = Arc::new(ssh_config());
             let mut handle =
@@ -323,11 +384,10 @@ pub fn connect_remote_with_cancel(
                 term, shared, writer, resizer, shuttor, true, None,
             )));
 
-            // ============ 7. 等待会话关闭，保持 runtime 存活 ============
+            // ============ 7. 等待会话关闭：任务随 remote_loop 结束而结束 ============
             session_done.notified().await;
-        });
-    });
-    (handle, rx, cancel)
+        }
+    }
 }
 
 const CONNECT_CANCELLED: &str = "连接已取消";
@@ -420,12 +480,12 @@ async fn remote_loop(
                     Some(ChannelMsg::Data { data }) => {
                         log::debug!("远程收到 {} 字节", data.len());
                         if feed_program_output(&term, &shared, &data) {
-                            (on_event)(&SessionEvent::Wakeup);
+                            notify_wakeup(&shared, &on_event);
                         } else {
                             let mut guard = term.lock();
                             parser.advance(&mut *guard, &data);
                             drop(guard);
-                            (on_event)(&SessionEvent::Wakeup);
+                            notify_wakeup(&shared, &on_event);
                         }
                     }
                     Some(ChannelMsg::ExtendedData { data, .. }) => {
@@ -433,7 +493,7 @@ async fn remote_loop(
                         let mut guard = term.lock();
                         parser.advance(&mut *guard, &data);
                         drop(guard);
-                        (on_event)(&SessionEvent::Wakeup);
+                        notify_wakeup(&shared, &on_event);
                     }
                     Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) => {
                         break;

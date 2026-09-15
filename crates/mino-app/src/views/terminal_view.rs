@@ -22,12 +22,20 @@ use mino_core::terminal::keys::{
 };
 use mino_core::terminal::{Session, SessionEvent, TermMode};
 
+/// 装饰网格线的顶点缓存（面板矩形 / 主题修订号 / 缩放比全都没变时直接复用）。
+struct GridLinesCache {
+    rect: Rect,
+    theme_revision: u64,
+    ppp: f32,
+    mesh: std::sync::Arc<egui::Mesh>,
+}
+
 /// 行缓存：内容 hash 未变时复用已布局文本（Galley），避免每帧重建。
 /// `runs` 与 pixels_per_point 绑定，窗口缩放后需全量失效（见 `show`）。
 #[derive(Clone)]
 struct RowCache {
-    /// 内容指纹（fg+bg+样式+字符；不含光标效果，光标移动不触发重建）。
-    hash: u64,
+    /// 逐列 cell 指纹快照（与 `LineData::cell_keys` 同构）。
+    cell_keys: Vec<u64>,
     /// 已布局文本分段（每段按终端列定位绘制，无需整行 layout_job）。
     runs: Vec<CachedRun>,
     /// 背景段（合并相邻相同背景色，含起止列）。
@@ -111,7 +119,11 @@ struct BgRect {
 
 /// 单行渲染数据（锁内构建，锁外 layout）。
 struct LineData {
-    hash: u64,
+    /// 逐列的 cell 指纹（长度 = 列数）。
+    ///
+    /// 用于「只重算受损列并比对」的最小重建：光标移动只损伤 1-2 列，
+    /// 整行 80-200 cell 的颜色解析与分词没有必要时每帧重做。
+    cell_keys: Vec<u64>,
     segments: Vec<Segment>,
     backgrounds: Vec<BgRect>,
 }
@@ -220,10 +232,115 @@ pub struct TerminalView {
     remote_home: Option<std::path::PathBuf>,
     /// 上一帧终端是否持有焦点（焦点自动恢复用）。
     had_focus: bool,
+    /// 本地目录缓存 `(规范路径, 取值时刻)`。
+    ///
+    /// 标签栏与状态栏每帧都要标题（→ 本地目录），而内核 cwd 查询要经过
+    /// `waitpid` + `proc_listchildpids` + `proc_pidinfo` + `canonicalize`
+    /// 多次系统调用；目录在一帧内不可能变化，用极短 TTL 摊掉这些调用。
+    /// 需要即时真值的入口（⌘D 收藏、SFTP 定位）走 `fresh_local_directory`。
+    dir_cache: std::cell::RefCell<Option<(String, std::time::Instant)>>,
     /// 分段耗时打点（性能 HUD 读数；默认不共享，仅本视图内部使用）。
     last_build_ms: f32,
     last_layout_ms: f32,
     last_paint_ms: f32,
+    /// 本帧的规模计数 `(shapes, 重建行数, 复用行数, 上传字节)`。
+    ///
+    /// 渲染优化的唯一可观察证据：帧耗时无法区分「CPU 侧重建」与
+    /// 「GPU 侧上传」，两者优化手段完全不同。
+    last_stats: (usize, usize, usize, usize),
+    /// 本帧待提交的 Shape 列表（复用缓冲）。
+    ///
+    /// 逐 Shape 调 `Painter::add` 每次都要取 Context 写锁并做一次 Vec push；
+    /// egui 的 `Painter::extend` 明确说明「一次提交比多次 add 快」，
+    /// 满屏 CJK 场景下这是 10^3 次写锁与 1 次的区别。
+    shapes_scratch: Vec<egui::Shape>,
+    /// 损坏行的列区间（复用缓冲；每帧 `clear` + `resize` 而非新建）。
+    ///
+    /// `None` = 未损坏；`Some((left, right))` = 该显示行的受损列范围
+    /// （alacritty 的 damage 带列区间，此前被完全忽略，导致光标移动也整行重建）。
+    damaged_bits: Vec<Option<(usize, usize)>>,
+    /// 本帧待布局的行数据（复用缓冲；每帧 `clear`）。
+    lines_scratch: Vec<(i32, LineData)>,
+    /// 本帧终端内容区域（`outer` 内缩 `PADDING` 后的矩形）。
+    ///
+    /// Phase C 的行顶点是「行内相对」坐标，`inner.min` 变化必须让所有行
+    /// 顶点失效；测试也需要它把网格坐标换算成屏幕坐标做命中断言。
+    last_inner: Rect,
+    /// 装饰网格线的已 tessellate 顶点缓存（面板矩形不变时零重建）。
+    ///
+    /// 网格线每帧约 40+26 条，形状完全静态却要重新 tessellate 并逐条提交；
+    /// 缓存成 `Shape::Mesh` 后每帧只提交一个图元。
+    grid_lines_cache: Option<GridLinesCache>,
+    /// 组字串的已布局 Galley 缓存 `(文本, 字号, Galley)`。
+    ///
+    /// 组字期间每帧都重绘，而预编辑串在两次按键之间不变——缓存避免每帧
+    /// 重新 shaping（`Text::clone` + `chars().collect()` + 整串 layout）。
+    ime_preedit_cache: Option<(String, f32, std::sync::Arc<egui::Galley>)>,
+    /// 自管 GPU 渲染资源（`None` = 走 egui 的 Shape 路径，如无 GPU 的测试环境）。
+    gpu: Option<std::sync::Arc<crate::views::terminal_gpu::TerminalGpu>>,
+    /// 行顶点/索引缓冲（仅自管路径使用）。
+    gpu_rows: crate::views::terminal_gpu::RowBuffers,
+    /// 每行 uniform（仅自管路径使用，懒建）。
+    gpu_uniform: Option<crate::views::terminal_gpu::UniformBlock>,
+    /// 当前字体图集绑定（仅自管路径使用；由 UI 线程刷新后持有）。
+    gpu_atlas: Option<std::sync::Arc<crate::views::terminal_gpu::AtlasBinding>>,
+    /// 上次提交给 GPU 的图集足迹 `(宽, 高, 填充率)`。
+    ///
+    /// 尺寸变化 = egui-wgpu 换了 wgpu 纹理；填充率**骤降** = epaint 整份重建了
+    /// 字体系统（`fill_ratio() > 0.8` 触发），此时图集尺寸可能一模一样，但
+    /// 字形位置全变——只比尺寸会漏掉这种情况，表现为「字符错位/串码」。
+    gpu_last_atlas: (usize, usize, u32),
+    /// 已上传到 GPU 的行网格（**网格行号** → 顶点数据；内容一变就重传）。
+    ///
+    /// 与 `row_meshes` 互斥使用：自管路径只维护这份，egui 路径只维护那份，
+    /// 避免同一份行顶点存两份。
+    gpu_row_meshes: HashMap<i32, std::sync::Arc<egui::Mesh>>,
+    /// 已上传到 GPU 的行网格快照（网格行号 → 顶点；`Arc::ptr_eq` 判是否需重传）。
+    gpu_uploaded: HashMap<i32, std::sync::Arc<egui::Mesh>>,
+    /// **当前缓存的行网格是用哪个图集尺寸构建的**（纹素）。
+    ///
+    /// 行网格顶点的 uv 是「纹素 ÷ 图集尺寸」得到的归一化坐标，因此网格与
+    /// 构建时的图集尺寸强绑定。图集会在同帧更晚的位置（状态栏等其它控件
+    /// 首次用到新字形）继续变大，那时本帧的网格已经构建完毕——所以不能只在
+    /// 构建前比对尺寸，必须**下一帧开头**再比一次：一旦发现当前尺寸与
+    /// `mesh_atlas_size` 不同，就说明上一帧的网格 uv 已经指向错误区域，
+    /// 立即整体重建（并请求重绘，避免停在一帧的错误画面上）。
+    ///
+    /// 尺寸稳定后不再变化（字形已全部入图集），因此这是收敛的一次性代价。
+    mesh_atlas_size: [usize; 2],
+    /// 上次渲染时的字体定义指纹（族内的字体名列表）。
+    ///
+    /// `Context::add_font`（中文 fallback 并入）只把新字体排进队列，
+    /// **下一帧** `begin_pass` 才真正重建字体系统。若在并入当帧就清缓存，
+    /// 重建行用的仍是旧字体——乱码 Galley 会被再次缓存且 hash 未变，
+    /// 此后永不重建（这正是启动后登录横幅中文持续乱码的原因）。
+    /// 指纹在并入后的下一帧才变化，因此在帧开头比对它才是正确时机。
+    font_fingerprint: u64,
+    /// 行文本网格缓存（**显示行号** → 已合成顶点）。
+    ///
+    /// 每行的所有分段 Galley 合成为一个 `Mesh`：绘制时一个 `Shape::Mesh`
+    /// 取代 N 个 `Shape::Text`，epaint 对前者的处理是 `append_ref`（纯顶点
+    /// 追加），对后者要逐字形生成顶点。满屏 CJK 时一行 40 段 → 40 Shape，
+    /// 合成为 1 个。
+    ///
+    /// 键是显示行号（不是网格行号）：mesh 顶点里烘焙了绝对行位，
+    /// 滚动/尺寸变化后必须整体重建（`invalidate_row_meshes`），
+    /// 而 `rows_cache` 保留（分词结果与显示位置无关）。
+    row_meshes: HashMap<i32, std::sync::Arc<egui::Mesh>>,
+    /// 行网格需要整体重合成（滚动 / 行数 / 内边距 / 缩放比 / 主题变化时置位）。
+    ///
+    /// 用标志而不是立即清空：清理发生在尺寸计算之后、`rows_cache` 已经可用的
+    /// 位置，避免在 `show_with_input` 开头清掉又重新填。
+    row_meshes_invalidated: bool,
+    /// 本帧内容重建过的显示行（用于只重建这些行的网格顶点）。
+    rebuilt_display_rows: Vec<i32>,
+    /// 上次合成行网格时的显示足迹 `(display_offset, 可见行数, 内容区原点)`。
+    ///
+    /// 三者任一变化都让所有行的绝对顶点失效（滚动是主因）。缓存这个足迹
+    /// 而不是每帧无条件重合成，空闲/打字帧才是零顶点重建。
+    last_mesh_offset: usize,
+    last_mesh_rows: u16,
+    last_mesh_origin: egui::Pos2,
     /// 会话标题缓存（`SessionEvent::Title` 时更新，避免每帧 Mutex + String clone）。
     cached_title: String,
     /// Bell 脉冲到期时间（`SessionEvent::Bell` 时记录；paint 时若未到期则在
@@ -231,6 +348,14 @@ pub struct TerminalView {
     bell_until: Option<std::time::Instant>,
     /// 远程 PTY 尺寸同步重试次数（`window_change` 由 SSH 后台异步发送）。
     remote_resize_sync_frames: u8,
+    /// 拖拽中未通知后台的最新尺寸（`Some((cols, rows))` = 有欠账）。
+    /// 窗口拖拽时每帧尺寸都变：本地网格必须立即跟上（否则字越界），
+    /// 但后台通知节流到 50ms 一次（本地 SIGWINCH/ioctl、远程 SSH
+    /// `window_change` 包都不需要帧级精度）。欠账在 `flush_pending_resize`
+    /// 中补发；trailing 语义保证拖拽结束后的最终尺寸一定到达。
+    pending_backend_resize: Option<(u16, u16)>,
+    /// 上次通知后台尺寸的时刻（节流基准）。
+    last_backend_resize_at: Option<std::time::Instant>,
     /// 当前终端选区（⌘C / Ctrl+Shift+C 复制）。
     selection: Option<TerminalSelection>,
     /// 是否正在进行鼠标拖选。
@@ -301,9 +426,32 @@ impl TerminalView {
             pwd_output_rows: None,
             remote_home: None,
             had_focus: false,
+            dir_cache: std::cell::RefCell::new(None),
             last_build_ms: 0.0,
             last_layout_ms: 0.0,
             last_paint_ms: 0.0,
+            last_stats: (0, 0, 0, 0),
+            shapes_scratch: Vec::new(),
+            damaged_bits: Vec::new(),
+            lines_scratch: Vec::new(),
+            last_inner: Rect::NOTHING,
+            grid_lines_cache: None,
+            ime_preedit_cache: None,
+            gpu: None,
+            gpu_rows: crate::views::terminal_gpu::RowBuffers::default(),
+            gpu_uniform: None,
+            gpu_atlas: None,
+            gpu_last_atlas: (0, 0, 0),
+            gpu_row_meshes: HashMap::new(),
+            gpu_uploaded: HashMap::new(),
+            mesh_atlas_size: [0, 0],
+            font_fingerprint: 0,
+            row_meshes: HashMap::new(),
+            row_meshes_invalidated: true,
+            rebuilt_display_rows: Vec::new(),
+            last_mesh_offset: usize::MAX,
+            last_mesh_rows: 0,
+            last_mesh_origin: egui::pos2(f32::NAN, f32::NAN),
             cached_title,
             bell_until: None,
             remote_resize_sync_frames: if is_remote {
@@ -311,6 +459,8 @@ impl TerminalView {
             } else {
                 0
             },
+            pending_backend_resize: None,
+            last_backend_resize_at: None,
             selection: None,
             selecting: false,
             copy_flash_until: None,
@@ -346,9 +496,184 @@ impl TerminalView {
         self.clipboard_write_error.take()
     }
 
+    /// 失效所有与字体相关的缓存。
+    ///
+    /// 字体系统被 epaint 重建（运行时 `add_font`、或字形图集填充率超过 80%
+    /// 触发整份重建）后，已缓存的 Galley 仍指向旧图集的 UV——不失效就会
+    /// 采到错误区域，表现为中文渲染成乱码且永不恢复。
+    pub fn invalidate_glyph_caches(&mut self) {
+        self.rows_cache.clear();
+        self.wide_glyphs.clear();
+        self.ime_preedit_cache = None;
+        self.row_meshes.clear();
+        // 自管路径：图集换代后已上传顶点的 uv 失效。
+        self.gpu_row_meshes.clear();
+        self.gpu_rows.clear();
+        self.gpu_uploaded.clear();
+        // 复位"当前网格用哪个尺寸构建"，让下次比对必然触发重建。
+        self.mesh_atlas_size = [0, 0];
+    }
+
+    /// 失效行网格缓存（顶点里烘焙了绝对行位，显示位置变化即失效）。
+    ///
+    /// 触发时机：滚动（`display_offset` 变化）、可见行数变化、内边距原点
+    /// 变化、缩放比变化、主题变化、列数变化（后者同时清 `rows_cache`）。
+    /// 只置标志不清 `rows_cache`：分词结果与显示位置无关，保留后滚动只需
+    /// 重建滚入的新行。
+    fn invalidate_row_meshes(&mut self) {
+        self.row_meshes_invalidated = true;
+    }
+
+    /// 上传本帧变化的行顶点，并 push 一次自管绘制回调。
+    ///
+    /// 顶点是行内相对坐标：滚动只需换 uniform 里的行原点，顶点零重传。
+    /// 只在内容变化的行上调用 `upload_row`（`gpu_row_meshes` 已在本帧按
+    /// 脏行更新），因此空闲帧的上传量是 0。
+    fn submit_gpu_rows(
+        &mut self,
+        use_gpu: bool,
+        inner: Rect,
+        screen_points: Vec2,
+        display_offset: usize,
+        ppp: f32,
+    ) {
+        if !use_gpu {
+            return;
+        }
+        let Some(gpu) = self.gpu.clone() else {
+            return;
+        };
+        let Some(atlas) = self.gpu_atlas.clone() else {
+            return;
+        };
+        if self.gpu_uniform.is_none() {
+            self.gpu_uniform = Some(crate::views::terminal_gpu::UniformBlock::new(
+                &gpu,
+                &gpu.uniform_layout,
+            ));
+        }
+        let Some(uniform) = self.gpu_uniform.as_mut() else {
+            return;
+        };
+
+        // 行内容变化的行重传顶点；被移出视口的行释放槽位。
+        self.gpu_rows.uploaded_bytes = 0;
+        let mut live: std::collections::HashSet<i32> = std::collections::HashSet::new();
+        // 本帧之前已上传、但内容变了的行：`gpu_row_meshes` 每次整体重建时
+        // 需要重传（用「上次上传的 mesh 指针」判断是否已传过）。
+        for v in 0..self.rows as usize {
+            let grid_line = v as i32 - display_offset as i32;
+            let Some(mesh) = self.gpu_row_meshes.get(&(v as i32)) else {
+                continue;
+            };
+            live.insert(grid_line);
+            let already = self.gpu_uploaded.get(&grid_line);
+            let stale = match already {
+                Some(prev) => !std::sync::Arc::ptr_eq(prev, mesh),
+                None => true,
+            };
+            if stale {
+                gpu_rows_upload(&mut self.gpu_rows, &gpu, grid_line, mesh);
+                self.gpu_uploaded.insert(grid_line, mesh.clone());
+            }
+        }
+        let stale: Vec<i32> = self
+            .gpu_uploaded
+            .keys()
+            .copied()
+            .filter(|line| !live.contains(line))
+            .collect();
+        for line in stale {
+            self.gpu_rows.remove_row(line);
+            self.gpu_uploaded.remove(&line);
+        }
+
+        // uniform：每行一个 `Locals`（屏幕尺寸 + 行原点 + 图集尺寸）。
+        //
+        // `screen_size` 必须是**整个渲染目标**（窗口）的点尺寸，而不是终端
+        // 内容区：顶点着色器用绝对值/全屏尺寸 → NDC，而我们提交的 `row_origin`
+        // 是绝对屏幕坐标。传内容区尺寸会把坐标放大（表现为文字整体拉伸错位）。
+        let screen_size = [screen_points.x.max(1.0), screen_points.y.max(1.0)];
+        let mut draws = Vec::with_capacity(self.rows as usize);
+        let mut slots = 0usize;
+        for v in 0..self.rows as usize {
+            let grid_line = v as i32 - display_offset as i32;
+            let Some((index_start, index_count, base_vertex)) =
+                self.gpu_rows.draw_params(grid_line)
+            else {
+                continue;
+            };
+            let row_origin = [
+                snap_point(inner.min.x, ppp),
+                snap_point(inner.min.y + v as f32 * self.cell_height, ppp),
+            ];
+            uniform.write_row(
+                slots,
+                screen_size,
+                row_origin,
+                [self.gpu_last_atlas.0 as f32, self.gpu_last_atlas.1 as f32],
+            );
+            draws.push(crate::views::terminal_gpu::RowDraw {
+                index_start,
+                index_count,
+                base_vertex,
+                uniform_offset: uniform.offset_of(slots),
+            });
+            slots += 1;
+        }
+        uniform.flush(&gpu.queue, slots);
+        if draws.is_empty() {
+            return;
+        }
+        let (Some(vbo), Some(ibo)) = self.gpu_rows.buffers() else {
+            return;
+        };
+        // 缓冲由回调持有：`Arc` 包装后交给回调（epoch 变化时 `RowBuffers`
+        // 内部换了缓冲，此处自然取到新的那个）。
+        let callback = crate::views::terminal_gpu::TerminalCallback::new(
+            gpu.clone(),
+            std::sync::Arc::new(vbo.clone()),
+            std::sync::Arc::new(ibo.clone()),
+            uniform.bind_group.clone(),
+            atlas,
+            draws,
+        );
+        self.shapes_scratch.push(egui::Shape::Callback(
+            eframe::egui_wgpu::Callback::new_paint_callback(inner, callback),
+        ));
+    }
+
     /// 本帧终端渲染分段耗时（性能 HUD 读取；未渲染时均为 0）。
     pub fn last_timing(&self) -> (f32, f32, f32) {
         (self.last_build_ms, self.last_layout_ms, self.last_paint_ms)
+    }
+
+    /// 本帧规模计数 `(shapes, 重建行数, 复用行数, 上传字节)`（性能 HUD 读取）。
+    pub fn last_stats(&self) -> (usize, usize, usize, usize) {
+        self.last_stats
+    }
+
+    /// 注入自管 GPU 渲染资源（`None` = 回退 egui Shape 路径）。
+    ///
+    /// 由 `MinoApp` 在建会话时调用：只有 `eframe::CreationContext` 里有
+    /// `wgpu_render_state`（`Harness::new_ui` 的测试没有，天然覆盖回退路径）。
+    pub fn set_gpu(
+        &mut self,
+        gpu: Option<std::sync::Arc<crate::views::terminal_gpu::TerminalGpu>>,
+    ) {
+        if gpu.is_some() {
+            self.gpu_uniform = None; // 懒建（需要 `TerminalGpu` 的绑定布局）
+            self.row_meshes_invalidated = true;
+        } else {
+            self.gpu_rows.clear();
+            self.gpu_uploaded.clear();
+        }
+        self.gpu = gpu;
+    }
+
+    /// 本帧终端内容区域（屏幕坐标；未渲染过时为 `Rect::NOTHING`）。
+    pub fn terminal_inner(&self) -> Rect {
+        self.last_inner
     }
 
     /// 会话引用（供状态栏等读取标题）。
@@ -359,6 +684,35 @@ impl TerminalView {
     /// 会话标题（缓存，`Title` 事件时更新；避免每帧 Mutex + String clone）。
     pub fn session_title(&self) -> &str {
         &self.cached_title
+    }
+
+    /// 后台尺寸通知窗口（拖拽节流）：50ms 内最多一次，欠账 trailing 补发。
+    const BACKEND_RESIZE_MIN_INTERVAL: Duration = Duration::from_millis(50);
+
+    /// 请求一次后台尺寸通知（节流：窗口内只记欠账，不重复发包）。
+    ///
+    /// `force` 给远程建连初期的重试窗口用（那几帧必须真发，不能被节流吞掉）。
+    fn request_backend_resize(&mut self, force: bool) {
+        let now = std::time::Instant::now();
+        let due = force
+            || self
+                .last_backend_resize_at
+                .is_none_or(|at| now.duration_since(at) >= Self::BACKEND_RESIZE_MIN_INTERVAL);
+        if due {
+            self.session.notify_backend_size(self.cols, self.rows);
+            self.last_backend_resize_at = Some(now);
+            self.pending_backend_resize = None;
+        } else {
+            self.pending_backend_resize = Some((self.cols, self.rows));
+        }
+    }
+
+    /// 尺寸稳定后补发拖拽欠账（最终尺寸一定到达；尺寸又变时自然覆盖欠账）。
+    fn flush_pending_resize(&mut self) {
+        if self.pending_backend_resize.take().is_some() {
+            self.session.notify_backend_size(self.cols, self.rows);
+            self.last_backend_resize_at = Some(std::time::Instant::now());
+        }
     }
 
     /// 当前终端已知的工作目录（供 SFTP 快捷定位使用）。
@@ -376,14 +730,39 @@ impl TerminalView {
     /// 会 `invalidate` 并永久停在旧值，不能作为"当前目录"的数据源；
     /// 内核查询偶发失败（子进程刚 fork 间隙）时才回退到跟踪值。
     /// 远程会话返回 `None`。
+    ///
+    /// 结果带极短 TTL 缓存：标签栏与状态栏每帧都要标题，逐帧走
+    /// `waitpid`/`proc_listchildpids`/`proc_pidinfo`/`canonicalize` 纯属浪费；
+    /// 300ms 内目录不可能"需要被用户看到地"变化，事件（回车、shell 输出）
+    /// 之后的下一次取值也会自然刷新。需要即时真值的入口用
+    /// `fresh_local_directory`。
     pub fn effective_local_directory(&self) -> Option<String> {
         if self.session.is_remote() {
             return None;
         }
-        self.session
+        const CACHE_TTL: Duration = Duration::from_millis(300);
+        if let Some((path, at)) = self.dir_cache.borrow().as_ref() {
+            if at.elapsed() < CACHE_TTL {
+                return Some(path.clone());
+            }
+        }
+        self.fresh_local_directory()
+    }
+
+    /// 不做缓存的内核 cwd 查询（⌘D 收藏 / SFTP 定位等需要即时真值的入口）。
+    pub fn fresh_local_directory(&self) -> Option<String> {
+        if self.session.is_remote() {
+            return None;
+        }
+        let path = self
+            .session
             .child_current_dir()
             .map(|path| path.to_string_lossy().into_owned())
-            .or_else(|| self.tracked_directory())
+            .or_else(|| self.tracked_directory());
+        if let Some(path) = &path {
+            *self.dir_cache.borrow_mut() = Some((path.clone(), std::time::Instant::now()));
+        }
+        path
     }
 
     /// 输入跟踪器维护的目录（仅本地标题的内核查询失败时回退用）。
@@ -558,12 +937,67 @@ impl TerminalView {
     pub fn show_with_input(&mut self, ui: &mut Ui, input_enabled: bool) {
         let ctx = ui.ctx().clone();
         let term_arc = self.session.term();
+        // Shape 批量缓冲每帧清空（保留容量），本帧所有绘制一次性提交。
+        self.shapes_scratch.clear();
 
         // 主题会改变默认前景、基本色和终端背景；旧 Galley 与背景段不能跨主题复用。
         let theme_revision = crate::theme::theme_revision();
         if self.last_theme_revision != theme_revision {
             self.rows_cache.clear();
+            self.invalidate_row_meshes();
             self.last_theme_revision = theme_revision;
+        }
+
+        // 字形图集换代看门狗：epaint 在图集填充率超过 80% 时整份重建字体系统
+        // （`Fonts::begin_pass`），已缓存的 Galley 与其 uv 随之失效。尺寸是公开
+        // API 里唯一能观察到重建的信号；不检查就会采到错误区域（乱码且不恢复）。
+        //
+        // 在**帧开头**读取：此刻的尺寸就是上一帧结束时（含状态栏等控件最后
+        // 一次写入字形）的最终尺寸，因此上一帧构建的行网格若要修正，只能在这
+        // 里发现。运行时 `add_font`（中文 fallback 并入）另有精确失效通道
+        // （`MinoApp` 调 `invalidate_glyph_caches`），不依赖这个启发式。
+        let atlas_size = ui.fonts(|f| f.font_image_size());
+        let font_fingerprint = ui.fonts(|f| font_definitions_fingerprint(f.definitions()));
+        if font_fingerprint != self.font_fingerprint {
+            // 字体定义变了：epaint 已在本次 `begin_pass` 重建字体系统，
+            // 旧 Galley 的字形来源与 uv 全部失效。
+            self.font_fingerprint = font_fingerprint;
+            self.invalidate_glyph_caches();
+            self.row_meshes_invalidated = true;
+            ui.ctx().request_repaint();
+        } else if atlas_size != self.mesh_atlas_size {
+            // 图集换过代（填充率超 80% 时整份重建）：网格 uv 失效，
+            // 但同一份字体定义下 Galley 的 uv_rect 依然有效，只重建网格即可。
+            self.invalidate_glyph_caches();
+            self.row_meshes_invalidated = true;
+            ui.ctx().request_repaint();
+        }
+        // 自管路径：顶点 uv 与图集绑定必须与「本帧将采样的那张 GPU 纹理」同口径。
+        //
+        // egui-wgpu 在 UI 帧**之后**才把图集变化上传成 wgpu 纹理；本帧读到的
+        // 纹理尺寸就是回调绘制时的那张。一旦它变了（图集翻倍/整份重建），
+        // 旧 bind group 指向被替换的纹理、旧顶点 uv 也失效——必须一起重建，
+        // 否则字形采到错误区域（表现为整屏方块或字符错位）。
+        // 填充率量化到 1% 避免浮点噪声；骤降（重建）时必然触发一次变化。
+        let fill = (ui.fonts(|f| f.font_atlas_fill_ratio()) * 100.0) as u32;
+        if self.gpu.is_some() {
+            if let Some([w, h]) = self.gpu.as_ref().and_then(|gpu| gpu.gpu_atlas_size()) {
+                let footprint = (w, h, fill);
+                let resized = (w, h) != (self.gpu_last_atlas.0, self.gpu_last_atlas.1);
+                // 填充率显著回退 = 字体系统被整份重建（图集内容重新排布）。
+                let rebuilt = fill + 10 < self.gpu_last_atlas.2;
+                if resized || rebuilt {
+                    self.gpu_last_atlas = footprint;
+                    self.gpu_rows.clear();
+                    self.gpu_row_meshes.clear();
+                    self.gpu_uploaded.clear();
+                    // 重建会重新排布字形，已缓存的 Galley uv 同样失效。
+                    self.invalidate_glyph_caches();
+                    self.row_meshes_invalidated = true;
+                } else {
+                    self.gpu_last_atlas = footprint;
+                }
+            }
         }
 
         // 终端区域背景（当前主题的终端色）。
@@ -572,34 +1006,36 @@ impl TerminalView {
         let theme = crate::theme::current_theme();
         let term_bg = theme.term_bg;
         let outer = ui.max_rect();
-        ui.painter().rect_filled(
+        // 缩放比在网格线缓存与尺寸计算两处都要用，先取一次
+        // （`pixels_per_point` 是 Context 写锁，避免同帧重复上锁）。
+        let ppp = ui.ctx().pixels_per_point();
+        self.shapes_scratch.push(egui::Shape::rect_filled(
             outer,
             0.0,
             Color32::from_rgb(term_bg.r, term_bg.g, term_bg.b),
-        );
+        ));
         // 低对比网格：提供科技感的空间层次，但不干扰终端文本。
-        let grid_step = 32.0;
-        let grid_color = crate::theme::tokens::GRID_LINE;
-        let first_x = outer.left() - outer.left().rem_euclid(grid_step);
-        let first_y = outer.top() - outer.top().rem_euclid(grid_step);
-        for x in (0..=((outer.width() / grid_step).ceil() as usize + 1))
-            .map(|i| first_x + i as f32 * grid_step)
-        {
-            ui.painter().line_segment(
-                [egui::pos2(x, outer.top()), egui::pos2(x, outer.bottom())],
-                egui::Stroke::new(1.0, grid_color),
-            );
+        // 形状完全静态（只依赖面板矩形与 ppp），缓存成 `Shape::Mesh` 后每帧
+        // 只提交一个图元，不再逐条 line_segment 提交并重新 tessellate。
+        let grid_up_to_date = self
+            .grid_lines_cache
+            .as_ref()
+            .is_some_and(|c| c.rect == outer && c.theme_revision == theme_revision && c.ppp == ppp);
+        if !grid_up_to_date {
+            self.grid_lines_cache = Some(GridLinesCache {
+                rect: outer,
+                theme_revision,
+                ppp,
+                mesh: std::sync::Arc::new(build_grid_lines_mesh(outer, ppp)),
+            });
         }
-        for y in (0..=((outer.height() / grid_step).ceil() as usize + 1))
-            .map(|i| first_y + i as f32 * grid_step)
-        {
-            ui.painter().line_segment(
-                [egui::pos2(outer.left(), y), egui::pos2(outer.right(), y)],
-                egui::Stroke::new(1.0, grid_color),
-            );
+        if let Some(cache) = self.grid_lines_cache.as_ref() {
+            self.shapes_scratch
+                .push(egui::Shape::Mesh(cache.mesh.clone()));
         }
         // 终端内容区域：背景铺满面板，文本/光标在内边距内绘制。
         let inner = outer.shrink(PADDING);
+        self.last_inner = inner;
 
         // ==================== 事件泵 ====================
         // 诊断：PTY 读取线程退出会导致输入写入失效。
@@ -608,9 +1044,10 @@ impl TerminalView {
         }
         // 注意：Wakeup 不再在此处二次 request_repaint——mino-core 的
         // `Listener::send_event` 已在事件到达时直接调过 on_event
-        // （app.rs 的 `ctx.request_repaint()`），此处仅处理 PtyWrite 回写
-        // 与标题缓存更新。
-        self.drain_background_events();
+        // （app.rs 的 `ctx.request_repaint()`）。事件后台回写
+        // （PtyWrite/颜色查询应答等）由 `MinoApp::ui` 在渲染之前对所有标签
+        // 统一 drain（`app.rs` 的 `for tab in &mut self.tabs`），此处不再重复
+        // drain：同一帧两次 `Mutex` + `mem::take` 是纯开销，且第二次必空。
 
         // ==================== 工作目录校正 ====================
         // 目录跟踪通常只需处理键盘输入；只有执行 pwd、等待其输出时才读取
@@ -651,7 +1088,6 @@ impl TerminalView {
 
         // ==================== 尺寸计算与 resize ====================
         // cell 尺寸只依赖字体（启动时加载），缓存到字段避免每帧 fonts_mut。
-        let ppp = ui.ctx().pixels_per_point();
         if self.cell_width == 0.0 || ppp != self.last_ppp {
             self.last_ppp = ppp;
             let (cell_width, cell_height) = ui.fonts_mut(|f| {
@@ -663,8 +1099,10 @@ impl TerminalView {
             self.cell_width = cell_width;
             self.cell_height = cell_height;
             // Galley 与 pixels_per_point 绑定：缩放变化后旧布局失效，全量重建。
+            // 行网格顶点同样失效（内边距缩放比都变了）。
             self.rows_cache.clear();
             self.wide_glyphs.clear();
+            self.invalidate_row_meshes();
         }
         let cell_width = self.cell_width;
         let cell_height = self.cell_height;
@@ -674,45 +1112,89 @@ impl TerminalView {
         let rows = ((avail.y / cell_height).floor() as usize).max(1);
         let size_changed = cols as u16 != self.cols || rows as u16 != self.rows;
         if size_changed {
+            let prev_cols = self.cols;
             self.cols = cols as u16;
             self.rows = rows as u16;
-            // 通知 PTY 并同步终端状态机网格（Session::resize 内部完成锁内 resize）。
-            self.session.resize(self.cols, self.rows);
+            // 本地网格立即跟上（否则字越界/显示错位），后台通知节流：
+            // 拖拽中每帧都变，PTY ioctl 与 SSH `window_change` 不需要帧级精度。
+            self.session.resize_grid(self.cols, self.rows);
+            self.request_backend_resize(false);
             if self.session.is_remote() {
                 // 布局变化后重新开始短暂重试窗口，确保 SSH 的异步
-                // window_change 在远端下一次动态渲染前到达。
+                // `window_change` 在远端下一次动态渲染前到达。
                 self.remote_resize_sync_frames = REMOTE_RESIZE_SYNC_FRAMES;
             }
-            self.rows_cache.clear();
+            // **只有列数变化才需要清行缓存**：宽度变化会让整个网格重新折行，
+            // 每行的 cell 内容与列定位全部改变。仅行数变化时网格行号与内容
+            // 都不变（多出/少掉的行由 `display_offset` 与渲染循环处理），
+            // 清缓存会让窗口竖向拖拽时每帧全量重建。
+            if self.cols != prev_cols {
+                self.rows_cache.clear();
+                self.wide_glyphs.clear();
+            }
             // 选区的 grid_line 是建立时的快照，resize 重排网格后可能悬空
             // （复制时越界索引在 release 下会 panic），尺寸变化即放弃选区。
             self.selection = None;
+        } else {
+            // 尺寸稳定后把拖拽欠账补发（trailing 语义：最终尺寸一定到达）；
+            // 远程建连初期的重试窗口同样走这里，避免双重通知路径。
+            self.flush_pending_resize();
         }
         if !size_changed && self.remote_resize_sync_frames > 0 {
             // 连接初始布局可能与 SSH request_pty 的 80x24 不同；即使本帧
             // 本地尺寸未变，也要把当前尺寸再送几次给远端，覆盖建连/输出
             // 并发时第一次 window_change 被延后的情况。
-            self.session.resize(self.cols, self.rows);
+            self.request_backend_resize(true);
             self.remote_resize_sync_frames -= 1;
         }
 
         // ==================== 构建渲染数据（锁内，行级增量） ====================
         // 只处理损坏行（`Term::damage`，行号 = 显示行号）与尚未缓存的行：
         // 内容未变的帧零遍历、零 layout；滚动只重建滚入的新行。
-        let mut lines_data: Vec<(i32, LineData)> = Vec::new();
+        // 缓冲从字段取出（复用容量），布局段结束后归还——避免每帧新建 Vec。
+        let mut lines_data = std::mem::take(&mut self.lines_scratch);
+        lines_data.clear();
         let mut cursor_rect: Option<Rect> = None;
         let mut cursor_color: Option<Color32> = None;
         let cursor_shape: CursorShape;
         let display_offset: usize;
         let build_start = std::time::Instant::now();
+        // 闪烁重绘意图：锁内置位、锁外统一 `request_repaint_after`。
+        let need_blink_repaint: bool;
+        // 锁序：持 Term 锁期间禁止调 Context（含 `input`/`request_repaint`，
+        // 均为 Context 写锁）——后台读线程 `send_event→request_repaint` 同样先
+        // Term 后 Context，同序只排队；反向嵌套才是 AB-BA 死锁。时间与重绘意
+        // 图一律锁外准备、锁内只读局部量。
+        let ui_time = ctx.input(|i| i.time);
 
         {
             let mut guard = term_arc.lock();
             // damage 收集（行号 = 网格行号 + display_offset = 显示行号），
             // 必须在同一持锁内 reset，否则下帧重复返回旧损伤。
-            let (full_damage, damaged) = match guard.damage() {
-                TermDamage::Full => (true, Vec::new()),
-                TermDamage::Partial(iter) => (false, iter.map(|b| b.line).collect::<Vec<_>>()),
+            // 损坏行位集：`contains` 是逐行 O(n) 线性查找，全屏输出时每帧
+            // 几十个损坏行 × 几十行渲染行 = 上千次比较；位集下标 O(1)。
+            // 行号是显示行号（0.. 视口行数），超范围的防御性忽略。
+            // 位集从字段取出复用容量（`resize` 只在新行数与容量不同步时分配）。
+            let mut damaged = std::mem::take(&mut self.damaged_bits);
+            damaged.clear();
+            damaged.resize(self.rows as usize, None);
+            let full_damage = match guard.damage() {
+                TermDamage::Full => true,
+                TermDamage::Partial(iter) => {
+                    for bounds in iter {
+                        if let Some(slot) = damaged.get_mut(bounds.line) {
+                            // 同一行被多次损伤时取区间并集（列区间是有损的，
+                            // 合并后偏大只会多比较几列，不会漏比较）。
+                            *slot = Some(match *slot {
+                                Some((left, right)) => {
+                                    (left.min(bounds.left), right.max(bounds.right))
+                                }
+                                None => (bounds.left, bounds.right),
+                            });
+                        }
+                    }
+                    false
+                }
             };
             guard.reset_damage();
 
@@ -730,28 +1212,68 @@ impl TerminalView {
             let cursor_style = guard.cursor_style();
             cursor_shape = cursor_style.shape;
 
-            // 光标可见性（含闪烁）。
-            let time = ctx.input(|i| i.time);
+            // 光标可见性（含闪烁）：`ui_time` 锁外已取，锁内不再碰 Context；
+            // 闪烁重绘锁外统一安排，不延长持锁时间。
             let blinking = cursor_style.blinking;
+            need_blink_repaint = blinking;
             let cursor_visible = mode.contains(TermMode::SHOW_CURSOR)
-                && (!blinking || ((time * 2.0) as u64).is_multiple_of(2));
-            if blinking {
-                ctx.request_repaint_after(Duration::from_millis(500));
-            }
+                && (!blinking || ((ui_time * 2.0) as u64).is_multiple_of(2));
 
             // 逐显示行：缓存命中（未损坏且 hash 一致）则跳过，否则锁内构建段。
             // 显示行 v ↔ 网格行 Line(v - display_offset)（display_iter 同语义：
             // 每个网格行一个显示行，wrap 续行独立成行）。
             let default_bg_egui = to_egui(default_bg);
             let grid = guard.grid();
-            for v in 0..self.rows as usize {
+            for (v, damage) in damaged.iter().enumerate() {
                 let grid_line = v as i32 - display_offset as i32;
                 let cached = self.rows_cache.get(&grid_line);
-                // 未损坏且已缓存：直接复用（不再遍历该行 cell）。
-                if !full_damage && !damaged.contains(&v) && cached.is_some() {
+                // 决定本行需要比较/重建的列范围：
+                // - 有精确损伤区间：只比较该区间（光标移动通常只损伤 1-2 列）
+                // - Full damage 但有缓存：整行比较（内容其实常常没变，如滚动）
+                // - 未损坏且有缓存：零遍历直接复用
+                let compare_range = match (damage, cached) {
+                    // 无缓存（首次可见 / 刚被字体看门狗或列数变化失效）：
+                    // 必须整行构建——缓存缺失不等于内容未变。
+                    (_, None) => Some(None),
+                    // 有精确损伤区间：只比较该区间（光标移动通常只损伤 1-2 列）。
+                    (Some(range), Some(_)) => Some(Some(*range)),
+                    // 未损坏且有缓存：零遍历直接复用。
+                    (None, Some(_)) if !full_damage => None,
+                    // Full damage 且有缓存：整行比较（滚动时内容常常没变）。
+                    (None, Some(_)) => Some(None),
+                };
+                let Some(compare_range) = compare_range else {
                     continue;
+                };
+                // 有缓存时先做指纹比较：未变化则整行跳过（不解析、不分词、不 layout）。
+                if let (Some(range), Some(c)) = (compare_range, cached) {
+                    if !row_keys_changed(
+                        grid,
+                        grid_line,
+                        self.cols as usize,
+                        colors,
+                        default_fg,
+                        default_bg,
+                        Some(range),
+                        &c.cell_keys,
+                    ) {
+                        continue;
+                    }
+                } else if let Some(c) = cached {
+                    if !row_keys_changed(
+                        grid,
+                        grid_line,
+                        self.cols as usize,
+                        colors,
+                        default_fg,
+                        default_bg,
+                        None,
+                        &c.cell_keys,
+                    ) {
+                        continue;
+                    }
                 }
-                // 锁内读取该网格行构建段与 hash。
+                // 锁内读取该网格行构建段与 hash（此时已知内容确有变化）。
                 let data = build_line_data(
                     grid,
                     grid_line,
@@ -761,12 +1283,6 @@ impl TerminalView {
                     default_bg,
                     default_bg_egui,
                 );
-                // 内容未变（如光标行被标记损伤但文本没变）：跳过 layout 复用旧 Galley。
-                if let Some(c) = cached {
-                    if c.hash == data.hash {
-                        continue;
-                    }
-                }
                 lines_data.push((grid_line, data));
             }
 
@@ -787,16 +1303,39 @@ impl TerminalView {
                     ));
                 }
             }
+            // 归还位集缓冲（容量复用，下帧 `clear` + `resize` 零分配）。
+            self.damaged_bits = damaged;
         }
         self.last_build_ms = build_start.elapsed().as_secs_f32() * 1000.0;
+        if need_blink_repaint {
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
 
         // ==================== 绘制（锁外） ====================
         let layout_start = std::time::Instant::now();
+        // 行网格顶点烘焙了绝对行位（`inner.min.y + v*cell_height`），
+        // 显示位置整体变化即失效：滚动（display_offset）、可见行数、
+        // 内容区原点任一变化都会让所有行的顶点落到错误位置。
+        // 只重建顶点、不重新分词也不重新 layout（`rows_cache` 照旧命中）。
+        let display_offset_now = display_offset;
+        if self.row_meshes_invalidated
+            || self.last_mesh_offset != display_offset_now
+            || self.last_mesh_rows != self.rows
+            || self.last_mesh_origin != inner.min
+        {
+            self.row_meshes_invalidated = false;
+            self.last_mesh_offset = display_offset_now;
+            self.last_mesh_rows = self.rows;
+            self.last_mesh_origin = inner.min;
+            self.row_meshes.clear();
+        }
         // 先为新构建的行做文本布局并写缓存（命中行不进入此循环）。
         // 每个分段独立 layout（单行不换行），绘制时按终端列定位——
         // 避免整行 LayoutJob 的字体实际 advance 累积漂移（CJK 宽字符）。
         // 宽字符段恒为单字符，Galley 按 (字符, 样式) 跨行跨帧复用。
-        for (grid_line, data) in &lines_data {
+        let mut rebuilt_rows_scratch = std::mem::take(&mut self.rebuilt_display_rows);
+        rebuilt_rows_scratch.clear();
+        for (grid_line, data) in &mut lines_data {
             let mut runs = Vec::with_capacity(data.segments.len());
             for seg in &data.segments {
                 let galley = match wide_glyph_key(seg) {
@@ -823,16 +1362,95 @@ impl TerminalView {
             self.rows_cache.insert(
                 *grid_line,
                 RowCache {
-                    hash: data.hash,
+                    cell_keys: std::mem::take(&mut data.cell_keys),
                     runs,
-                    backgrounds: data.backgrounds.clone(),
+                    // 直接移动所有权：每次重建行少一次 Vec 深拷贝。
+                    backgrounds: std::mem::take(&mut data.backgrounds),
                 },
             );
+            // 内容变了的显示行必须重建网格顶点（显示行 = 网格行 + display_offset）。
+            let display_row = *grid_line + display_offset_now as i32;
+            if (0..self.rows as i32).contains(&display_row) {
+                rebuilt_rows_scratch.push(display_row);
+            }
         }
+        // 重建行数（HUD 读数：滚动/输出时应远小于视口行数）。
+        let rebuilt_rows = lines_data.len();
+        // 归还行数据缓冲（`clear` 后复用容量；`LineData` 内的 Vec 已被移走）。
+        lines_data.clear();
+        self.lines_scratch = lines_data;
+
+        // 合成行网格：所有 Galley 已就绪、图集尺寸已是本帧最终值（见上）。
+        // 命中缓存的行直接复用 `Arc<Mesh>`；被失效清掉的行在这里补齐，
+        // 代价只是顶点拼接（不重新分词、不重新 layout）。
+        //
+        // uv 归一化用的尺寸：本帧布局已经把终端自身的新字形写进图集，
+        // 所以要用**布局之后**的尺寸（否则本帧新字形会被归一化错误）。
+        // 同帧更晚的控件若再撑大图集，下一帧开头的看门狗会发现并重建。
+        let atlas_size = ui.fonts(|f| f.font_image_size());
+        self.mesh_atlas_size = atlas_size;
+        // 自管 GPU 路径：行顶点是「行内相对」坐标（与显示位置无关），
+        // 位置由 uniform 提供，因此滚动不重传顶点。
+        let gpu_available =
+            self.gpu.is_some() && self.rows as usize <= crate::views::terminal_gpu::MAX_ROWS;
+        // 图集绑定必须每帧重建：egui-wgpu 在「整块更新」时**新建**一张 wgpu
+        // 纹理，尺寸可能不变——只按尺寸判断会漏掉换代，缓存的 bind group 会
+        // 一直指向被替换的旧纹理（表现为首帧正常、之后字形逐渐错乱）。
+        // 重建成本是一次纹理视图 + bind group（微秒级），远低于错绘的代价。
+        if gpu_available {
+            self.gpu_atlas = self.gpu.as_ref().and_then(|gpu| gpu.refresh_atlas());
+        }
+        let use_gpu = gpu_available && self.gpu_atlas.is_some();
+        // 渲染目标是整个窗口，NDC 映射必须以窗口尺寸为基准。
+        let screen_points = ui.ctx().content_rect().size();
+        if use_gpu {
+            for v in 0..self.rows as usize {
+                let dirty = rebuilt_rows_scratch.contains(&(v as i32));
+                if !dirty && self.gpu_row_meshes.contains_key(&(v as i32)) {
+                    continue;
+                }
+                let grid_line = v as i32 - display_offset_now as i32;
+                let Some(cache) = self.rows_cache.get(&grid_line) else {
+                    continue;
+                };
+                let mesh = build_row_mesh(
+                    &cache.runs,
+                    ppp,
+                    cell_width,
+                    inner.min.x,
+                    0.0,
+                    true,
+                    atlas_size,
+                );
+                self.gpu_row_meshes
+                    .insert(v as i32, std::sync::Arc::new(mesh));
+            }
+        } else {
+            for v in 0..self.rows as usize {
+                let dirty = rebuilt_rows_scratch.contains(&(v as i32));
+                if !dirty && self.row_meshes.contains_key(&(v as i32)) {
+                    continue;
+                }
+                let grid_line = v as i32 - display_offset_now as i32;
+                let Some(cache) = self.rows_cache.get(&grid_line) else {
+                    continue;
+                };
+                let mesh = build_row_mesh(
+                    &cache.runs,
+                    ppp,
+                    cell_width,
+                    inner.min.x,
+                    inner.min.y + v as f32 * cell_height,
+                    false,
+                    atlas_size,
+                );
+                self.row_meshes.insert(v as i32, std::sync::Arc::new(mesh));
+            }
+        }
+        self.rebuilt_display_rows = rebuilt_rows_scratch;
         self.last_layout_ms = layout_start.elapsed().as_secs_f32() * 1000.0;
 
         let paint_start = std::time::Instant::now();
-        let painter = ui.painter();
         let origin = inner.min;
         let selection_bg = Color32::from_rgba_unmultiplied(
             theme.accent.r(),
@@ -840,123 +1458,176 @@ impl TerminalView {
             theme.accent.b(),
             92,
         );
-        for v in 0..self.rows as usize {
-            let grid_line = v as i32 - display_offset as i32;
-            let Some(cache) = self.rows_cache.get(&grid_line) else {
-                continue;
-            };
-            // 背景矩形（行内连续背景段）。
-            for bg in &cache.backgrounds {
-                let rect = Rect::from_min_size(
-                    origin + Vec2::new(bg.start as f32 * cell_width, v as f32 * cell_height),
-                    Vec2::new((bg.end - bg.start) as f32 * cell_width, cell_height),
-                );
-                painter.rect_filled(rect, 0.0, bg.color);
-            }
-            if let Some(selection) = self.selection {
-                if let Some((start, end)) =
-                    selection.columns_for_line(grid_line, self.cols as usize)
-                {
+        let shapes = &mut self.shapes_scratch;
+        // 悬浮链接命中：绘制循环已经遍历了每行每个 run，在这里顺带判定命中，
+        // 避免 `open_hovered_hyperlink` 再整屏遍历一次（rows × runs）。
+        let hover_pos = ui
+            .input(|i| i.pointer.hover_pos())
+            .filter(|p| inner.contains(*p));
+        let mut hovered_link: Option<String> = None;
+        {
+            for v in 0..self.rows as usize {
+                let grid_line = v as i32 - display_offset as i32;
+                let Some(cache) = self.rows_cache.get(&grid_line) else {
+                    continue;
+                };
+                // 背景矩形（行内连续背景段）。
+                for bg in &cache.backgrounds {
                     let rect = Rect::from_min_size(
-                        origin + Vec2::new(start as f32 * cell_width, v as f32 * cell_height),
-                        Vec2::new((end - start) as f32 * cell_width, cell_height),
+                        origin + Vec2::new(bg.start as f32 * cell_width, v as f32 * cell_height),
+                        Vec2::new((bg.end - bg.start) as f32 * cell_width, cell_height),
                     );
-                    painter.rect_filled(rect, 2.0, selection_bg);
+                    shapes.push(egui::Shape::rect_filled(rect, 0.0, bg.color));
                 }
-            }
-            // 文本分段：每段按终端列定位绘制（Arc clone 零成本；不再 layout_job）。
-            // 分段起点 x = start_col * cell_width——终端列与屏幕列严格对齐，
-            // 同段内连续同字宽字符（半角 run / CJK run 不混排）无累积漂移。
-            let row_top = origin.y + v as f32 * cell_height;
-            for run in &cache.runs {
-                let pos = egui::pos2(origin.x + run.start_col as f32 * cell_width, row_top);
-                painter.galley(pos, run.galley.clone(), Color32::WHITE);
-                // 下划线变体矢量线（SGR 4 系列；Galley 只画 Single，其余在这里补）。
-                if run.underline != UnderlineStyle::None && run.underline != UnderlineStyle::Single
-                {
-                    let width = run.galley.size().x;
-                    if width > 0.0 {
-                        let color = run.underline_color.unwrap_or(run.fg);
-                        let base_y = row_top + cell_height - 2.0;
-                        paint_underline_variant(
-                            painter,
-                            pos.x,
-                            base_y,
-                            width,
-                            run.underline,
-                            color,
+                if let Some(selection) = self.selection {
+                    if let Some((start, end)) =
+                        selection.columns_for_line(grid_line, self.cols as usize)
+                    {
+                        let rect = Rect::from_min_size(
+                            origin + Vec2::new(start as f32 * cell_width, v as f32 * cell_height),
+                            Vec2::new((end - start) as f32 * cell_width, cell_height),
                         );
+                        shapes.push(egui::Shape::rect_filled(rect, 2.0, selection_bg));
                     }
                 }
-                // OSC8 超链接下划线（accent2 色，1px，基线处；只画有链接的段）。
-                if run.link.is_some() {
-                    let width = run.galley.size().x;
-                    if width > 0.0 {
-                        painter.line_segment(
-                            [
-                                egui::pos2(pos.x, row_top + cell_height - 2.0),
-                                egui::pos2(pos.x + width, row_top + cell_height - 2.0),
-                            ],
-                            Stroke::new(1.0, theme.accent2),
-                        );
+                // 文本：整行一个 `Shape::Mesh`（所有分段已合成为单个顶点缓冲）。
+                // `Shape::Mesh(Arc<Mesh>)` 在 epaint 里是纯顶点追加
+                // （`append_ref`），而 `Shape::Text` 要逐字形生成顶点——
+                // 满屏 CJK 时这能把每帧 Shape 数从 cell 级降到行级。
+                //
+                // 自管 GPU 路径下文本由回调绘制（见下方 `Shape::Callback`），
+                // 这里不再 push 行网格。
+                if !use_gpu {
+                    if let Some(mesh) = self.row_meshes.get(&(v as i32)) {
+                        shapes.push(egui::Shape::Mesh(mesh.clone()));
+                    }
+                }
+                // 下划线变体与超链接下划线仍按段绘制：它们是矢量线（不是字形），
+                // 且只在少数行出现，不构成热点。
+                let row_top = origin.y + v as f32 * cell_height;
+                for run in &cache.runs {
+                    let pos = egui::pos2(origin.x + run.start_col as f32 * cell_width, row_top);
+                    // 下划线变体矢量线（SGR 4 系列；Galley 只画 Single，其余在这里补）。
+                    if run.underline != UnderlineStyle::None
+                        && run.underline != UnderlineStyle::Single
+                    {
+                        let width = run.galley.size().x;
+                        if width > 0.0 {
+                            let color = run.underline_color.unwrap_or(run.fg);
+                            let base_y = row_top + cell_height - 2.0;
+                            push_underline_variant(
+                                shapes,
+                                pos.x,
+                                base_y,
+                                width,
+                                run.underline,
+                                color,
+                            );
+                        }
+                    }
+                    // OSC8 超链接下划线（accent2 色，1px，基线处；只画有链接的段）。
+                    if let Some(url) = run.link.as_deref() {
+                        let width = run.galley.size().x;
+                        if width > 0.0 {
+                            shapes.push(egui::Shape::line_segment(
+                                [
+                                    egui::pos2(pos.x, row_top + cell_height - 2.0),
+                                    egui::pos2(pos.x + width, row_top + cell_height - 2.0),
+                                ],
+                                Stroke::new(1.0, theme.accent2),
+                            ));
+                            // 命中判定与绘制共用同一批 run（首个命中即锁定，
+                            // 与原整屏扫描的「行序 → 段序」优先级一致）。
+                            if hovered_link.is_none()
+                                && hover_pos.is_some_and(|p| {
+                                    Rect::from_min_size(pos, egui::vec2(width, cell_height))
+                                        .contains(p)
+                                })
+                            {
+                                hovered_link = Some(url.to_owned());
+                            }
+                        }
                     }
                 }
             }
+        } // 结束 shapes 借用作用域（之后要调 `&mut self` 方法）
+
+        // ==================== 自管 GPU 提交 ====================
+        // 只上传内容变化的行；滚动/空闲帧零上传（行顶点是行内相对坐标，
+        // 位置由 uniform 提供）。回调只读缓冲，不上传。
+        if use_gpu {
+            self.submit_gpu_rows(use_gpu, inner, screen_points, display_offset_now, ppp);
         }
         // OSC8 超链接点击：命中链接段则经 `open_url` 打开（浏览器/文件）。
         // 只在未订阅鼠标上报时处理——订阅时点击已透传给程序，链接由程序自己管。
         if input_enabled && !self.last_mode.intersects(TermMode::MOUSE_MODE) {
-            self.open_hovered_hyperlink(ui, inner, display_offset);
+            self.open_hovered_hyperlink(ui, hovered_link);
         }
 
         // 光标形状绘制（shape 已在锁内读取，无需二次上锁）。
         if let (Some(rect), Some(color)) = (cursor_rect, cursor_color) {
             match cursor_shape {
                 CursorShape::Block => {
-                    painter.rect_filled(rect, 0.0, color);
+                    self.shapes_scratch
+                        .push(egui::Shape::rect_filled(rect, 0.0, color));
                 }
                 CursorShape::Underline => {
-                    painter.line_segment(
+                    self.shapes_scratch.push(egui::Shape::line_segment(
                         [
                             rect.left_bottom() + Vec2::new(0.0, -1.0),
                             rect.right_bottom() + Vec2::new(0.0, -1.0),
                         ],
                         Stroke::new(1.5, color),
-                    );
+                    ));
                 }
                 CursorShape::Beam => {
-                    painter.line_segment(
+                    self.shapes_scratch.push(egui::Shape::line_segment(
                         [rect.left_top(), rect.left_bottom()],
                         Stroke::new(1.5, color),
-                    );
+                    ));
                 }
                 CursorShape::HollowBlock => {
-                    painter.rect_stroke(
+                    self.shapes_scratch.push(egui::Shape::rect_stroke(
                         rect,
                         0.0,
                         Stroke::new(1.0, color),
                         egui::StrokeKind::Middle,
-                    );
+                    ));
                 }
                 CursorShape::Hidden => {}
             }
         }
         // Bell 视觉脉冲：到期前在终端左上角画 accent 色圆点（0.6s 自消失）。
-        // 脉冲期间每帧安排重绘以保证到期即消失；无 Bell 时零额外重绘。
+        // 只在到期时刻安排一帧重绘（`request_repaint_after(剩余时长)`），到期即
+        // 清掉圆点；脉冲期间不再每帧 `request_repaint`——omp 的任务完成/错误
+        // 通知走 BEL（默认 notifyProtocol），多 tab 高输出并发时频繁 BEL 会
+        // 把 0.6s 窗口续成永久 60fps 全帧重绘（每帧 Full damage + 全屏重建），
+        // UI 线程跑满表现为整窗冻结、只能强制退出（toast 降频同模式）。
         if let Some(until) = self.bell_until {
-            if std::time::Instant::now() < until {
-                painter.circle_filled(
+            let now = std::time::Instant::now();
+            if now < until {
+                self.shapes_scratch.push(egui::Shape::circle_filled(
                     origin + Vec2::new(8.0, 8.0),
                     3.0,
                     Color32::from_rgb(theme.accent.r(), theme.accent.g(), theme.accent.b()),
-                );
-                ui.ctx().request_repaint();
+                ));
+                ui.ctx().request_repaint_after(until - now);
             } else {
                 self.bell_until = None;
             }
         }
         // IME 预编辑串内联渲染（光标处、下划线标出组字中文本）。
         self.paint_ime_preedit(ui, inner, cursor_rect);
+        // 一次性提交本帧全部终端 Shape：逐 Shape 的 `Painter::add` 每次都要
+        // 取 Context 写锁，`extend` 把满屏 10^3 次写锁合并为一次。
+        let shape_count = self.shapes_scratch.len();
+        ui.painter().extend(self.shapes_scratch.drain(..));
+        self.last_stats = (
+            shape_count,
+            rebuilt_rows,
+            (self.rows as usize).saturating_sub(rebuilt_rows),
+            self.gpu_rows.uploaded_bytes,
+        );
         // 绘制耗时（背景 rect + 文本 galley + 光标形状）。
         self.last_paint_ms = paint_start.elapsed().as_secs_f32() * 1000.0;
 
@@ -1227,13 +1898,19 @@ impl TerminalView {
     ///
     /// 只读 `self.ime_preedit`（已在 `handle_input` 里由 Preedit 事件更新），
     /// 不触终端锁、不写缓存——组字串不进 PTY、不进回显、不污染行 hash。
-    fn paint_ime_preedit(&self, ui: &Ui, inner: Rect, cursor_rect: Option<Rect>) {
-        let Some(preedit) = self.ime_preedit.as_ref() else {
-            return;
+    fn paint_ime_preedit(&mut self, ui: &Ui, inner: Rect, cursor_rect: Option<Rect>) {
+        // 先取出组字串与活跃区间（组字串需交给 `layout_no_wrap`，必须克隆；
+        // 后续 `self.shapes_scratch` 是可变借用，不能与 `self.ime_preedit` 的
+        // 不可变借用共存）。
+        let (text, active_range) = {
+            let Some(preedit) = self.ime_preedit.as_ref() else {
+                return;
+            };
+            if preedit.text.is_empty() {
+                return;
+            }
+            (preedit.text.clone(), preedit.active_range.clone())
         };
-        if preedit.text.is_empty() {
-            return;
-        }
         let Some(cursor) = cursor_rect else {
             return;
         };
@@ -1247,38 +1924,51 @@ impl TerminalView {
             theme.accent.b(),
             56,
         );
-        let galley = painter.layout_no_wrap(
-            preedit.text.clone(),
-            FontId::monospace(self.font_size),
-            Color32::from_rgb(theme.term_fg.r, theme.term_fg.g, theme.term_fg.b),
-        );
+        // 预编辑串在两次按键之间逐帧不变，缓存 Galley 避免每帧重新 shaping
+        // （组字期间每帧都重绘，layout 成本会持续产生）。
+        let cache_valid = self
+            .ime_preedit_cache
+            .as_ref()
+            .is_some_and(|(cached, size, _)| *cached == text && *size == self.font_size);
+        if !cache_valid {
+            let galley = painter.layout_no_wrap(
+                text.clone(),
+                FontId::monospace(self.font_size),
+                Color32::from_rgb(theme.term_fg.r, theme.term_fg.g, theme.term_fg.b),
+            );
+            self.ime_preedit_cache = Some((text.clone(), self.font_size, galley));
+        }
+        let galley = self
+            .ime_preedit_cache
+            .as_ref()
+            .expect("组字缓存刚写入")
+            .2
+            .clone();
         let rect = Rect::from_min_size(cursor.min, galley.size());
-        painter.rect_filled(rect, 2.0, bg);
-        painter.galley(rect.min, galley, Color32::WHITE);
+        self.shapes_scratch
+            .push(egui::Shape::rect_filled(rect, 2.0, bg));
+        self.shapes_scratch
+            .push(egui::Shape::galley(rect.min, galley, Color32::WHITE));
         // 活跃区间加粗下划线（输入法标出的当前转换节）；无区间时整串下划线。
         let underline_y = rect.bottom() - 1.0;
-        let active = preedit
-            .active_range
-            .clone()
-            .unwrap_or(0..preedit.text.chars().count());
-        let chars: Vec<char> = preedit.text.chars().collect();
-        let char_w = (rect.width() / chars.len().max(1) as f32).max(1.0);
-        let (range, stroke_w) =
-            if !preedit.text.is_empty() && (active.start != 0 || active.end != chars.len()) {
-                (active, 2.0)
-            } else {
-                (0..chars.len(), 1.0)
-            };
-        let from = range.start.min(chars.len());
-        let to = range.end.min(chars.len()).max(from);
+        let char_count = text.chars().count();
+        let active = active_range.unwrap_or(0..char_count);
+        let char_w = (rect.width() / char_count.max(1) as f32).max(1.0);
+        let (range, stroke_w) = if active.start != 0 || active.end != char_count {
+            (active, 2.0)
+        } else {
+            (0..char_count, 1.0)
+        };
+        let from = range.start.min(char_count);
+        let to = range.end.min(char_count).max(from);
         if from < to {
-            painter.line_segment(
+            self.shapes_scratch.push(egui::Shape::line_segment(
                 [
                     egui::pos2(rect.left() + from as f32 * char_w, underline_y),
                     egui::pos2(rect.left() + to as f32 * char_w, underline_y),
                 ],
                 Stroke::new(stroke_w, theme.accent2),
-            );
+            ));
         }
         // 组字期间持续重绘，保证候选变化/光标闪烁即时反映。
         ui.ctx().request_repaint();
@@ -1324,13 +2014,21 @@ impl TerminalView {
 
     /// 处理键盘与鼠标输入（转发到 PTY / 网格滚动）。
     fn handle_input(&mut self, ui: &Ui, inner: Rect, output_rows: Option<Vec<String>>) {
-        let session = &self.session;
         let mode = self.last_mode;
         let cell_height = self.cell_height;
         let ctx = ui.ctx().clone();
-        // 滚动后需要重绘；不能在 ui.input 闭包内调用 request_repaint
-        // （Context 锁已被 input 持有，会自死锁 10 秒后 panic），用 flag 延后。
+        // 滚动/Term 锁一律延后到闭包外执行：`ui.input` 闭包持有 Context 写锁，
+        // 闭包内再拿 FairMutex 的 Term 锁会与 PTY 读线程的
+        // `send_event→request_repaint→Context 写锁` 形成 AB-BA（10 秒自死锁
+        // panic；此前滚轮分支已因此加过 need_repaint 注释）。滚动意图先记入
+        // `pending_scroll`，闭包外统一 `scroll_display`。
         let mut need_repaint = false;
+        let mut pending_scroll: Vec<Scroll> = Vec::new();
+        // 本帧待写入 PTY 的字节：闭包内只追加、闭包外一次发送。
+        // 事件循环按事件逐个 `session.write` 会产生 N 次通道发送 + N 次
+        // `Vec` 拷贝（滚轮 steps 循环、DeleteSurrounding 64 次循环最典型）；
+        // 一次发送只剩一次拷贝，且远程只发一个 `SessionCmd::Write`。
+        let mut pending_writes: Vec<u8> = Vec::new();
         // 本帧输入动作（闭包内只读 self 写入 PTY，闭包外统一更新工作目录跟踪器）。
         let mut actions: Vec<InputAction> = Vec::new();
         // 本帧是否有文本粘贴事件：有则走文本老路，释放键分支不再读剪贴板图片。
@@ -1420,11 +2118,9 @@ impl TerminalView {
                         if let Some(scroll) = scrollback_key(key, *modifiers) {
                             // Shift+PageUp/PageDown 不应发送给 shell，而是作为
                             // 终端窗口的本地 scrollback 翻页。编码层为这两个
-                            // 组合返回 None；这里必须真正执行滚动，否则按键
-                            // 会变成“既不发数据也不滚动”的无操作。
-                            let term_arc = session.term();
-                            let mut guard = term_arc.lock();
-                            guard.scroll_display(scroll);
+                            // 组合返回 None；这里只记录意图（见函数头注释），
+                            // 闭包外统一滚动，否则按键会变成"既不发数据也不滚动"的无操作。
+                            pending_scroll.push(scroll);
                             need_repaint = true;
                             continue;
                         }
@@ -1433,7 +2129,7 @@ impl TerminalView {
                         if mods.ctrl || mods.alt {
                             if let Some(k) = map_char_key(key, modifiers.shift) {
                                 if let Some(bytes) = keys::encode_key(k, mods, mode) {
-                                    session.write(&bytes);
+                                    pending_writes.extend_from_slice(&bytes);
                                     actions.push(InputAction::Bytes(bytes));
                                 }
                                 continue;
@@ -1441,7 +2137,7 @@ impl TerminalView {
                         }
                         if let Some(k) = map_special_key(key) {
                             if let Some(bytes) = keys::encode_key(k, mods, mode) {
-                                session.write(&bytes);
+                                pending_writes.extend_from_slice(&bytes);
                                 actions.push(InputAction::Bytes(bytes));
                             }
                             continue;
@@ -1476,7 +2172,7 @@ impl TerminalView {
                         if !text.chars().all(is_printable_text_char) {
                             continue;
                         }
-                        session.write(text.as_bytes());
+                        pending_writes.extend_from_slice(text.as_bytes());
                         actions.push(InputAction::Text(text.clone()));
                     }
                     egui::Event::Ime(ime) => {
@@ -1506,7 +2202,7 @@ impl TerminalView {
                                     need_repaint = true;
                                     continue;
                                 }
-                                session.write(commit.as_bytes());
+                                pending_writes.extend_from_slice(commit.as_bytes());
                                 actions.push(InputAction::Text(commit.clone()));
                                 need_repaint = true;
                             }
@@ -1521,11 +2217,11 @@ impl TerminalView {
                                 let before = (*before_chars).min(64);
                                 let after = (*after_chars).min(64);
                                 for _ in 0..before {
-                                    session.write(b"\x7f");
+                                    pending_writes.push(0x7f);
                                     actions.push(InputAction::Bytes(vec![0x7f]));
                                 }
                                 for _ in 0..after {
-                                    session.write(b"\x1b[3~");
+                                    pending_writes.extend_from_slice(b"\x1b[3~");
                                     actions.push(InputAction::Bytes(b"\x1b[3~".to_vec()));
                                 }
                                 need_repaint = true;
@@ -1542,7 +2238,11 @@ impl TerminalView {
                         } else {
                             text.clone()
                         };
-                        session.write(payload.as_bytes());
+                        // 闭包内不直接写通道（`EventLoopSender::send` 会 `notify`
+                        // 唤醒 PTY 读线程，持 Context 写锁时调等于把锁序倒置）：
+                        // 攒入 `pending_writes`，闭包外与按键字节同一次发出，
+                        // 到达顺序与本帧事件顺序一致。
+                        pending_writes.extend_from_slice(payload.as_bytes());
                         // 粘贴内容不可逐字节信任（可能含控制序列），模型失效。
                         actions.push(InputAction::Paste);
                     }
@@ -1592,7 +2292,7 @@ impl TerminalView {
                                     continue;
                                 };
                                 for _ in 0..steps {
-                                    session.write(&bytes);
+                                    pending_writes.extend_from_slice(&bytes);
                                     actions.push(InputAction::Bytes(bytes.clone()));
                                 }
                             }
@@ -1608,7 +2308,7 @@ impl TerminalView {
                                     continue;
                                 };
                                 for _ in 0..steps {
-                                    session.write(&bytes);
+                                    pending_writes.extend_from_slice(&bytes);
                                     actions.push(InputAction::Bytes(bytes.clone()));
                                 }
                             }
@@ -1623,29 +2323,25 @@ impl TerminalView {
                                         }
                                     }
                                     egui::MouseWheelUnit::Page => {
-                                        let term_arc = session.term();
-                                        let mut guard = term_arc.lock();
-                                        if delta.y > 0.0 {
-                                            guard.scroll_display(Scroll::PageUp);
+                                        pending_scroll.push(if delta.y > 0.0 {
+                                            Scroll::PageUp
                                         } else {
-                                            guard.scroll_display(Scroll::PageDown);
-                                        }
+                                            Scroll::PageDown
+                                        });
                                         need_repaint = true;
                                         0
                                     }
                                 };
                                 if lines != 0 {
-                                    let term_arc = session.term();
-                                    let mut guard = term_arc.lock();
-                                    if modifiers.alt {
+                                    pending_scroll.push(if modifiers.alt {
                                         if lines > 0 {
-                                            guard.scroll_display(Scroll::PageUp);
+                                            Scroll::PageUp
                                         } else {
-                                            guard.scroll_display(Scroll::PageDown);
+                                            Scroll::PageDown
                                         }
                                     } else {
-                                        guard.scroll_display(Scroll::Delta(lines));
-                                    }
+                                        Scroll::Delta(lines)
+                                    });
                                     need_repaint = true;
                                 }
                             }
@@ -1656,6 +2352,20 @@ impl TerminalView {
             }
         });
 
+        // 闭包外统一执行滚动（见函数头注释）：此时已释放 Context 写锁，
+        // 再拿 Term 锁不会形成 AB-BA。
+        if !pending_scroll.is_empty() {
+            let term_arc = self.session.term();
+            let mut guard = term_arc.lock();
+            for scroll in pending_scroll {
+                guard.scroll_display(scroll);
+            }
+        }
+        // 闭包内攒的字节（按键/鼠标/IME/粘贴）一次写入：一次通道发送、一次
+        // 发送端拷贝，到达顺序与本帧事件顺序一致。
+        if !pending_writes.is_empty() {
+            self.session.write(&pending_writes);
+        }
         if need_repaint {
             ctx.request_repaint();
         }
@@ -1982,44 +2692,10 @@ impl TerminalView {
     /// 只处理左键单击（`clicked_by(Primary)`），且指针必须落在某段链接的
     /// 矩形内；段宽用缓存 Galley 实测宽（与绘制同一宽度），不按字符估算。
     /// `file://` 与 `http(s)://` 都直通 `open_url`（egui-winit 调 `open`）。
-    fn open_hovered_hyperlink(&mut self, ui: &Ui, inner: Rect, display_offset: usize) {
-        let Some(pointer) = ui.input(|i| i.pointer.hover_pos()) else {
-            return;
-        };
-        if !inner.contains(pointer) {
-            return;
-        }
-        let cell_width = self.cell_width;
-        let cell_height = self.cell_height;
-        let mut hovered: Option<String> = None;
-        for v in 0..self.rows as usize {
-            let grid_line = v as i32 - display_offset as i32;
-            let Some(cache) = self.rows_cache.get(&grid_line) else {
-                continue;
-            };
-            let row_top = inner.min.y + v as f32 * cell_height;
-            for run in &cache.runs {
-                let Some(url) = run.link.as_deref() else {
-                    continue;
-                };
-                let width = run.galley.size().x;
-                if width <= 0.0 {
-                    continue;
-                }
-                let rect = Rect::from_min_size(
-                    egui::pos2(inner.min.x + run.start_col as f32 * cell_width, row_top),
-                    egui::vec2(width, cell_height),
-                );
-                if rect.contains(pointer) {
-                    hovered = Some(url.to_owned());
-                    break;
-                }
-            }
-            if hovered.is_some() {
-                break;
-            }
-        }
-        let Some(url) = hovered else {
+    /// 命中结果由渲染循环顺带算出（`hovered_link`）——此前这里每帧重新
+    /// 遍历整屏 `rows × runs`，与绘制循环重复扫描同一批数据。
+    fn open_hovered_hyperlink(&mut self, ui: &Ui, hovered_link: Option<String>) {
+        let Some(url) = hovered_link else {
             return;
         };
         ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
@@ -2029,13 +2705,165 @@ impl TerminalView {
     }
 }
 
+/// 按 ppp 对齐到整像素（与 epaint 的 `round_to_pixels` 同语义）。
+fn snap_point(v: f32, ppp: f32) -> f32 {
+    (v * ppp).round() / ppp
+}
+
+/// 上传一行顶点到 GPU 缓冲（失败时静默跳过：该行在帧内不可见，
+/// 下一帧仍会重试——比让整帧 panic 更符合「渲染尽力而为」的取舍）。
+fn gpu_rows_upload(
+    rows: &mut crate::views::terminal_gpu::RowBuffers,
+    gpu: &crate::views::terminal_gpu::TerminalGpu,
+    grid_line: i32,
+    mesh: &egui::Mesh,
+) {
+    if !rows.upload_row(gpu, grid_line, mesh) {
+        log::warn!("终端行顶点缓冲容量不足，本行跳过自管绘制（grid_line={grid_line}）");
+    }
+}
+
+/// 字体定义指纹：族内字体名列表 + 字体数据条目数。
+///
+/// [`egui::Context::add_font`] 只入队，`begin_pass` 才重建字体系统；指纹因此
+/// 在**下一帧**才变化，是「上一帧缓存的 Galley 需作废」的准确信号。
+/// 只哈希名字与数量（不含 TTF 字节），每帧成本可忽略。
+fn font_definitions_fingerprint(definitions: &egui::FontDefinitions) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    mix_hash(&mut h, definitions.font_data.len() as u64);
+    for (family, names) in &definitions.families {
+        mix_hash(&mut h, family.to_string().len() as u64);
+        for name in names {
+            for b in name.bytes() {
+                mix_hash(&mut h, u64::from(b));
+            }
+            mix_hash(&mut h, 0xff);
+        }
+    }
+    h
+}
+
+/// 把一行的分段 Galley 合成为单个 `Mesh`。
+///
+/// `relative = false`（Phase B 的 `Shape::Mesh`）：顶点是绝对屏幕点。
+/// `relative = true` （Phase C 的自管回调）：顶点以「行左缘 + 行顶」为原点，
+/// 绝对位置由 uniform 提供——这样同一网格行的顶点在滚动/移动窗口后依然有效。
+///
+/// **uv 归一化的归属**：`RowVisuals::mesh` 的 uv 是图集纹素坐标（epaint 文档
+/// 明示「you need to divide the uv coordinates by the texture size」）。
+/// egui 路径（`relative = false`）必须在这里除（`Shape::Mesh` 按原样上传，
+/// tessellator 对它是纯拷贝、不做归一化）；自管路径（`relative = true`）保留
+/// **纹素**坐标，由图集纹理本身在顶点着色器里除——两边都除会得到 ≈0 的 uv，
+/// 采样到图集左上角的白像素（整屏实心方块）。纹理尺寸只有着色器能准确知道。
+///
+/// 像素对齐与 epaint 的 `Painter` 一致：每个分段原点先按 ppp 取整，
+/// 否则字形会落在半像素上、出现灰边。
+fn build_row_mesh(
+    runs: &[CachedRun],
+    ppp: f32,
+    cell_width: f32,
+    x_base: f32,
+    y: f32,
+    relative: bool,
+    atlas_size: [usize; 2],
+) -> egui::Mesh {
+    let snap = |v: f32| (v * ppp).round() / ppp;
+    let uv_scale = egui::vec2(
+        1.0 / atlas_size[0].max(1) as f32,
+        1.0 / atlas_size[1].max(1) as f32,
+    );
+    let x_origin = snap(x_base);
+    // 纹理指向字体图集（含 `WHITE_UV` 白像素），不是自定义纹理。
+    let mut mesh = egui::Mesh {
+        texture_id: egui::TextureId::Managed(0),
+        ..Default::default()
+    };
+    for run in runs {
+        // 行 mesh 只取第一行（分段恒为单行、`break_on_newline = false`）。
+        let Some(row) = run.galley.rows.first() else {
+            continue;
+        };
+        let glyphs = &row.visuals.mesh;
+        if glyphs.is_empty() {
+            continue;
+        }
+        let origin_abs = snap(x_base + run.start_col as f32 * cell_width);
+        let dx = if relative {
+            origin_abs - x_origin
+        } else {
+            origin_abs
+        };
+        let dy = if relative { 0.0 } else { snap(y) };
+        let offset = egui::vec2(dx, dy);
+        let base = mesh.vertices.len() as u32;
+        // 自管路径保留纹素 uv（顶点着色器按**被采样纹理**的尺寸归一化，
+        // 避免 CPU 侧记录的尺寸与纹理换代后的实际尺寸不一致）；egui 路径在此归一化。
+        let uv = |v: &egui::epaint::Vertex| {
+            if relative {
+                v.uv
+            } else {
+                egui::pos2(v.uv.x * uv_scale.x, v.uv.y * uv_scale.y)
+            }
+        };
+        mesh.vertices
+            .extend(glyphs.vertices.iter().map(|v| egui::epaint::Vertex {
+                pos: v.pos + offset,
+                uv: uv(v),
+                color: v.color,
+            }));
+        mesh.indices.extend(glyphs.indices.iter().map(|i| i + base));
+    }
+    mesh
+}
+
+/// 一次性 tessellate 装饰网格线为单个 `Mesh`（面板矩形与缩放比相同即复用）。
+///
+/// 网格线是纯色线段：顶点 uv 取 `WHITE_UV`（字体图集左上角的白像素），
+/// 纹理 id 用 `TextureId::Managed(0)` 即字体图集本身，因此不需要额外的纹理
+/// 资源（epaint 对 `Shape::Mesh` 只做顶点追加，不做 uv 归一化）。
+fn build_grid_lines_mesh(panel: Rect, ppp: f32) -> egui::Mesh {
+    const GRID_STEP: f32 = 32.0;
+    let mut mesh = egui::Mesh::default();
+    let mut tessellator = egui::epaint::Tessellator::new(
+        ppp,
+        egui::epaint::TessellationOptions::default(),
+        [1, 1],
+        Vec::new(),
+    );
+    let stroke = egui::Stroke::new(1.0, crate::theme::tokens::GRID_LINE);
+    let first_x = panel.left() - panel.left().rem_euclid(GRID_STEP);
+    let first_y = panel.top() - panel.top().rem_euclid(GRID_STEP);
+    for x in (0..=((panel.width() / GRID_STEP).ceil() as usize + 1))
+        .map(|i| first_x + i as f32 * GRID_STEP)
+    {
+        tessellator.tessellate_line_segment(
+            [egui::pos2(x, panel.top()), egui::pos2(x, panel.bottom())],
+            stroke,
+            &mut mesh,
+        );
+    }
+    for y in (0..=((panel.height() / GRID_STEP).ceil() as usize + 1))
+        .map(|i| first_y + i as f32 * GRID_STEP)
+    {
+        tessellator.tessellate_line_segment(
+            [egui::pos2(panel.left(), y), egui::pos2(panel.right(), y)],
+            stroke,
+            &mut mesh,
+        );
+    }
+    mesh
+}
+
 /// 下划线变体矢量线（SGR 4:2/4:3/4:4/4:5；Single 由 Galley 直接画）。
 ///
 /// 双线 = 基线 + 基线-2px 两条 1px；波浪 = 振幅 1px 的 8 段折线（段宽<8px
 /// 退化为单线）；点线 = 1px 点 + 2px 空、虚线 = 3px 线 + 2px 空（dash 手工
 /// 分段，egui 无虚线 stroke）。颜色由调用方按 SGR58/前景解好传入。
-fn paint_underline_variant(
-    painter: &egui::Painter,
+///
+/// 直接推入 Shape 批量缓冲（而非 `Painter::add`）：下划线变体一行最多产生
+/// 8 + ceil(width/3) 条线，逐条提交会把 Context 写锁次数放大到千级。
+fn push_underline_variant(
+    out: &mut Vec<egui::Shape>,
     x: f32,
     base_y: f32,
     width: f32,
@@ -2046,21 +2874,21 @@ fn paint_underline_variant(
         UnderlineStyle::None | UnderlineStyle::Single => {}
         UnderlineStyle::Double => {
             for dy in [0.0, -2.0] {
-                painter.line_segment(
+                out.push(egui::Shape::line_segment(
                     [
                         egui::pos2(x, base_y + dy),
                         egui::pos2(x + width, base_y + dy),
                     ],
                     Stroke::new(1.0, color),
-                );
+                ));
             }
         }
         UnderlineStyle::Curly => {
             if width < 8.0 {
-                painter.line_segment(
+                out.push(egui::Shape::line_segment(
                     [egui::pos2(x, base_y), egui::pos2(x + width, base_y)],
                     Stroke::new(1.0, color),
-                );
+                ));
                 return;
             }
             let segs = 8;
@@ -2070,7 +2898,10 @@ fn paint_underline_variant(
                 // 正弦一周期：0→+1→0→-1→0，振幅 1px。
                 let dy = (t * std::f32::consts::TAU).sin();
                 let next = egui::pos2(x + width * t, base_y + dy);
-                painter.line_segment([prev, next], Stroke::new(1.0, color));
+                out.push(egui::Shape::line_segment(
+                    [prev, next],
+                    Stroke::new(1.0, color),
+                ));
                 prev = next;
             }
         }
@@ -2078,10 +2909,10 @@ fn paint_underline_variant(
             let mut cx = x;
             while cx < x + width {
                 let end = (cx + 1.0).min(x + width);
-                painter.line_segment(
+                out.push(egui::Shape::line_segment(
                     [egui::pos2(cx, base_y), egui::pos2(end, base_y)],
                     Stroke::new(1.0, color),
-                );
+                ));
                 cx += 3.0;
             }
         }
@@ -2089,10 +2920,10 @@ fn paint_underline_variant(
             let mut cx = x;
             while cx < x + width {
                 let end = (cx + 3.0).min(x + width);
-                painter.line_segment(
+                out.push(egui::Shape::line_segment(
                     [egui::pos2(cx, base_y), egui::pos2(end, base_y)],
                     Stroke::new(1.0, color),
-                );
+                ));
                 cx += 5.0;
             }
         }
@@ -2222,6 +3053,153 @@ fn selection_to_text(
 /// `x = start_col * cell_width` 即精确对齐，无累积漂移。
 /// （历史 bug：整行一个 LayoutJob 让 egui 按 fallback 字体实际 advance 排字，
 /// CJK 实际宽度 ≠ 2×cell，后续字符整体左移，光标越打越远。）
+/// 一个 cell 的渲染属性（`build_line_data` 与 `cell_key` 共用同一套解析规则）。
+struct ResolvedCell {
+    style: CellStyle,
+    /// 普通宽字符的右半占位格：不产生文本，但进指纹。
+    spacer: bool,
+    /// 写入文本段的字符（隐藏字符 / 行尾占位视作空格）。
+    text: char,
+    /// 隐藏字符或行尾占位时丢弃组合符（与文本段一致）。
+    drop_zero_width: bool,
+    is_wide: bool,
+}
+
+/// 解析 cell 的颜色与样式（粗体亮色映射、INVERSE 反色、DIM 减暗）。
+///
+/// 行内容构建与逐 cell 指纹必须走同一份解析，否则指纹会与实际绘制脱节
+/// （表现为「样式变了但行不重建」）。
+fn resolve_cell(
+    cell: &alacritty_terminal::term::cell::Cell,
+    colors: &Colors,
+    default_fg: Rgb,
+    default_bg: Rgb,
+) -> ResolvedCell {
+    let bold = cell.flags.contains(Flags::BOLD);
+    let mut fg = resolve_color(cell.fg, colors, default_fg, bold);
+    let mut bg = resolve_color(cell.bg, colors, default_bg, false);
+    let italic = cell.flags.contains(Flags::ITALIC);
+    let underline = underline_style_of(cell.flags);
+    let strikeout = cell.flags.contains(Flags::STRIKEOUT);
+    // SGR 58 下划线颜色（`Color::Spec` 直接 RGB，其余走调色板解析）。
+    let underline_color = cell.underline_color().map(|c| match c {
+        AColor::Spec(rgb) => to_egui(rgb),
+        other => resolve_color(other, colors, default_fg, false),
+    });
+
+    // INVERSE 反色。
+    if cell.flags.contains(Flags::INVERSE) {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+    // DIM 减暗（粗体不减）。
+    if cell.flags.contains(Flags::DIM) && !bold {
+        fg = Color32::from_rgb(fg.r() / 2, fg.g() / 2, fg.b() / 2);
+    }
+
+    let leading_spacer = cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER);
+    let spacer = cell.flags.contains(Flags::WIDE_CHAR_SPACER) && !leading_spacer;
+    let hidden = cell.flags.contains(Flags::HIDDEN);
+    ResolvedCell {
+        style: CellStyle {
+            fg,
+            bg,
+            bold,
+            italic,
+            underline,
+            strikeout,
+            underline_color,
+        },
+        spacer,
+        text: if hidden || leading_spacer {
+            ' '
+        } else {
+            cell.c
+        },
+        drop_zero_width: hidden || leading_spacer,
+        // 主宽字符（WIDE_CHAR 标志）占双列：后续半角另起新段。
+        // 行尾换行占位（LEADING）与隐藏字符视作半角空格宽度。
+        is_wide: !leading_spacer && !hidden && cell.flags.contains(Flags::WIDE_CHAR),
+    }
+}
+
+/// 单个 cell 的内容指纹（样式 + 字符 + 组合符 + OSC8 链接 URI）。
+fn cell_key(
+    cell: &alacritty_terminal::term::cell::Cell,
+    colors: &Colors,
+    default_fg: Rgb,
+    default_bg: Rgb,
+) -> u64 {
+    let resolved = resolve_cell(cell, colors, default_fg, default_bg);
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    mix_hash(&mut h, resolved.style.key());
+    mix_hash(&mut h, resolved.text as u64);
+    if !resolved.drop_zero_width {
+        if let Some(zero_width) = cell.zerowidth() {
+            for c in zero_width {
+                mix_hash(&mut h, *c as u64);
+            }
+        }
+    }
+    if let Some(hyperlink) = cell.hyperlink() {
+        for b in hyperlink.uri().bytes() {
+            mix_hash(&mut h, u64::from(b));
+        }
+    }
+    // 宽字符与半角的段切分不同，必须进指纹。
+    mix_hash(&mut h, u64::from(resolved.is_wide));
+    h
+}
+
+/// 取网格行（负行号 = scrollback）。
+fn grid_row(
+    grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
+    grid_line: i32,
+) -> &alacritty_terminal::grid::Row<alacritty_terminal::term::cell::Cell> {
+    // `Line` 的 tuple 构造器不公开，负行号（scrollback）用 `Line(0) - n` 构造。
+    &grid[if grid_line >= 0 {
+        alacritty_terminal::index::Line::from(grid_line as usize)
+    } else {
+        alacritty_terminal::index::Line::from(0) - grid_line.unsigned_abs() as usize
+    }]
+}
+
+/// 比较一行内 `[left, right]` 列的指纹与缓存是否一致（含边界收敛）。
+///
+/// `None` 表示未变化、无需重建。用于「光标移动只损伤一两列」的场景：
+/// 只重算受损列，避免整行的颜色解析与分词。
+#[allow(clippy::too_many_arguments)]
+fn row_keys_changed(
+    grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
+    grid_line: i32,
+    cols: usize,
+    colors: &Colors,
+    default_fg: Rgb,
+    default_bg: Rgb,
+    range: Option<(usize, usize)>,
+    cached_keys: &[u64],
+) -> bool {
+    let row = grid_row(grid, grid_line);
+    let (left, right) = match range {
+        Some((left, right)) => (
+            left.min(cols.saturating_sub(1)),
+            right.min(cols.saturating_sub(1)),
+        ),
+        None => (0, cols.saturating_sub(1)),
+    };
+    for (col, cell) in row.into_iter().enumerate().take(cols) {
+        if col < left || col > right {
+            continue;
+        }
+        let key = cell_key(cell, colors, default_fg, default_bg);
+        match cached_keys.get(col) {
+            Some(cached) if *cached == key => {}
+            // 指纹长度不同（列数变化）或值不同：需要重建。
+            _ => return true,
+        }
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_line_data(
     grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
@@ -2234,116 +3212,48 @@ fn build_line_data(
 ) -> LineData {
     let mut segments: Vec<Segment> = Vec::new();
     let mut backgrounds: Vec<BgRect> = Vec::new();
-    let mut hash: u64 = 0;
-    // `Line` 的 tuple 构造器不公开，负行号（scrollback）用 `Line(0) - n` 构造。
-    let row = &grid[if grid_line >= 0 {
-        alacritty_terminal::index::Line::from(grid_line as usize)
-    } else {
-        alacritty_terminal::index::Line::from(0) - grid_line.unsigned_abs() as usize
-    }];
+    let mut cell_keys: Vec<u64> = Vec::with_capacity(cols);
+    let row = grid_row(grid, grid_line);
 
     for (col, cell) in row.into_iter().enumerate().take(cols) {
-        // 解析颜色（含粗体 → 亮色映射）。
-        let mut fg = resolve_color(
-            cell.fg,
-            colors,
-            default_fg,
-            cell.flags.contains(Flags::BOLD),
-        );
-        let mut bg = resolve_color(cell.bg, colors, default_bg, false);
-        let bold = cell.flags.contains(Flags::BOLD);
-        let italic = cell.flags.contains(Flags::ITALIC);
-        let underline = underline_style_of(cell.flags);
-        let strikeout = cell.flags.contains(Flags::STRIKEOUT);
-        // SGR 58 下划线颜色（`Color::Spec` 直接 RGB，其余走调色板解析）。
-        let underline_color = cell.underline_color().map(|c| match c {
-            AColor::Spec(rgb) => to_egui(rgb),
-            other => resolve_color(other, colors, default_fg, false),
-        });
+        let resolved = resolve_cell(cell, colors, default_fg, default_bg);
+        let style = resolved.style;
 
-        // INVERSE 反色。
-        if cell.flags.contains(Flags::INVERSE) {
-            std::mem::swap(&mut fg, &mut bg);
-        }
-        // DIM 减暗（粗体不减）。
-        if cell.flags.contains(Flags::DIM) && !bold {
-            fg = Color32::from_rgb(fg.r() / 2, fg.g() / 2, fg.b() / 2);
-        }
+        // 逐列指纹（与本行内容同源，见 `cell_key` 的说明）。
+        cell_keys.push(cell_key(cell, colors, default_fg, default_bg));
 
         // 背景段合并（默认背景不绘制）。
-        push_background(&mut backgrounds, col, bg, default_bg_egui);
+        push_background(&mut backgrounds, col, style.bg, default_bg_egui);
 
-        let leading_spacer = cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER);
-        let wide_spacer = cell.flags.contains(Flags::WIDE_CHAR_SPACER);
-        if wide_spacer && !leading_spacer {
+        if resolved.spacer {
             // 普通宽字符占位格由前一个宽字符的 glyph 提供视觉宽度，
-            // 不再追加文本，但必须进入哈希以跟踪其背景/属性变化。
-            mix_cell_hash(
-                &mut hash,
-                cell.c,
-                CellStyle {
-                    fg,
-                    bg,
-                    bold,
-                    italic,
-                    underline,
-                    strikeout,
-                    underline_color,
-                },
-                cell.zerowidth(),
-            );
+            // 不再追加文本（其背景/属性变化已由 `cell_key` 覆盖）。
             continue;
         }
 
-        // 文本段合并（宽字符起新段：字宽与半角不同，不混排）。
-        let text = if cell.flags.contains(Flags::HIDDEN) || leading_spacer {
-            ' '
-        } else {
-            cell.c
-        };
-        let zero_width = if cell.flags.contains(Flags::HIDDEN) || leading_spacer {
+        let zero_width = if resolved.drop_zero_width {
             None
         } else {
             cell.zerowidth()
         };
-        // 主宽字符（WIDE_CHAR 标志）占双列：后续半角另起新段。
-        // 行尾换行占位（LEADING）与隐藏字符视作半角空格宽度。
-        let is_wide = !leading_spacer
-            && !cell.flags.contains(Flags::HIDDEN)
-            && cell.flags.contains(Flags::WIDE_CHAR);
         // OSC8 超链接：同 URI 才合并（`push_or_merge` 判 link 相等）。
         let link = cell
             .hyperlink()
             .map(|h| h.uri().to_owned())
             .filter(|u| !u.is_empty());
-        if let Some(url) = link.as_deref() {
-            hash = hash.wrapping_mul(131).wrapping_add(url.len() as u64);
-            for b in url.bytes() {
-                hash = hash.wrapping_mul(131).wrapping_add(b as u64);
-            }
-        }
         push_or_merge(
             &mut segments,
             col,
-            text,
+            resolved.text,
             zero_width,
-            is_wide,
-            CellStyle {
-                fg,
-                bg,
-                bold,
-                italic,
-                underline,
-                strikeout,
-                underline_color,
-            },
+            resolved.is_wide,
+            style,
             link,
-            &mut hash,
         );
     }
 
     LineData {
-        hash,
+        cell_keys,
         segments,
         backgrounds,
     }
@@ -2453,23 +3363,40 @@ struct CellStyle {
 }
 
 impl CellStyle {
+    /// 样式指纹（用于行缓存的内容比较）。
+    ///
+    /// 用 FNV-1a 混合而非位域 XOR：各字段先各自打包进 64 位再混合，字段之间
+    /// 不可能互相覆盖。此前的位域写法把 `underline_color` 的三通道组合
+    /// `.wrapping_mul(31)` 直接 XOR 进去，最大可到 `0x1EFFFFE1`，占住
+    /// bit 24-28——与 `bold<<24 / italic<<25 / underline<<26 / strikeout<<29`
+    /// 重叠，导致「下划线颜色变了但指纹不变」的伪命中（行不重建、颜色不更新）。
     fn key(self) -> u64 {
-        u64::from(self.fg.r())
-            ^ (u64::from(self.fg.g()) << 8)
-            ^ (u64::from(self.fg.b()) << 16)
-            ^ (u64::from(self.bg.r()) << 32)
-            ^ (u64::from(self.bg.g()) << 40)
-            ^ (u64::from(self.bg.b()) << 48)
-            ^ (u64::from(self.bold) << 24)
-            ^ (u64::from(self.italic) << 25)
-            ^ ((self.underline as u64 % 7) << 26)
-            ^ (u64::from(self.strikeout) << 29)
-            ^ self
-                .underline_color
-                .map(|c| u64::from(c.r()) ^ (u64::from(c.g()) << 8) ^ (u64::from(c.b()) << 16))
-                .unwrap_or(0)
-                .wrapping_mul(31)
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a 64 位偏移基数
+        mix_hash(&mut h, pack_rgb(self.fg.r(), self.fg.g(), self.fg.b()));
+        mix_hash(&mut h, pack_rgb(self.bg.r(), self.bg.g(), self.bg.b()));
+        let flags = u64::from(self.bold)
+            | (u64::from(self.italic) << 1)
+            | ((self.underline as u64) << 2)
+            | (u64::from(self.strikeout) << 5);
+        mix_hash(&mut h, flags);
+        // 单独打包下划线颜色并附带「是否存在」位，避免与 `None` 撞（黑 = 0）。
+        let underline = match self.underline_color {
+            Some(c) => pack_rgb(c.r(), c.g(), c.b()) | (1 << 24),
+            None => 0,
+        };
+        mix_hash(&mut h, underline);
+        h
     }
+}
+
+/// 三通道 8 位颜色打包进低 24 位。
+fn pack_rgb(r: u8, g: u8, b: u8) -> u64 {
+    u64::from(r) | (u64::from(g) << 8) | (u64::from(b) << 16)
+}
+
+/// FNV-1a 混合一步（64 位）。
+fn mix_hash(h: &mut u64, v: u64) {
+    *h = (*h ^ v).wrapping_mul(0x0000_0100_0000_01B3);
 }
 
 /// 合并或追加一个 cell 到段列表。
@@ -2492,7 +3419,6 @@ fn push_or_merge(
     is_wide: bool,
     style: CellStyle,
     link: Option<String>,
-    hash: &mut u64,
 ) {
     if let Some(last) = segments.last_mut() {
         if !is_wide
@@ -2509,7 +3435,6 @@ fn push_or_merge(
             if let Some(zero_width) = zero_width {
                 last.text.extend(zero_width.iter().copied());
             }
-            mix_cell_hash(hash, c, style, zero_width);
             return;
         }
     }
@@ -2528,18 +3453,6 @@ fn push_or_merge(
     if let Some(zero_width) = zero_width {
         if let Some(last) = segments.last_mut() {
             last.text.extend(zero_width.iter().copied());
-        }
-    }
-    mix_cell_hash(hash, c, style, zero_width);
-}
-
-/// 将影响行绘制的 cell 属性加入缓存指纹。
-fn mix_cell_hash(hash: &mut u64, c: char, style: CellStyle, zero_width: Option<&[char]>) {
-    *hash = hash.wrapping_mul(131).wrapping_add(style.key());
-    *hash = hash.wrapping_mul(131).wrapping_add(c as u64);
-    if let Some(zero_width) = zero_width {
-        for c in zero_width {
-            *hash = hash.wrapping_mul(131).wrapping_add(*c as u64);
         }
     }
 }
@@ -2911,6 +3824,74 @@ fn scrollback_key(key: &egui::Key, modifiers: egui::Modifiers) -> Option<Scroll>
 mod tests {
     use super::*;
     use mino_core::terminal::{Session, SessionOptions};
+    /// 高输出吞吐基准（`cargo test -- --ignored --nocapture 行构建吞吐`）。
+    ///
+    /// 无 criterion 依赖（离线 registry 无该 crate），用 `#[ignore]` 单测
+    /// 代替：构造满屏混合内容（ASCII + 中文 + 颜色/下划线），循环跑锁内
+    /// `build_line_data`，打印行/秒。跑分只看量级（优化前后对比），
+    /// 不做 CI 门限（机器差异大）。
+    #[test]
+    #[ignore]
+    fn 行构建吞吐基准() {
+        use alacritty_terminal::term::cell::Flags;
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            120,
+            40,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        // 满屏混合内容：ASCII 彩色 + 中文 + 下划线变体。
+        session.write("printf '\\e[31m%s\\e[0m\\n' {a..z} >/dev/null\r".as_bytes());
+        session.write(
+            "printf '中文测试行%03d \\e[4:3m下划线\\e[0m \\e[32m绿色\\e[0m\\n' {001..040}\r"
+                .as_bytes(),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        let term_arc = session.term();
+        let guard = term_arc.lock();
+        let content = guard.renderable_content();
+        let colors = content.colors;
+        let grid = guard.grid();
+        let cols = grid.columns();
+        let lines: Vec<i32> = (0..40).map(|v| v - content.display_offset as i32).collect();
+        let iters = 50usize;
+        let start = std::time::Instant::now();
+        let mut rows_built = 0usize;
+        for _ in 0..iters {
+            for grid_line in &lines {
+                let data = build_line_data(
+                    grid,
+                    *grid_line,
+                    cols,
+                    colors,
+                    alacritty_terminal::vte::ansi::Rgb {
+                        r: 226,
+                        g: 233,
+                        b: 240,
+                    },
+                    alacritty_terminal::vte::ansi::Rgb {
+                        r: 11,
+                        g: 16,
+                        b: 22,
+                    },
+                    Color32::from_rgb(11, 16, 22),
+                );
+                std::hint::black_box(data.cell_keys.len());
+                rows_built += 1;
+            }
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        let have_wide = grid
+            .display_iter()
+            .any(|item| item.cell.flags.contains(Flags::WIDE_CHAR));
+        println!(
+            "行构建吞吐：{rows_built} 行 / {elapsed:.2}s = {:.0} 行/秒（宽字符行参与：{have_wide}）",
+            rows_built as f64 / elapsed
+        );
+        drop(guard);
+    }
+
     use std::cell::RefCell;
     use std::path::PathBuf;
     use std::rc::Rc;
@@ -3309,6 +4290,61 @@ mod tests {
         );
     }
 
+    /// 滚动只应重建**滚入的新行**，而不是整屏。
+    ///
+    /// alacritty 在 `display_offset` 变化时返回 `TermDamage::Full`（不携带逐行
+    /// 信息），旧实现据此对所有行重算内容与 hash——一次滚轮就是整屏重建。
+    /// 现在 Full 帧也走逐行指纹比较：内容没变的行不重建，只有从未缓存过的
+    /// 新滚入行需要构建。
+    #[test]
+    fn 滚动时不重建未变化的行() {
+        use alacritty_terminal::grid::Scroll;
+
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+        });
+        assert!(wait_text(&view, &mut harness, "mino"), "zsh 未就绪");
+
+        // 输出远超一屏的内容，确保 scrollback 里有从未进入过缓存的旧行。
+        view.borrow().session().write(b"seq 200\r");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            harness.step();
+            if grid_text(view.borrow().session())
+                .lines()
+                .any(|l| l.trim_end() == "200")
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        harness.run_steps(4);
+        let rows_visible = view.borrow().rows as usize;
+        assert!(rows_visible > 10, "视口行数异常：{rows_visible}");
+
+        // 向上滚动 4 行：滚入 4 条从未缓存过的行。
+        {
+            let term = view.borrow().session().term();
+            let mut guard = term.lock();
+            guard.grid_mut().scroll_display(Scroll::Delta(4));
+        }
+        harness.step();
+        let rebuilt = view.borrow().last_stats().1;
+        assert!(
+            rebuilt < rows_visible / 2,
+            "滚动一屏内的小步长不应重建整屏：重建 {rebuilt} 行 / 可见 {rows_visible} 行"
+        );
+    }
+
     /// 找一条以 `first` 开头的可见行，返回（显示行号, [(终端列, 字符)]）。
     fn grid_row_starting_with(
         session: &Session,
@@ -3364,8 +4400,12 @@ mod tests {
         });
         // 字体必须在首帧前装好：cell_width 与宽字符 Galley 都按首帧字体缓存
         // （kittest 默认字体没有中文字形，也量不出真实 cell_width）。
-        crate::setup_fonts(&harness.ctx);
-        assert!(wait_text(&view, &mut harness, "mino"), "zsh 未就绪");
+        // 中文字体是后台线程读（55MB+ 的 .ttc 同步读会拖慢首帧）：测试必须
+        // `wait_ready` 阻塞到并入完成，否则 `has_glyphs("中")` 查到缺字形。
+        let mut cjk = crate::setup_fonts(&harness.ctx);
+        cjk.wait_ready(&harness.ctx);
+        // `add_font` 下一帧 begin_pass 才落地：先跑一帧再查字形。
+        harness.step();
         // 字体链必须真能画中文：缺字形时测到的是占位符宽度，断言无意义。
         // （`set_fonts` 在下一帧 begin_pass 生效，故须等跑过帧再查。）
         assert!(
@@ -3481,12 +4521,41 @@ mod tests {
 
 #[cfg(test)]
 mod deadlock_tests {
-    use super::*;
-    use mino_core::terminal::{Session, SessionOptions};
+    use super::TerminalView;
+    use mino_core::terminal::{Session, SessionEvent, SessionOptions};
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::Arc;
 
+    /// 本模块内等待终端文本（`mod tests` 的同名 helper 私有，兄弟模块不可见）。
+    fn wait_view_text(
+        view: &std::rc::Rc<std::cell::RefCell<TerminalView>>,
+        harness: &mut egui_kittest::Harness,
+        needle: &str,
+    ) -> bool {
+        use alacritty_terminal::term::cell::Flags;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while std::time::Instant::now() < deadline {
+            harness.step();
+            let term_arc = view.borrow().session().term();
+            let guard = term_arc.lock();
+            let mut text = String::new();
+            for item in guard.renderable_content().display_iter {
+                if item.cell.flags.contains(Flags::WIDE_CHAR_SPACER)
+                    || item.cell.flags.contains(Flags::HIDDEN)
+                {
+                    continue;
+                }
+                text.push(item.cell.c);
+            }
+            drop(guard);
+            if text.contains(needle) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+        false
+    }
     /// 回归测试：滚轮事件不应在 ui.input 闭包内触发 request_repaint（会自死锁 panic）。
     #[test]
     fn 滚轮滚动不死锁() {
@@ -3526,6 +4595,220 @@ mod deadlock_tests {
             harness.step();
         }
         // 若修复失效，此处会在 10 秒死锁后 panic；到达这里说明通过。
+    }
+
+    /// 回归：滚轮/Page 滚动闭包外统一拿 Term 锁后仍滚动正确。
+    ///
+    /// `ui.input` 闭包持有 Context 写锁，闭包内直接 `scroll_display`（拿终端
+    /// FairMutex）会与 PTY 读线程 `send_event→request_repaint→Context 写锁`
+    /// 形成 AB-BA（10 秒自死锁 panic；旧注释只延后了 `request_repaint`）。
+    /// 锁序是代码结构性质，本测试断言可观测契约：Page 上滚一页、Point 下滚。
+    #[test]
+    fn 滚轮滚动闭包外执行且步数正确() {
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+        });
+        assert!(wait_view_text(&view, &mut harness, "mino"), "zsh 未就绪");
+        // 产生足够 scrollback（60 行超过 24 行视口）：直接注入程序侧输出，
+        // 不靠 shell 执行命令——测试环境的 zsh 会做会话恢复、命令回显里也含
+        // 同样的文本，按屏幕文本等"输出就绪"会误判（回显先到、输出后到），
+        // 随后 Page 上滚因无历史可滚而停在 0（此前 flaky 的根因）。
+        let mut payload = Vec::new();
+        for line in 0..60 {
+            payload.extend_from_slice(format!("line {line}\r\n").as_bytes());
+        }
+        view.borrow()
+            .session()
+            .inject_program_output_for_test(&payload);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            harness.step();
+            let history = {
+                use alacritty_terminal::grid::Dimensions;
+                let term = view.borrow().session().term();
+                let guard = term.lock();
+                guard.grid().history_size()
+            };
+            if history > 24 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "注入输出未进 scrollback（历史行 {history}）"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+        let offset_before = view
+            .borrow()
+            .session()
+            .term()
+            .lock()
+            .grid()
+            .display_offset();
+        // Page 单位滚轮上滚：指针先移到终端内（滚轮只在指针位于终端时处理）。
+        harness.event(egui::Event::PointerMoved(egui::pos2(100.0, 100.0)));
+        harness.step();
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Page,
+            delta: egui::Vec2::new(0.0, 3.0),
+            modifiers: egui::Modifiers::default(),
+            phase: egui::TouchPhase::Move,
+        });
+        harness.step();
+        harness.step();
+        let offset_after_page = view
+            .borrow()
+            .session()
+            .term()
+            .lock()
+            .grid()
+            .display_offset();
+        assert!(
+            offset_after_page > offset_before,
+            "Page 滚轮应上滚一页：{offset_before} → {offset_after_page}"
+        );
+        // Point 单位滚轮下滚：回到视口底部附近（offset 减小）。
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::Vec2::new(0.0, -3.0),
+            modifiers: egui::Modifiers::default(),
+            phase: egui::TouchPhase::Move,
+        });
+        harness.step();
+        harness.step();
+        let offset_after_point = view
+            .borrow()
+            .session()
+            .term()
+            .lock()
+            .grid()
+            .display_offset();
+        assert!(
+            offset_after_point < offset_after_page,
+            "Point 滚轮应下滚：{offset_after_page} → {offset_after_point}"
+        );
+    }
+
+    /// 回归：程序持续产生事件时终端仍能推帧（用户现象「SSH + omp 双窗口整窗无响应」）。
+    ///
+    /// 根因是 AB-BA：UI 线程持 egui `Context` 写锁时取终端锁（旧实现里
+    /// `ui.input` 闭包内滚动、渲染持锁期间读时间/安排重绘），PTY 读线程则持
+    /// 终端锁回调 `request_repaint`（要 `Context` 写锁）。程序只要持续产生
+    /// 非 Wakeup 事件——omp 的任务通知是 BEL、窗口标题、终端查询回执——两个
+    /// 方向就会撞在一起，双方都等对方持有的锁，进程再也回不来。
+    ///
+    /// 复现方式与生产同构、不靠概率：后台线程按 PTY 读线程的锁序执行
+    /// 「持终端锁 → 回调 `request_repaint`」，主循环按生产路径推帧并带滚动
+    /// 输入（旧实现的滚动正是在 `ui.input` 闭包内取终端锁＝反向锁序）。
+    ///
+    /// 帧推进放子线程、主线程按心跳超时判定：死锁时测试**有界失败**，不会把
+    /// 整个测试套件挂住（其它用例是「跑通即通过」的形态，这条必须能自己报错）。
+    #[test]
+    fn 程序事件洪泛时终端仍能推帧() {
+        use std::sync::mpsc;
+        use std::sync::OnceLock;
+
+        const STEPS: usize = 40;
+        let (tx, rx) = mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            // `OnceLock` 而非 `LazyLock`：回调要用的正是 kittest 建好 harness
+            // 之后才存在的那个 `Context`，初值只能在运行期拿到。
+            let ctx_cell: Arc<OnceLock<egui::Context>> = Arc::new(OnceLock::new());
+            let callback_cell = ctx_cell.clone();
+            let session = Session::spawn_local(
+                SessionOptions::default(),
+                80,
+                24,
+                // 生产路径：PTY 读线程解析出事件后回调 UI 去重绘——这一步要
+                // `Context` 写锁，而终端锁此时仍在读线程手里（正是 AB-BA 的另一半）。
+                Arc::new(move |_ev: &SessionEvent| {
+                    if let Some(ctx) = callback_cell.get() {
+                        ctx.request_repaint();
+                    }
+                }),
+            )
+            .expect("创建本地终端失败");
+            let term = session.term();
+            let view = Rc::new(RefCell::new(TerminalView::new(session)));
+            let view_show = view.clone();
+            let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+                view_show.borrow_mut().show(ui);
+            });
+            let _ = ctx_cell.set(harness.ctx.clone());
+            assert!(wait_view_text(&view, &mut harness, "mino"), "zsh 未就绪");
+            harness.event(egui::Event::PointerMoved(egui::pos2(100.0, 100.0)));
+            harness.step();
+
+            // 模拟 PTY 读线程：持终端锁的整段窗口内回调 UI 重绘。持锁后先留
+            // 一段让 UI 走到取锁点，再回调——旧实现此刻正是 UI 持 `Context`
+            // 等终端锁、读线程持终端锁等 `Context`（双向死锁）。
+            let reader_term = term.clone();
+            let reader_ctx = harness.ctx.clone();
+            let reader = std::thread::spawn(move || {
+                for _ in 0..STEPS {
+                    {
+                        let _guard = reader_term.lock();
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        reader_ctx.request_repaint();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            });
+
+            for i in 0..STEPS {
+                // 滚轮（Point 单位）与 Shift+PageUp 两条路径都产生本地滚动意图；
+                // 旧实现两条都在 `ui.input` 闭包内取终端锁。
+                harness.event(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::Vec2::new(0.0, if i % 2 == 0 { 3.0 } else { -3.0 }),
+                    modifiers: egui::Modifiers::default(),
+                    phase: egui::TouchPhase::Move,
+                });
+                harness.event(egui::Event::Key {
+                    key: egui::Key::PageUp,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::SHIFT,
+                });
+                harness.step();
+                if tx.send(()).is_err() {
+                    return;
+                }
+            }
+            reader.join().expect("读线程模拟线程异常退出");
+            // 推帧全程后视图仍可用：滚动偏移回到视口底部附近。
+            let offset = view
+                .borrow()
+                .session()
+                .term()
+                .lock()
+                .grid()
+                .display_offset();
+            assert!(offset <= 1, "推帧结束后滚动偏移异常：{offset}");
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        for step in 0..STEPS {
+            let now = std::time::Instant::now();
+            assert!(
+                now < deadline,
+                "第 {step}/{STEPS} 帧前已超时：终端推帧停滞（AB-BA 死锁）"
+            );
+            assert!(
+                rx.recv_timeout(deadline - now).is_ok(),
+                "第 {step}/{STEPS} 帧超时未完成：终端推帧停滞（AB-BA 死锁）"
+            );
+        }
+        worker.join().expect("推帧线程异常退出");
     }
 }
 
@@ -3629,6 +4912,46 @@ mod mouse_wheel_tests {
         );
     }
 
+    /// 网格线改由缓存 `Mesh` 绘制后，顶点必须采样字体图集的白色像素
+    /// （`WHITE_UV` = 图集左上角）：uv 若非 (0,0)，网格线会采到字形像素
+    /// 而出现彩色噪点；纹理 id 也必须指向图集而不是自定义纹理。
+    #[test]
+    fn 网格线网格采样白像素() {
+        let mesh = build_grid_lines_mesh(
+            Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(200.0, 100.0)),
+            1.0,
+        );
+        assert!(
+            !mesh.vertices.is_empty() && mesh.indices.len().is_multiple_of(3),
+            "网格线网格不应为空且索引应为三角形：{} 顶点 / {} 索引",
+            mesh.vertices.len(),
+            mesh.indices.len()
+        );
+        assert_eq!(
+            mesh.texture_id,
+            egui::TextureId::Managed(0),
+            "网格线应使用字体图集（含白像素）作为纹理"
+        );
+        assert!(
+            mesh.vertices.iter().all(|v| v.uv == egui::epaint::WHITE_UV),
+            "网格线顶点应全部采样白像素，否则会采到字形像素"
+        );
+    }
+
+    /// 缓存命中必须复用同一份顶点数据（面板矩形与 ppp 不变时零重建）。
+    #[test]
+    fn 网格线缓存命中不重建() {
+        let rect = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(200.0, 100.0));
+        let first = build_grid_lines_mesh(rect, 1.0);
+        let second = build_grid_lines_mesh(rect, 1.0);
+        assert_eq!(
+            first.vertices.len(),
+            second.vertices.len(),
+            "同一面板矩形应产出确定的顶点数"
+        );
+        assert_eq!(first.indices, second.indices);
+    }
+
     /// 回归：omp 发出的 OSC8 超链接（`tui.hyperlinks=always` 下路径/URL
     /// 全包链接）必须进段缓存并可点击；同 URI 相邻 cell 合并、不同 URI 另起段。
     #[test]
@@ -3682,6 +5005,69 @@ mod mouse_wheel_tests {
         assert!(
             !links.iter().any(|s| s.contains("mid")),
             "普通文本不应带链接：{links:?}"
+        );
+
+        // 悬浮命中：命中结果由渲染循环顺带算出（不再单独整屏扫描），
+        // 指针落在第一段链接的矩形内时必须给出小手光标。
+        let link_center = {
+            let v = view.borrow();
+            let offset = v
+                .session()
+                .term()
+                .lock()
+                .renderable_content()
+                .display_offset;
+            let inner = v.terminal_inner();
+            let mut found = None;
+            for (grid_line, cache) in &v.rows_cache {
+                for run in &cache.runs {
+                    if run
+                        .link
+                        .as_deref()
+                        .is_some_and(|u| u.contains("https://a.example"))
+                    {
+                        let display_row = *grid_line + offset as i32;
+                        found = Some(
+                            inner.min
+                                + egui::vec2(
+                                    (run.start_col as f32 + 0.5) * v.cell_width,
+                                    (display_row as f32 + 0.5) * v.cell_height,
+                                ),
+                        );
+                    }
+                }
+            }
+            found.expect("未找到第一段链接的缓存 run")
+        };
+        harness.event(egui::Event::PointerMoved(link_center));
+        harness.step();
+        assert_eq!(
+            harness.output().platform_output.cursor_icon,
+            egui::CursorIcon::PointingHand,
+            "指针落在链接段上应显示小手光标（hover 命中失效）"
+        );
+
+        // 排除假阳性：终端内的非链接单元格不能给小手——否则上面的断言
+        // 只证明了「指针在终端面板内」，没证明链接命中。
+        let blank_inside = {
+            let v = view.borrow();
+            v.terminal_inner().max - egui::vec2(1.0, 1.0)
+        };
+        harness.event(egui::Event::PointerMoved(blank_inside));
+        harness.step();
+        assert_ne!(
+            harness.output().platform_output.cursor_icon,
+            egui::CursorIcon::PointingHand,
+            "终端内的非链接单元格不应给小手光标"
+        );
+
+        // 离开终端后不再是小手。
+        harness.event(egui::Event::PointerMoved(egui::pos2(-50.0, -50.0)));
+        harness.step();
+        assert_ne!(
+            harness.output().platform_output.cursor_icon,
+            egui::CursorIcon::PointingHand,
+            "指针离开终端后不应保持小手光标"
         );
     }
 
@@ -3738,6 +5124,43 @@ mod mouse_wheel_tests {
         let _ = recording;
     }
 
+    /// 回归：Bell 脉冲期间只在到期时刻安排重绘，不做每帧 `request_repaint`。
+    ///
+    /// 用户现象：多 tab 各跑一个 omp、任务执行高输出时整窗冻结、只能强制退出。
+    /// 根因：omp 的任务完成/错误通知走 BEL（默认 notifyProtocol `\x07`），
+    /// 旧 Bell 脉冲在 0.6s 窗口内每帧 `request_repaint`；高输出并发下频繁 BEL
+    /// 把窗口续成永久 60fps 全帧重绘（+滚动 Full damage 全屏重建），UI 线程
+    /// 跑满表现为整窗冻结（toast 的滑入动画已是同模式降频先例）。
+    /// 断言用 `harness.run()`（重绘收敛即停）：旧实现永不收敛、超 max_steps
+    /// panic；新实现只在到期时刻安排一帧、`run()` 正常返回。
+    #[test]
+    fn bell脉冲到期前不常驻重绘() {
+        use mino_core::terminal::{Session, SessionOptions};
+        use std::sync::Arc;
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = std::rc::Rc::new(std::cell::RefCell::new(TerminalView::new(session)));
+        view.borrow()
+            .session()
+            .inject_program_output_for_test(b"\x07");
+        view.borrow_mut().drain_background_events();
+        assert!(view.borrow().bell_until.is_some(), "Bell 应置位视觉脉冲");
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+        });
+        // `run()` 在无即时重绘请求时收敛返回；旧每帧 request 永不收敛。
+        harness.run();
+        assert!(
+            view.borrow().bell_until.is_some(),
+            "脉冲未到期不应被渲染清掉"
+        );
+    }
     /// 回归：Bell 不再静默丢失（视觉脉冲 0.6s）；ResetTitle 清空程序
     /// 设置过的标题（此前 `Event::ResetTitle` 在 `_ => false` 被丢弃）。
     #[test]
@@ -3955,6 +5378,52 @@ mod mouse_wheel_tests {
         assert_eq!(mouse_wheel_steps(egui::MouseWheelUnit::Line, -30.0), 3);
         assert_eq!(mouse_wheel_steps(egui::MouseWheelUnit::Page, 1.0), 1);
         assert_eq!(mouse_wheel_steps(egui::MouseWheelUnit::Point, 0.0), 0);
+    }
+
+    /// 字形图集换代必须让所有缓存 Galley 失效。
+    ///
+    /// 运行时 `add_font`（中文 fallback 并入）与图集填充率超 80% 都会让
+    /// epaint 整份重建字体系统，旧 Galley 的 UV 随之指向错误区域——不失效
+    /// 就会表现为「启动后中文渲染成乱码且永不恢复」。这里用不合法的图集
+    /// 尺寸触发看门狗，断言内容未变的一帧仍然重建了行。
+    #[test]
+    fn 图集尺寸变化清空行缓存() {
+        use mino_core::terminal::{Session, SessionOptions};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::sync::Arc;
+
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+        });
+        harness.run_steps(4);
+
+        // 先让首屏内容进入缓存，随后在内容不变的前提下伪造一次「图集换代」。
+        // 只跑一帧：看门狗在该帧内清缓存并全量重建，`last_stats` 读的就是它。
+        view.borrow_mut().mesh_atlas_size = [0, 0];
+        harness.step();
+        let rebuilt = view.borrow().last_stats().1;
+        assert!(
+            rebuilt > 0,
+            "图集尺寸变化后，内容未变的帧也必须重建行（实际重建 {rebuilt} 行）"
+        );
+
+        // 对照：下一帧无损坏行，不应再重建（证明上一步来自失效而非每帧重建）。
+        harness.step();
+        let steady = view.borrow().last_stats().1;
+        assert!(
+            steady < rebuilt,
+            "稳定帧不应重建与换代帧同样多的行（稳定 {steady} vs 换代 {rebuilt}）"
+        );
     }
 }
 
@@ -4566,6 +6035,113 @@ mod background_tests {
             false,
         );
         assert_ne!(first, second);
+    }
+
+    /// 旧实现把 `underline_color` 的 24 位组合直接 XOR 进位域，
+    /// 与 bold/italic/underline/strikeout 的位重叠：下划线颜色变化可能
+    /// 不改变指纹 → 行不重建、颜色不更新。修复后各字段独立混合，必须单射。
+    #[test]
+    fn 下划线颜色不与样式位重叠() {
+        let base = |underline_color, strikeout| {
+            style_key(
+                Color32::WHITE,
+                Color32::BLACK,
+                false,
+                false,
+                UnderlineStyle::Single,
+                underline_color,
+                strikeout,
+            )
+        };
+        // 旧实现的碰撞点：颜色三通道组合乘积恰好抵消掉 strikeout 位。
+        let with_strikeout = base(Some(Color32::from_rgb(0x1f, 0x00, 0x00)), true);
+        let color_only = base(Some(Color32::from_rgb(0x1f, 0x00, 0x00)), false);
+        assert_ne!(
+            with_strikeout, color_only,
+            "删除线与下划线颜色必须进入互不重叠的位域"
+        );
+        // 仅下划线颜色不同 → 指纹必须不同（含 None 与黑色的区分）。
+        assert_ne!(
+            base(Some(Color32::from_rgb(1, 2, 3)), false),
+            base(Some(Color32::from_rgb(1, 2, 4)), false),
+            "下划线颜色单通道差异必须改变指纹"
+        );
+        assert_ne!(
+            base(None, false),
+            base(Some(Color32::BLACK), false),
+            "无下划线颜色与黑色必须可区分"
+        );
+        // 相同输入必须稳定。
+        assert_eq!(base(None, false), base(None, false));
+    }
+
+    /// 逐 cell 指纹必须真的区分相邻列的内容。
+    ///
+    /// 曾经 `cell_key` 的最后一行是个裸表达式（返回 `is_wide`），
+    /// 累积出的哈希被丢弃、所有列都得到 0——于是「受损列比对」永远判定
+    /// 「未变化」，行再也不重建（表现为 OSC8 链接/新输出永不显示）。
+    #[test]
+    fn 逐列指纹区分相邻列内容() {
+        use alacritty_terminal::grid::Grid;
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::cell::Cell;
+        use alacritty_terminal::term::color::Colors;
+
+        let colors = Colors::default();
+        let fg = Rgb {
+            r: 200,
+            g: 200,
+            b: 200,
+        };
+        let bg = Rgb { r: 0, g: 0, b: 0 };
+        let mut grid: Grid<Cell> = Grid::new(2, 4, 0);
+        grid[Line(0)][Column(0)] = Cell::default();
+        grid[Line(0)][Column(1)] = Cell::default();
+        grid[Line(0)][Column(0)].c = 'a';
+        grid[Line(0)][Column(1)].c = 'b';
+
+        let key_a = cell_key(&grid[Line(0)][Column(0)], &colors, fg, bg);
+        let key_b = cell_key(&grid[Line(0)][Column(1)], &colors, fg, bg);
+        assert_ne!(key_a, key_b, "相邻列的不同字符必须产生不同指纹");
+
+        // 同一内容必须稳定（否则每帧都判定「变了」而重建）。
+        assert_eq!(
+            key_a,
+            cell_key(&grid[Line(0)][Column(0)], &colors, fg, bg),
+            "同一 cell 的指纹必须稳定"
+        );
+
+        // 变换样式（粗体）必须改变指纹。
+        let bold_cell = Cell {
+            c: 'a',
+            flags: {
+                let mut flags = alacritty_terminal::term::cell::Flags::empty();
+                flags.insert(alacritty_terminal::term::cell::Flags::BOLD);
+                flags
+            },
+            ..Default::default()
+        };
+        assert_ne!(
+            key_a,
+            cell_key(&bold_cell, &colors, fg, bg),
+            "样式变化必须改变指纹"
+        );
+
+        // 行内比对：只有受损列不同才算变化。
+        let keys = vec![key_a, key_b];
+        assert!(
+            !row_keys_changed(&grid, 0, 2, &colors, fg, bg, Some((0, 0)), &keys),
+            "0 列未变时不应判定需要重建"
+        );
+        grid[Line(0)][Column(0)].c = 'z';
+        assert!(
+            row_keys_changed(&grid, 0, 2, &colors, fg, bg, Some((0, 0)), &keys),
+            "受损列内容变化必须判定需要重建"
+        );
+        assert!(
+            !row_keys_changed(&grid, 0, 2, &colors, fg, bg, Some((1, 1)), &keys),
+            "受损列之外的变化不应触发重建"
+        );
     }
 }
 

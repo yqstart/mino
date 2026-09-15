@@ -26,14 +26,16 @@ crates/
 │   ├── src/config/mod.rs     # HostProfile/HostConfig + hosts.toml
 │   └── tests/                # 集成测试（需本地测试 sshd: 127.0.0.1:2222）
 └── mino-app/                  # egui 应用
-    ├── src/main.rs           # 入口 + 字体加载（SF Mono + CJK fallback）+ 圆角注入
+    ├── src/main.rs           # 入口 + 字体装配（同步主字体，CJK fallback 走后台 CjkFontLoader）+ 圆角注入
     ├── src/native.rs         # macOS 原生窗口定制（无边框窗口整体圆角，AppKit layer）
-    ├── src/app.rs            # MinoApp：tabs 列表 + 设置弹窗（show_settings）+ 布局/连接管理/对话框/快捷键
-    ├── src/perf.rs           # 性能 HUD（帧耗时/FPS/分段打点统计，⌥P 切换）
+    ├── src/app.rs            # MinoApp：tabs 列表 + 设置弹窗（show_settings）+ 布局/连接管理/对话框/快捷键；本地会话后台创建（poll_local_spawn 帧内挂载）
+    ├── src/perf.rs           # 性能 HUD（帧耗时/FPS/Shape 数/重建行/上传字节，⌥P 切换）
     ├── src/theme.rs          # 三套深色主题
     ├── src/workdir.rs        # 根据 PTY 输入跟踪本地/远程 cd 工作目录
     └── src/views/
-        ├── terminal_view.rs  # cell 渲染（行级增量 + Galley 缓存）、输入转发、滚动
+        ├── terminal_view.rs  # cell 渲染（行级增量 + Galley 缓存 + 自管 GPU 提交）、输入转发、滚动
+        ├── terminal_gpu.rs   # 自管 GPU 渲染：逐行顶点常驻显存 + 动态 uniform + 图集换代看门狗
+        ├── terminal_gpu.wgsl # 行网格着色器（与 egui.wgsl 同源的颜色/抖动/gamma 语义）
         └── sftp_view.rs      # 文件面板：列表（show_rows 虚拟化）/导航/传输进度/确认对话框
 ```
 
@@ -45,6 +47,7 @@ crates/
 - 远程：后台线程 tokio runtime → SSH channel 读 → `Processor::advance` → 同一 `Term`
 - 统一接口：`Session { term, writer, resizer, shuttor, is_remote }`（Writer/Resizer/Shuttor 闭包抽象）；本地与远程会话共用同一终端输入与渲染链路
 - 写操作：本地走 `EventLoopSender`，远程走命令队列（UI 线程非阻塞）
+- **本地会话后台创建（v1.1.2，`app.rs`）**：`new_local_tab_at` 只登记 `pending_local`（`mpsc`），后台线程 `Session::spawn_local` 完成后 `request_repaint`，UI 帧内 `poll_local_spawn` 就绪即挂标签——PTY fork + oh-my-zsh 初始化（可达数百毫秒）不再堵首帧与 ⌘T，等待期状态栏显示"终端启动中…"；**测试构建仍走同步路径**（kittest `run_steps` 不等待后台线程），异步挂载由回归测试 `本地终端异步就绪后挂载标签` 直接驱动 `poll_local_spawn` 覆盖
 - 渲染：UI 锁 `FairMutex<Term>` → `renderable_content()` → 逐行 hash 缓存 LayoutJob（增量重建）
 
 ### 终端渲染（v0.7 起为行级增量，`terminal_view.rs`）
@@ -61,11 +64,27 @@ crates/
 - **单锁化**：光标形状 `cursor_style()` 在第一次锁内读取（曾帧内二次上锁）
 - **Wakeup 单次 repaint**：drain_events 不再对 Wakeup 二次 request（mino-core `Listener::send_event` 已直接调 on_event=request_repaint）
 - 性能验证：idle 帧（无内容变化）构建耗时 0.03ms（此前全量扫描 0.5-2ms，降 15-60 倍）
+- **v1.1.2 追加减负（egui 回退路径同样生效）**：一行 N 个 `CachedRun` 合成为**单个 `Mesh`** 提交（`row_meshes`，键为显示行号——mesh 顶点烘焙了绝对行位，滚动/尺寸变化整体重合成，`rows_cache` 保留）；按 **damage 的列区间**只重建受损列（`damaged_bits`：光标移动只损 1-2 列，曾整行 80-200 cell 重算）；Shape 一次 `Painter::extend` 批量提交（`shapes_scratch`，替代逐 Shape `add` 的上千次 Context 写锁）；装饰网格线 tessellate 结果缓存（`grid_lines_cache`）；输入法预编辑串 Galley 缓存（`ime_preedit_cache`）；标签/状态栏目录读 `effective_local_directory`（300ms TTL，每帧 4 次系统调用 → 1 次；需要即时真值的入口走 `fresh_local_directory`）
+- **一帧输入合并**：输入事件先攒进 `pending_writes` 再一次 `session.write`（曾每个按键/粘贴分片一次通道发送）
+- **resize 节流**：拖拽窗口时 `resize_grid` 每帧更新本地网格（字不越界），后台通知（本地 SIGWINCH / 远程 SSH `window_change`）按 **50ms** 合并 + trailing 补发（`notify_backend_size`）
+- 远程逐 SSH 数据包唤醒合并为每帧一次（`notify_wakeup` 标志位，由 `drain_events` 复位）：`cat` 大文件时重绘请求不再与包数同阶
+
+### 终端自管 GPU 渲染（v1.1.2 起，`views/terminal_gpu.rs` + `terminal_gpu.wgsl`）
+
+- **动机**：egui 每帧把全部 Shape 重新 tessellate 并整块上传顶点（`Context::tessellate` 明确不做跨帧复用），终端这种「字形几乎不变、只有少数行在变」的场景等于每帧整屏重传。自管路径把每行顶点常驻显存：**行内容不变不重传、滚动只改 uniform 的 `row_origin`、空闲帧零上传**
+- **启用条件**：`MinoApp::new` 用 `cc.wgpu_render_state` 建进程级 `TerminalGpu`（管线/布局/采样器/图集绑定），会话创建时 `TerminalView::set_gpu` 注入；kittest（`Harness::new_ui`）没有 wgpu 后端 → `gpu = None` → 自动走 egui Shape 回退路径（两条路径共存，回退路径由 kittest 全覆盖，**GPU 路径须实机运行验证**）
+- **回调内绝不触碰 `egui_wgpu::Renderer`**：kittest 在 `update_buffers`/`render` 期间持写锁、eframe 渲染期持读锁，回调内再取锁必死锁。字体图集绑定只在 UI 线程帧内刷新（`gpu_atlas`），回调只读
+- **管线逐项对齐 egui**（颜色格式/混合/采样数/顶点布局/抖动/gamma/预乘 alpha），否则自管绘制与相邻 egui 控件有可见色差；顶点 uv 是 epaint 的**纹素坐标**，归一化在顶点着色器里做（`a_tex_coord / r_locals.atlas_size`）
+- **图集换代看门狗（双条件）**：行顶点 uv 与图集尺寸强绑定，按「尺寸变化 **或** 填充率骤降」检测——epaint 整份重建字体系统时尺寸可能一模一样但字形位置全变（只比尺寸会漏，表现为字符错位/串码）；图集还会在同帧更晚的位置（其它控件首次用到新字形）继续变大，因此必须在**下一帧开头**再比一次当前尺寸与 `mesh_atlas_size`，不一致立即整屏重建并请求重绘
+- **逐行缓冲 + 区间分配器**：`RowBuffers` 每行独立槽位（容量翻倍冗余、`free_v`/`free_i` 空洞合并），容量不足时返回 false（该行本帧不可见）；uniform 步长按 `min_uniform_buffer_offset_alignment` 放大（`TerminalGpu::new` 读设备 limit），每行一个 `Locals`，**上限 `MAX_ROWS = 256`**
+- **`screen_size` 必须是整个渲染目标的点尺寸**（窗口），不是终端内容区：着色器用「绝对坐标 ÷ 全屏尺寸」→ NDC，传内容区尺寸会把坐标放大（文字整体拉伸错位）
+- 性能 HUD（⌥P）显示每帧 Shape 数 / 重建行 / 复用行 / 上传字节——渲染优化的唯一可观察证据（帧耗时区分不了「CPU 侧重建」与「GPU 侧上传」）
 
 ### 终端能力应答（v1.0.8 起，`terminal/mod.rs` + `terminal_view.rs` + `keys.rs`）
 -
 - **程序的终端查询必须应答**：mino 曾把 alacritty 的 `Event::ColorRequest` / `Event::TextAreaSizeRequest` 当无关事件丢掉，导致 `printf '\e]11;?\a'` **永远收不到答复**（实测对比 macOS Terminal.app：Terminal 回 `]11;rgb:1e1e/…`，minо 无任何输出）。查询终端配色的 TUI（omp 启动即查 OSC 11）只能按"未知终端"回退配色
 - 事件链路：`SessionEvent::ColorRequest { index, formatter }` / `TextAreaSizeRequest(formatter)` / `ClipboardStore` / `ClipboardLoad` / `ResetTitle` 入队（`Listener::send_event`，formatter 是 alacritty 给的闭包），UI 侧 `TerminalView::drain_background_events` 应答后写回 PTY；`Bell` 转 0.6s 视觉脉冲（左上角圆点，无常驻重绘），`ResetTitle` 清标题缓存（曾在 `_ => false` 被丢弃，标题永久停旧值）
+- **PtyWrite 队列 64KB 字节上限（v1.1.2）**：PtyWrite 是终端能力应答（DA/kitty/DECRQM/OSC 查询回执，程序可触发），不是用户数据——多标签高输出并发时后台标签长期不消费会无界追加；超限丢最旧的应答（程序按"未知终端"回退，不破坏终端状态），队列内存有界；回归测试 `写回队列超限丢最旧应答且有界`
 - **颜色索引语义**（alacritty `term::color`）：0-255 调色板、256 前景、257 背景、258 光标、259+ Dim/Bright 变体；优先级与渲染 `resolve_color` 一致：**OSC 动态覆盖（`term.colors()`）> 主题调色板**。`Colors` 只实现越界即 panic 的 `Index`，查询索引由终端程序控制，**必须先做边界检查**（`COUNT` = 269）；**`COLORTERM=truecolor` 必须注入**（本地 `local_session_options_at` + 远程 `set_env`，sshd 未放行时静默忽略）：omp 的 `getColorMode` 只认该变量判 24-bit，`TERM=xterm-256color` 只判 256 色，缺了它 agent 全程降级（实证自 omp 二进制）
 - **焦点事件上报（`DECSET 1004`）**：程序开启后，窗口获得/失去焦点必须发 `ESC [ I` / `ESC [ O`（`TerminalView::report_focus_change`，读 `ctx.input(|i| i.focused)`）；**首帧只记录基准状态**，不能补发历史变化（程序是在自己启用之后才开始期待事件）；回归测试 `终端查询与焦点上报有应答`（python3 脚本开 cbreak 读 PTY，断言收到 `]11;rgb:` 与 `\x1b[I`）、`颜色查询按索引返回主题颜色`、`颜色查询优先使用OSC覆盖`、mino-core `颜色与尺寸查询进入事件队列`
 - **对照 Terminal.app 的方法**（本机排查用）：把 omp 包一层透明 PTY 代理分别跑在 mino 与 Terminal.app 里，比对**两个方向**的字节——`mino → 程序`方向能看出终端应答差异，`程序 → mino`方向能看出按键编码差异
@@ -84,7 +103,7 @@ crates/
 
 ### SFTP
 
-- `connect_sftp` 建立独立 SSH 连接（后台线程 runtime 存活到 `Shutdown` 命令）
+- `connect_sftp` 建立独立 SSH 连接（任务跑在共享 runtime 上，会话存活到 `Shutdown` 命令）
 - UI 持 `SftpHandle`（克隆发送端）发命令；后台执行后经 `SftpEvent` 通道回报
 - 事件流：`Listed / Progress / Done / Error / Closed`
 - **传输失败清理半成品**：下载失败删本地半成品文件、上传失败删远程半成品（不残留截断文件误导用户）
@@ -99,7 +118,7 @@ crates/
 
 - **主机密钥校验（TOFU，`ssh/known_hosts.rs`）**：终端与 SFTP 连接都经 `connect_verified` 校验服务器公钥——首次连接记录 `SHA256:base64` 指纹到 `~/.config/mino/known_hosts.toml`，后续必须一致，不一致（服务器换密钥/中间人攻击）则拒绝并在错误里给出修复指引（曾无条件接受所有服务器密钥）。进程级 `Mutex` 串行化读-改-写（终端+SFTP 双连接并发首连会丢更新）；known_hosts 与 hosts.toml 都强制 **0600 权限**（含明文密码/口令，默认 umask 022 会产生 0644）。**指纹拒绝后重连需删文件对应条目**；密钥文件/known_hosts 测试用 rand 0.10（与 russh 的 rand_core 版本一致）
 - **SSH 配置**：`ssh_config()` 统一 30s keepalive（`keepalive_interval`）+ 3 次无响应断开（`keepalive_max`），空闲连接被 NAT/防火墙静默断开后能及时发现；私钥路径自动展开 `~`（配置里写 `~/.ssh/id_ed25519` 可直接加载）
-- 远程连接后台线程必须持有 runtime 直到会话关闭（`Notify` 等待 remote_loop 结束），否则 tokio::spawn 的任务被取消
+- **进程级共享 tokio runtime（v1.1.2，`ssh::shared_runtime()`）**：远程终端与 SFTP 的全部任务共用一份 `LazyLock` runtime（上限 8 worker）——曾每个连接各建 2-worker runtime（N 个标签 = 2N 常驻线程 + N 份内存）；任务以 `ssh::wait_for_task`（`Notify`）等待结束。**runtime 不可用时也必须把失败事件回传**，否则 SFTP 面板永久停在"连接中…"；远程连接后台线程必须持有等到会话关闭，否则 tokio::spawn 的任务被取消
 - `Session` 实现 `Drop` → 发 Shutdown 优雅关闭
 - **本地会话关闭兜底**：alacritty 的 `Pty` 析构只发 SIGHUP 后 `wait()`，shell（zsh）偶发不响应 SIGHUP 会让 wait 永久阻塞（关闭标签页时 UI 线程卡死，kittest 回归测试约 50% 概率必现）——`spawn_local` 在创建 EventLoop 前保存 `pty.child().id()`（macOS 上 login exec 成 shell 后 PID 不变），`Session::drop` 先 SIGHUP 给 shell 优雅退出机会，再在守护线程延时 300ms 补 **SIGKILL** 保证 Pty 的 wait 必然返回（shell 已退时 kill 无害）；EventLoop::new 失败的错误路径同样先 SIGKILL 再析构 pty；**libc 依赖仅 `cfg(unix)`**（Windows 无 kill/SIGHUP，ConPTY 无此问题）
 
@@ -119,6 +138,7 @@ crates/
 - **display_iter 行号是网格坐标**（alacritty `grid/mod.rs::display_iter`）：viewport 顶行为 0，向上滚动后可见的 scrollback 行是**负行号**（`Line(-(display_offset)-1)`）。渲染循环必须用相对视口顶行的显示行号（换行时计数），**严禁 `point.line.0 as usize`**——负行号 cast 成 usize::MAX 级巨值，`rows_cache.resize` 直接 `capacity overflow` 闪退（offset=1 时则是 index 越界）；光标定位同样需换算：显示行 = 光标网格行 + `display_offset`。回归测试：`滚动scrollback后渲染不崩溃`
 - 主机条目（设置弹窗 → 主机管理卡片内）：单击选中、双击连接；样式：**accent 圆形头像（主机名首字符）+ 名称（超长截断不换行）+ 🗑 删除图标**（行右缘，hover 红底）；**行点击区横向扩展到面板可用宽度**（`row_rect`），短名称主机也能整行点击
 - **egui 0.36 交互坑：`Response::interact()`（scope_builder(...).response.interact(...)）的点击无法命中**（响应链问题，kittest 实测 clicked/hovered 恒 false）——必须用 `ui.interact(rect, id, sense)` 显式注册交互区，删除按钮等行内控件最后注册以覆盖行点击区
+- **egui 0.36 锁序铁律：唯一合法顺序是「先终端锁、后 Context」——任何地方都禁止反向（Context → 终端 `FairMutex`）**。Context 的 `input`/`memory`/`output_mut`/`fonts_mut`/`request_repaint` 都是 **写锁**，而 PTY 读线程按 `pty_read`（持 lease）→ `send_event` → `on_event` → `Context::request_repaint` 的固定顺序取锁；一旦 UI 侧出现在持 Context 写锁时等终端锁，两线程各持一把等对方 = AB-BA，双方都是阻塞等待、永不恢复（用户现象：SSH + omp 双窗口整窗无响应；`sample` 实证主线程停在 `Context::input` 闭包内等终端锁，PTY 读线程停在 `request_repaint` 等 Context）。两处历史违规：①`ui.input` 闭包内 `scroll_display`（滚轮/Shift+PageUp）②渲染持锁期间 `ctx.input(|i| i.time)` 与闪烁 `request_repaint_after`。修法：滚动/重绘/时间读取等一律记意图，锁外或闭包外统一执行。回归测试 `后台持锁请求重绘时终端仍能推帧`（后台线程持终端锁并回调 `request_repaint`，主循环推帧 + 滚轮——旧实现 10 秒内触发 epaint 死锁检测，测试有界失败）
 - 终端调色板（Catppuccin Mocha 16 色 + xterm 256 色表）在渲染层解析（`theme.rs::TERM_PALETTE_16`/`xterm256`），优先级：Spec > OSC 覆盖（term.colors）> 内置调色板；`Term.colors` 默认全 None，不设调色板则全部渲染为白色；**v0.7：xterm256 固定部分（index ≥ 16）用 `XTERM_FIXED` OnceLock 查表**（曾逐 cell 现算乘除，全彩色屏每帧上万次算术）
 - 选中主机条目左侧 2px accent 竖条；标签页底部有选中指示条（白色细线，宽度动画，Tabby current-tab-indicator）
 - **标签页（tab）无双边框**：tab 内容用无边框透明 `Button`（`selectable_label` 选中自带边框，与手绘高亮叠加会成"双重框"），高亮只有一层手绘——**激活 tab 用面板色（`bg_panel`）凸起底 + 底部白色指示条，hover 用白 8% 叠加**（Tabby 风：标签栏比激活 tab 深一级）。**选中底必须画在内容之前**：用 `egui::Frame`（fill=bg_panel 随 sel_alpha 动画、inner_margin(2,3)）+ `.show()` 包住 tab 内容（Frame 先铺底再放内容）——曾把不透明面板色 `painter.rect_filled` 画在内容之后（同一 layer 后画在上），激活 tab 文字被整块盖住完全不可见（像素扫描验证：除底部指示条外无任何文字像素）；hover 白 8% 叠加是极淡提亮，画在内容之后无害
@@ -145,8 +165,8 @@ crates/
 - 主题快捷键：⌥1-⌥3 快速切换三套主题
 - **新建连接表单**（`connect_dialog`）：默认用户名 `root`、端口 `22`（`ConnectForm` 手写 `Default`，可修改）；输入框统一走 `form_input` helper——圆角深色底（`bg_elevated`）+ 焦点 accent 边框 + `vertical_align(Center)`（**TextEdit 默认 `Align2::LEFT_TOP` 文字偏上，单行输入框必须居中**）
 - **状态栏**（底部）：左侧会话状态（状态点 + 会话标题 + SFTP 状态/错误）——会话标题与标签栏同源（本地 = 当前目录末级名，hover 看全路径，见上条 `TerminalTab::title()`），**右下角快捷键提示块已移除**（曾显示 ⌘B/⌘T/⌘W/⌘N/⌥1-3 五个圆角块，用户要求删除）；主题快捷键 ⌥1-3 仍在（勿写 ⌥1-4）
-- **持续重绘治理（v0.7）**：egui `Spinner` 内部每帧 `request_repaint` 强制 60fps 全帧重绘，全部替换为 `loading_hint`（app.rs 静态圆点 + 文字，零重绘）：连接等待页/状态栏 SFTP 连接中/更新安装中/SFTP 面板加载中；**toast 降频**：滑入动画期（~0.32s）16ms 重绘，动画结束后仅 `request_repaint_after(剩余时长)` 安排到期关闭帧（曾 4 秒全程 60fps）
-- **性能 HUD（`perf.rs`，v0.7）**：`⌥P` 切换（设置弹窗「关于」卡片也有开关），右上角半透明面板显示帧耗时/FPS/终端构建/布局/绘制分段耗时（滑动平均）；`MinoApp::ui` 开头 `perf.begin_frame()`、末尾 `end_frame()`，活动标签页 `terminal.last_timing()` 喂分段统计；terminal_view 内 `build_start/layout_start/paint_start` 三段打点；默认关闭不影响 kittest 截图断言
+- **持续重绘治理（v0.7）**：egui `Spinner` 内部每帧 `request_repaint` 强制 60fps 全帧重绘，全部替换为 `loading_hint`（app.rs 静态圆点 + 文字，零重绘）：连接等待页/状态栏 SFTP 连接中/更新安装中/SFTP 面板加载中；**toast 降频**：滑入动画期（~0.32s）16ms 重绘，动画结束后仅 `request_repaint_after(剩余时长)` 安排到期关闭帧（曾 4 秒全程 60fps）；**Bell 脉冲降频（v1.1.2）**：0.6s 脉冲只在到期时刻 `request_repaint_after(剩余时长)` 安排一帧，不再每帧 `request_repaint`——omp 任务通知走 BEL，频繁 BEL 会把窗口续成永久 60fps 冻窗
+- **性能 HUD（`perf.rs`，v0.7）**：`⌥P` 切换（设置弹窗「关于」卡片也有开关），右上角半透明面板显示帧耗时/FPS/终端构建/布局/绘制分段耗时（滑动平均）；`MinoApp::ui` 开头 `perf.begin_frame()`、末尾 `end_frame()`，活动标签页 `terminal.last_timing()` 喂分段统计；terminal_view 内 `build_start/layout_start/paint_start` 三段打点；**v1.1.2 新增** Shape 数 / 重建行 / 复用行 / GPU 上传字节（`last_stats()`）与「首帧」「终端就绪」启动耗时——帧耗时区分不了「CPU 侧重建」与「GPU 侧上传」，规模计数是渲染优化的唯一可观察证据；**默认开启**（测试 `性能 HUD 启动时应默认展示`），不影响 kittest 截图断言
 - **SFTP 面板**（tabby 形式）：`Panel::right("sftp_panel")` **必须是顶层面板（先于 CentralPanel 注册）**——嵌套在 CentralPanel 内时面板状态会被顶层布局污染，面板错位覆盖终端（表现为"面板打不开"）；**默认收起只显示终端，终端右上角悬浮 `sftp_floating_button`（app.rs 顶层函数，"SFTP" 圆角按钮，点击切换 `TerminalTab.sftp_open`）**；展开用官方 `show_collapsible`（滑动动画，收起后右缘保留细拖拽把手可拖开）；尺寸 `default_size(窗口 40%)/min_size(260)/max_size(窗口 50%)`——曾固定 340px（大窗口下偏窄）与 45% 上限（用户要求 40% 默认、50% 上限）；曾 resizable 无上限拖到 ~70% 窗口宽把终端压成窄条，max_size 每帧按 `viewport_rect().width()*0.50` 钳制；面板 frame 内边距 `Margin::symmetric(12, 10)`；**工具栏三行布局**（`sftp_view.rs`）：①标题行=左 `SFTP · 主机名`（truncate 截断占剩余宽）+ 右缘「刷新」按钮（right_to_left 分居两端，曾与「删除」重叠）②操作行=`horizontal_wrapped` 五按钮（上传/下载/新建目录/重命名/删除，空间不足自动换行——曾单行 horizontal 塞全部按钮，340 宽面板溢出右缘被裁剪）③路径行=「上级」按钮 + 路径 truncate 截断（曾长路径溢出被裁）；按钮统一 `sftp_tool_button` 紧凑样式（11.5px 文字 + bg_elevated 底 + 细边框 + RADIUS_ITEM 圆角）；回归测试 `工具栏按钮不截断不重叠`（340 宽内各按钮 rect 不越界且两两不相交）；`poll_sftp` 处理 `Closed` 事件（连接中断时不能停在"连接中…"），失败写入 `sftp_error` 字段由状态栏**持久显示**（toast 一闪而过易忽略），下次 `start_connect` 清空；**文件列表列布局**（`sftp_view.rs`）：名称列左对齐、大小/时间列右对齐（均 `.halign(egui::Align::LEFT/RIGHT)` 显式声明，避免依赖默认对齐），`new_child` 子 Ui 需 `spacing_mut().item_spacing.x = 0.0` 归零自动间距（否则子项间默认 8px 叠加导致列位错乱），列间距用 add_space 精确控制，名称 `Label::truncate()` 截断；**`cell_width` 必须用 `'0'` 字符宽（数字等宽字体的真实字宽）而非空格宽**——空格 ≈ 0.25em、数字 ≈ 0.6em，用空格宽估算列宽会导致时间列 "2026-08-14" 被截到 "2026-01"（曾用空格宽 + 11 字符列宽只能容 7 字符数字）；大小/时间列宽 12 字符等宽（足够显示 10 字符日期 + 缓冲），名称列 = 总宽 - 12×2 - 12；回归测试 `文件列表列对齐`、`sftp面板默认收起悬浮按钮切换`；kittest 截图布局断言：上传按钮 left > 400（面板在右半侧）、齿轮按钮 right > 400（标签栏最右侧）；**2026-08 面板升级与目录导航**：①标题行加 accent2 状态点（与状态栏同款）②路径改为**圆角"地址条"**（bg_elevated 底 + 细边框 + 内部 truncate）③文件列表**表头行首留 22px 图标位**（`icon_pad`，表头与行共用基准）、行高 22、表头 11px muted ④**".." 行**置顶（点击返回上级目录，文件管理器通用习惯）⑤**行首矢量图标**（`paint_entry_icon`：文件夹 accent2 填充提手+圆角主体、文件细描边轮廓——矢量绘制避免 emoji 字形随字体变化）⑥目录名 text_primary/文件名 text_secondary，选中 accent_soft 底 + 左侧 2px accent 竖条（与主机行一致）、hover 白 8% 叠加 ⑦传输记录用主题语义色（success/danger/accent2）⑧**目录导航 = 单击选中、再次单击已选中的目录进入**（不用 `double_clicked`——egui 多击计数被无关点击污染，双击时灵时不灵）；**行点击必须显式 `ui.interact(row_rect, 稳定 Id, Sense::click())` 且注册在列内容之后**——`allocate_exact_size` 的自动 Id 帧间漂移 + `new_child` 子 Ui 叠加，行点击从未生效（"点击文件夹进不去"的根因，kittest 探针逐步定位：snap_clicked 指向行内容区而非行交互区）；hover 用 `pointer.hover_pos()` 判定（子 Ui 会抢走 `response.hovered()`）；目录进入后 `loading=true` 显示静态加载指示（v0.7 起非 spinner，零持续重绘），相关测试用 `run_steps(6)` 显式步进（`Harness::run()` 会超 max_steps）；回归测试 `单击选中再次单击进入目录`（断言第一次单击只选中无 List 命令、再次单击发 `List("/workspace")`、文件两次单击不导航）、`文件列表列对齐` 已适配 ".." 行（"—" 共 3 个：.. 时间/.. 大小/目录大小）
 
 > 当前 SFTP 交互约定（2026-09-10）：目录和 `..` 行均为单击选中、普通双击导航；传输进度平时只显示标题行右缘的**状态徽标**（点击展开/收起详情卡片）：进行中=accent2 圆底+白色上箭头+总进度弧环、全部完成=success 圆底+白对勾、有失败=danger 圆底+白感叹号；新传输开始自动展开详情，上传全部结束后详情卡片显示「关闭」按钮（只清理已结束的上传）。
@@ -159,6 +179,8 @@ crates/
 - **测试绝不能读写用户真实配置**：`MinoApp::new` 使用 `default_config_path()`（用户真实 `~/.config/mino/hosts.toml`），涉及配置读写的测试必须走 `MinoApp::new_with_config(cc, test_config_path("标签"))`（`/tmp/mino-test-config-{tag}-{pid}.toml` 隔离路径）——**曾发生测试直接 save + remove_file 用户真实 hosts.toml：跑一次 `cargo test` 就覆盖并删除用户主机列表一次（表现为"每次更新新版本后主机全部消失"）**
 - 应用图标：`assets/icon.png`（**紫青渐变圆角底 + 白色 `>_` 终端提示符，四周留 10% 透明边距**，make-icon.swift 绘制，与应用内动态 logo 同构图）→ `load_icon()` 解码为 IconData → `ViewportBuilder::with_icon`——**eframe 在 macOS 上通过 NSApp 运行时设置 Dock 图标**，无 .app bundle 的 debug 构建也能生效；`.app` 安装版的 Dock 图标由 package-macos.sh 的 mino.icns 提供（同一设计）。**图标必须留透明边距：占满画布的无边距图标会被 macOS Dock 放大显示（比邻图标大一圈）**。**make-icon.swift 必须用 `NSBitmapImageRep` 位图上下文渲染（`NSImage.lockFocus` 在 Retina 屏按 2x 渲染导致输出尺寸翻倍）**
 - 字体：Monospace 族 = SF Mono（主）+ **Menlo（符号 fallback）** + STHeiti（CJK）+ egui 默认；Proportional 族 = SF 主 + STHeiti。**SF Mono 缺 `➜`(U+279C)/`❯`(U+276F)/`⚡` 等常用 zsh 提示符符号**，缺字形会被 egui 渲染为 `?` 替换符；Menlo 同为等宽且完整覆盖（宽度一致不漂移），必须排在 CJK fallback 之前。**禁止加载 Apple Color Emoji.ttc**（192MB 彩色位图字体，ab_glyph 无法解析 → egui panic）
+- **CJK fallback 后台加载（v1.1.2，`main.rs::CjkFontLoader`）**：中文 `.ttc` 是启动期最大一笔字体 IO（PingFang 78MB / STHeiti Light 55.8MB 全量读入），同步读完明显推迟首帧——改为后台线程读取，就绪后 `ctx.add_font`（`FontPriority::Lowest`）**增量追加**；**不能用「克隆定义 + `set_fonts`」**：`set_fonts` 跨帧比较整份定义（含 TTF 字节）易误判 `==` 吞掉并入（中文"读到了却没装上"的根因）。并入**下一帧** `begin_pass` 才真正重建字体系统，渲染侧因此按**字体定义指纹**在帧开头比对、命中才清行缓存（`terminal_view.rs::font_fingerprint`）——在并入当帧清缓存仍会用旧字体重建，乱码 Galley 被再次缓存且 hash 未变，此后永不重建（启动后登录横幅中文持续乱码的真根因）；平台候选路径见 `cjk_candidates()`
+- 主字体装配（SF Mono + Menlo + 界面字体约 10MB）仍同步执行：首帧必须有正确字形
 - 提示符 `?➜` 中的 `?` 是 oh-my-zsh robbyrussell 主题 `%1{➜%}` 语法在 zsh 5.9 的真实输出（script 捕获字节流验证：`0x3F E2 9E 9C`），Terminal.app 同样显示，**非 mino 渲染问题，勿尝试"修复"**
 - egui 0.36 API 注意：`App::ui` 替代 `update`、`Panel::top/left` 替代 `TopBottomPanel`、`Fonts` 需要 `fonts_mut`、`Event::Key` 无 `text` 字段（Text 独立事件）
 - 终端视图使用固定 `focus_id` 管理键盘焦点；对话框打开时自动聚焦首个输入框
@@ -166,9 +188,13 @@ crates/
 ## 验证
 
 ```bash
- cargo test --workspace         # 单元 + ssh 集成 + sftp 集成 + UI 渲染 + 字体链 + 标签页（含标题栏双击 zoom/拖拽） + 双击交互 + 表单默认值 + 设置弹窗 + scrollback + 完整应用回车 + TOFU 主机密钥校验 + F 键修饰编码 + SFTP 时间换算 + 目录单击选中再击进入 + ssh 快捷菜单 + 中文宽字符列对齐（像素级）+ 标签标题跟随当前目录 + IME候选窗跟随光标 + 终端能力应答（OSC 颜色查询/焦点上报，需 python3）+ 崩溃日志归档；注意 sftp/ssh 集成测试需先 `bash scripts/test-sshd.sh start`
+ cargo test --workspace -- --test-threads=1   # 单元 + ssh 集成 + sftp 集成 + UI 渲染 + 字体链 + 标签页（含标题栏双击 zoom/拖拽） + 双击交互 + 表单默认值 + 设置弹窗 + scrollback + 完整应用回车 + TOFU 主机密钥校验 + F 键修饰编码 + SFTP 时间换算 + 目录单击选中再击进入 + ssh 快捷菜单 + 中文宽字符列对齐（像素级）+ 标签标题跟随当前目录 + IME候选窗跟随光标 + 终端能力应答（OSC 颜色查询/焦点上报，需 python3）+ 崩溃日志归档 + 后台会话异步挂载 + 写回队列有界 + 死锁回归；注意 sftp/ssh 集成测试需先 `bash scripts/test-sshd.sh start`
 cargo clippy --workspace --all-targets   # 零警告
 cargo fmt --all
 ```
 
+**UI 测试必须串行**（`-- --test-threads=1`，CI 与 Release 工作流都这样跑）：并行时 kittest 争抢全局状态（主题静态、图形后端）会出现假失败——曾实测 `拖入文件目录应用路径写入终端` 失败、`超链接分段与点击` 挂起 60s+，串行后全部通过。
+
 窗口圆角为运行时原生效果（kittest 无真实窗口句柄，无法单测断言）；验证方式：`cargo run -p mino-app` 后 `screencapture -l <CGWindowID>` 截窗，四角像素应全透明（RGBA alpha=0）。
+
+**自管 GPU 渲染路径 kittest 覆盖不到**（测试环境无 wgpu 后端 → 走 egui 回退）：须实机验证——`cargo run -p mino-app`，HUD（⌥P）空闲帧 `shapes` 应为个位数、`上传` 接近 0，且实测输入/中文/滚动/大输出渲染正常。

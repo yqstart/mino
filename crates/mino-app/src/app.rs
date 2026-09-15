@@ -302,8 +302,33 @@ pub struct MinoApp {
     install_started_at: Option<f64>,
     /// 性能 HUD 是否显示（`⌥P` 切换；默认展示）。
     show_perf_hud: bool,
+    /// 终端自管 GPU 渲染资源（`None` = 无 wgpu 后端，走 egui Shape 路径）。
+    terminal_gpu: Option<std::sync::Arc<crate::views::terminal_gpu::TerminalGpu>>,
     /// 帧耗时统计（UI 线程打点）。
     perf: crate::perf::PerfStats,
+    /// 中文 fallback 字体后台加载器（生产路径由 `main` 注入；测试为空，
+    /// 中文由需要它的测试自己 `setup_fonts` + `wait_ready`）。
+    cjk_fonts: Option<crate::CjkFontLoader>,
+    /// 应用构造时刻（启动打点基准：首帧耗时、终端就绪耗时）。
+    created_at: std::time::Instant,
+    /// 首帧耗时是否已记录（只记一次）。
+    first_frame_reported: bool,
+    /// 终端就绪耗时是否已记录（首个会话挂上标签时记一次）。
+    terminal_ready_reported: bool,
+    /// 后台创建中的本地终端会话（PTY fork + shell 启动不再堵住首帧）。
+    pending_local: Option<PendingLocalSpawn>,
+}
+
+/// 正在后台创建的本地终端会话。
+///
+/// 本地会话创建要 fork PTY 并等待 shell（oh-my-zsh 用户可达数百毫秒），
+/// 同步做会让窗口首帧与 ⌘T 都明显卡顿；改为后台线程创建 + 帧内轮询挂载。
+/// 测试构建仍走同步路径（kittest 的 step 语义不等待后台线程），
+/// 轮询挂载逻辑由 `本地终端异步就绪后挂载标签` 直接驱动 `poll_local_spawn` 覆盖。
+struct PendingLocalSpawn {
+    rx: std::sync::mpsc::Receiver<std::io::Result<Session>>,
+    /// 打开后自动执行的启动命令（项目收藏；取首个非空行）。
+    command: String,
 }
 
 /// 本地终端会话选项：默认工作目录为 home，注入 TERM 与颜色环境变量。
@@ -689,6 +714,13 @@ impl MinoApp {
     ) -> Self {
         let ctx = cc.egui_ctx.clone();
 
+        // 终端自管 GPU 渲染资源：只有持有 wgpu 后端时才有
+        // （`Harness::new_ui` 的测试没有，天然覆盖 egui 回退路径）。
+        let terminal_gpu = cc
+            .wgpu_render_state
+            .as_ref()
+            .map(|state| std::sync::Arc::new(crate::views::terminal_gpu::TerminalGpu::new(state)));
+
         // 加载失败不能静默按空配置启动：文件存在但解析失败时先备份原文，
         // 避免后续保存把用户主机列表覆盖掉。
         let (config, load_message, config_write_blocked) = match HostConfig::load(&config_path) {
@@ -777,6 +809,12 @@ impl MinoApp {
             install_started_at: None,
             show_perf_hud: true,
             perf: crate::perf::PerfStats::new(),
+            terminal_gpu,
+            cjk_fonts: None,
+            created_at: std::time::Instant::now(),
+            first_frame_reported: false,
+            terminal_ready_reported: false,
+            pending_local: None,
         };
         // 启动时自动检查更新（后台线程，延迟 3 秒，静默）。
         if let Some(message) = load_message {
@@ -829,23 +867,93 @@ impl MinoApp {
     }
 
     /// 带目录与启动命令的本地标签构造（`new_local_tab` 与 `open_project` 共用）。
+    ///
+    /// 生产构建在后台线程创建会话（PTY fork + shell 启动/oh-my-zsh 初始化
+    /// 可达数百毫秒，同步做会推迟首帧、也让 ⌘T 明显卡顿），本帧只登记
+    /// `pending_local`，就绪后由 `poll_local_spawn` 挂上标签。
     fn new_local_tab_at(&mut self, ctx: &egui::Context, dir: Option<PathBuf>, command: &str) {
-        let ctx = ctx.clone();
-        let on_event = Arc::new(move |_ev: &SessionEvent| {
-            ctx.request_repaint();
-        });
-        match Session::spawn_local(local_session_options_at(dir), 80, 24, on_event) {
-            Ok(session) => {
-                let view = TerminalView::new(session);
-                // 启动命令只取首个非空行：多行粘贴会被 shell 逐行执行，
-                // 配置里换行只可能是误粘贴，不应多行注入。
-                if let Some(line) = command.lines().map(str::trim).find(|l| !l.is_empty()) {
-                    view.session().write(format!("{line}\n").as_bytes());
+        let options = local_session_options_at(dir);
+        let command = command.to_string();
+
+        // 测试构建同步创建：kittest 的 `run_steps` 不等待后台线程，
+        // 大量用例在 `MinoApp::new` 后立即断言标签存在。异步挂载路径由
+        // `本地终端异步就绪后挂载标签` 直接驱动 `poll_local_spawn` 覆盖。
+        #[cfg(test)]
+        {
+            let on_event = Arc::new(move |_ev: &SessionEvent| {});
+            let _ = ctx;
+            match Session::spawn_local(options, 80, 24, on_event) {
+                Ok(session) => self.mount_local_session(session, &command),
+                Err(e) => {
+                    log::error!("启动本地终端失败：{e}");
+                    self.show_toast(format!("启动本地终端失败：{e}"), true);
                 }
-                let id = self.allocate_id();
-                let tab = Box::new(TerminalTab::new(id, "本地终端".into(), view));
-                self.tabs.push(tab);
-                self.active_tab = self.tabs.len() - 1;
+            }
+        }
+
+        #[cfg(not(test))]
+        {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let spawn_ctx = ctx.clone();
+            let notify_ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let on_event = Arc::new(move |_ev: &SessionEvent| spawn_ctx.request_repaint());
+                let result = Session::spawn_local(options, 80, 24, on_event);
+                let _ = tx.send(result);
+                // 结果到达即唤醒 UI 去取（本帧之外才有结果，必须自己请求重绘）。
+                notify_ctx.request_repaint();
+            });
+            self.pending_local = Some(PendingLocalSpawn { rx, command });
+            // 让"正在启动终端…"占位立刻可见。
+            ctx.request_repaint();
+        }
+    }
+
+    /// 把已创建的本地会话挂上标签栏（异步与同步路径共用）。
+    fn mount_local_session(&mut self, session: Session, command: &str) {
+        let mut view = TerminalView::new(session);
+        view.set_gpu(self.terminal_gpu.clone());
+        // 启动命令只取首个非空行：多行粘贴会被 shell 逐行执行，
+        // 配置里换行只可能是误粘贴，不应多行注入。
+        if let Some(line) = command.lines().map(str::trim).find(|l| !l.is_empty()) {
+            view.session().write(format!("{line}\n").as_bytes());
+        }
+        let id = self.allocate_id();
+        let tab = Box::new(TerminalTab::new(id, "本地终端".into(), view));
+        self.tabs.push(tab);
+        self.active_tab = self.tabs.len() - 1;
+        if !self.terminal_ready_reported {
+            self.terminal_ready_reported = true;
+            self.perf
+                .set_terminal_ready_ms(self.created_at.elapsed().as_secs_f32() * 1000.0);
+        }
+    }
+
+    /// 处理后台创建中的本地终端：就绪即挂标签，失败即提示。
+    ///
+    /// 每帧调用；无等待中的会话时零成本。
+    fn poll_local_spawn(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_local.as_ref() else {
+            return;
+        };
+        let result = match pending.rx.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.pending_local = None;
+                self.show_toast("启动本地终端失败：会话创建线程异常退出", true);
+                return;
+            }
+        };
+        let command = self
+            .pending_local
+            .take()
+            .map(|pending| pending.command)
+            .unwrap_or_default();
+        match result {
+            Ok(session) => {
+                self.mount_local_session(session, &command);
+                ctx.request_repaint();
             }
             Err(e) => {
                 log::error!("启动本地终端失败：{e}");
@@ -853,11 +961,18 @@ impl MinoApp {
             }
         }
     }
+
+    /// 注入中文 fallback 字体后台加载器（生产路径由 `main` 调用）。
+    pub fn set_cjk_font_loader(&mut self, loader: crate::CjkFontLoader) {
+        self.cjk_fonts = Some(loader);
+    }
+
     /// 收藏当前终端目录为项目（⌘D 与快捷菜单空态入口共用）。
     ///
-    /// 仅本地标签可用：目录取 `TerminalView::effective_local_directory`
-    /// （内核 cwd 优先、跟踪值回退）——纯跟踪值在粘贴/补全/别名场景下会
-    /// 停在启动目录，标题与 SFTP 定位都不依赖它；
+    /// 仅本地标签可用：目录取 `TerminalView::fresh_local_directory`
+    /// （内核 cwd 优先、跟踪值回退，不走标题用的 TTL 缓存——用户按 ⌘D 的
+    /// 那一刻目录可能刚变过，缓存 300ms 的旧值会收藏错地方）——纯跟踪值在
+    /// 粘贴/补全/别名场景下会停在启动目录，标题与 SFTP 定位都不依赖它；
     /// 去重只看规范路径（重名允许），默认名取末级目录名。
     fn bookmark_current_directory(&mut self) {
         let Some(tab) = self.tabs.get(self.active_tab) else {
@@ -868,7 +983,7 @@ impl MinoApp {
             self.show_toast("仅支持收藏本地终端目录", true);
             return;
         }
-        let Some(cwd) = tab.terminal.effective_local_directory() else {
+        let Some(cwd) = tab.terminal.fresh_local_directory() else {
             self.show_toast("当前目录未知，稍后再试", true);
             return;
         };
@@ -903,6 +1018,7 @@ impl MinoApp {
         }
         self.show_toast(format!("已收藏「{name}」"), false);
     }
+
     fn close_tab(&mut self, index: usize) {
         if index >= self.tabs.len() {
             return;
@@ -1296,7 +1412,8 @@ impl MinoApp {
                         .pending_connection_id
                         .take()
                         .unwrap_or_else(|| self.allocate_id());
-                    let view = TerminalView::new(session);
+                    let mut view = TerminalView::new(session);
+                    view.set_gpu(self.terminal_gpu.clone());
                     self.tabs.push(Box::new(TerminalTab::new(
                         connection_id,
                         self.pending_label.clone(),
@@ -3751,6 +3868,11 @@ impl MinoApp {
                 ui.separator();
                 loading_hint(ui, "SFTP 连接中…");
             }
+            if self.pending_local.is_some() {
+                // ⌘T 新建终端时当前标签仍在显示：状态栏给出明确等待反馈。
+                ui.separator();
+                loading_hint(ui, "终端启动中…");
+            }
             if let Some(e) = &self.sftp_error {
                 ui.separator();
                 status_dot(ui, theme.danger, false);
@@ -4618,6 +4740,25 @@ impl eframe::App for MinoApp {
 
         // ==================== 处理异步结果 ====================
         // 所有标签都轮询后台状态，非活动标签不会积压终端写回或 SFTP 事件。
+        if let Some(loader) = &mut self.cjk_fonts {
+            // 中文 fallback 就绪即并入（只应用一次；未就绪时零成本）。
+            // 并入会让 epaint 重建整套字体（`Context::add_font` → 下一帧
+            // `fonts = None`），此前缓存的 Galley 全部指向旧图集——必须同步
+            // 失效终端行缓存，否则启动期渲染的中文会永久停在乱码字形上。
+            // 只负责唤醒：真正生效在下一帧 `begin_pass`（见
+            // `TerminalView::font_fingerprint` 的看门狗），此处清缓存会
+            // 用旧字体重建出一批乱码并永久缓存。
+            if loader.poll(&ctx) {
+                ctx.request_repaint();
+            }
+        }
+        if !self.first_frame_reported {
+            // 首帧耗时打点：覆盖"窗口出现→第一帧内容"的真实启动延迟。
+            self.first_frame_reported = true;
+            self.perf
+                .set_startup_ms(self.created_at.elapsed().as_secs_f32() * 1000.0);
+        }
+        self.poll_local_spawn(&ctx);
         for tab in &mut self.tabs {
             tab.terminal.drain_background_events();
         }
@@ -4720,7 +4861,15 @@ impl eframe::App for MinoApp {
                     loading_hint(ui, &format!("正在连接 {} …", self.pending_label));
                 });
             } else if self.tabs.is_empty() {
-                self.empty_state(ui, &ctx);
+                if self.pending_local.is_some() {
+                    // 本地会话在后台创建：显示占位而不是空状态，避免用户
+                    // 看到"没有终端"的错觉（PTY fork + shell 初始化期间）。
+                    ui.centered_and_justified(|ui| {
+                        loading_hint(ui, "正在启动终端…");
+                    });
+                } else {
+                    self.empty_state(ui, &ctx);
+                }
             } else if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                 tab.terminal.show_with_input(ui, terminal_input_enabled);
                 // tabby 风格：远程标签页终端右上角悬浮 SFTP 开关按钮。
@@ -4767,6 +4916,9 @@ impl eframe::App for MinoApp {
             self.perf.add_build(build);
             self.perf.add_layout(layout);
             self.perf.add_paint(paint);
+            let (shapes, rebuilt, reused, upload) = tab.terminal.last_stats();
+            self.perf
+                .add_terminal_counts(shapes, rebuilt, reused, upload);
         }
     }
 }
@@ -4785,8 +4937,52 @@ fn render_perf_hud(ui: &mut egui::Ui, perf: &crate::perf::PerfStats) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use eframe::egui;
     use egui_kittest::Harness;
+
+    /// 异步挂载：后台线程造好的会话经 `poll_local_spawn` 挂上标签栏。
+    ///
+    /// 生产构建的 `new_local_tab_at` 只登记 `pending_local`（后台线程创建
+    /// 会话），挂载逻辑与测试的同步路径共用 `mount_local_session`；这里直接
+    /// 驱动轮询，断言"结果到达→标签出现→状态栏占位消失"。
+    #[test]
+    fn 本地终端异步就绪后挂载标签() {
+        use mino_core::terminal::{Session, SessionOptions};
+        let config_path = test_config_path("pending-local");
+        let mut harness = egui_kittest::Harness::builder()
+            .with_step_dt(1.0 / 60.0)
+            .build_eframe(|cc| MinoApp::new_with_config(cc, config_path.clone()));
+        harness.run_steps(6);
+        assert_eq!(harness.state().tabs.len(), 1, "测试构建应同步建好首个标签");
+        // 模拟生产路径：把一个已建好的会话塞进 pending 队列。
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            std::sync::Arc::new(|_ev: &mino_core::terminal::SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(session)).expect("发送会话失败");
+        harness.state_mut().pending_local = Some(PendingLocalSpawn {
+            rx,
+            command: String::new(),
+        });
+        harness.run_steps(3);
+        assert!(
+            harness.state().pending_local.is_none(),
+            "结果到达后 pending 应被消费"
+        );
+        assert_eq!(harness.state().tabs.len(), 2, "新会话应挂上第二个标签");
+        assert!(
+            harness.state().perf.summary().contains("终端"),
+            "终端就绪打点应记录：{}",
+            harness.state().perf.summary()
+        );
+        std::fs::remove_file(&config_path).ok();
+    }
+
     use kittest::Queryable;
 
     /// 验证侧栏、工具栏与中央面板在 root Ui 上正常渲染。

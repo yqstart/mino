@@ -62,6 +62,15 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
     <string>NSApplication</string>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.developer-tools</string>
+    <!-- 文件夹访问授权弹窗的说明文字（macOS 26 对"文件和文件夹"类授权必填）：
+         缺了它弹窗只显示"是否允许 XXX"，用户无法判断用途；且每次更新后
+         ad-hoc 重签都会重置授权，没有说明文字更难一次通过。-->
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>Mino 需要访问你的项目文件夹，以便终端在此目录工作、打开新标签与收藏目录。</string>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>Mino 需要访问你的项目文件夹，以便终端在此目录工作、打开新标签与收藏目录。</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>Mino 需要访问你的项目文件夹，以便终端在此目录工作、打开新标签与收藏目录。</string>
 </dict>
 </plist>
 EOF

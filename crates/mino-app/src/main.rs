@@ -13,11 +13,143 @@ mod workdir;
 use app::{MinoApp, PRODUCT_NAME};
 use eframe::egui;
 
-/// 加载等宽主字体与中文 fallback（macOS 系统字体）。
-fn setup_fonts(ctx: &egui::Context) {
+/// 各平台中文 fallback 字体候选路径（按优先级）。
+///
+/// 单独成函数：装配线程与后台加载线程共用同一份候选列表，避免两处
+/// 顺序不一致（顺序决定实际选中的字体）。
+fn cjk_candidates() -> &'static [&'static str] {
+    #[cfg(target_os = "macos")]
+    {
+        &[
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/STHeiti Light.ttc",
+        ]
+    }
+    #[cfg(target_os = "windows")]
+    {
+        &[
+            "C:\\Windows\\Fonts\\msyh.ttc", // 微软雅黑
+            "C:\\Windows\\Fonts\\msyhbd.ttc",
+        ]
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        &[
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", // Noto Sans CJK
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",         // 文泉驿微米黑
+            "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+        ]
+    }
+}
+
+/// 中文 fallback 字体加载器：后台读取 + 就绪后并入字体定义。
+///
+/// 中文 fallback 是启动期最大的一笔字体 IO（本机实测 `STHeiti Light.ttc`
+/// 55.8MB，PingFang.ttc 78MB，均为单一 .ttc 全量读入），同步读完会明显
+/// 推迟首帧。主等宽字体、符号 fallback、界面字体合计约 10MB 仍同步装配
+/// （首帧就必须有正确字形），中文 fallback 交给后台线程，就绪后由 UI
+/// 线程把字节并入当前 `FontDefinitions` 再 `set_fonts` 一次。
+///
+/// 未就绪的短暂窗口里中文会按 egui 默认链路渲染，通常发生在一帧以内。
+pub struct CjkFontLoader {
+    rx: std::sync::mpsc::Receiver<Option<(String, Vec<u8>)>>,
+    /// 已并入或已确认无可用字体（之后不再轮询）。
+    done: bool,
+    /// 后台读取开始时间（启动打点用）。
+    started_at: std::time::Instant,
+}
+
+impl CjkFontLoader {
+    /// 启动后台读取（立即返回，不阻塞调用方）。
+    fn start() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let found = cjk_candidates().iter().find_map(|path| {
+                std::fs::read(path)
+                    .ok()
+                    .map(|bytes| (path.to_string(), bytes))
+            });
+            // 接收端已销毁（应用退出）时忽略发送失败。
+            let _ = tx.send(found);
+        });
+        Self {
+            rx,
+            done: false,
+            started_at: std::time::Instant::now(),
+        }
+    }
+
+    /// 就绪则并入字体定义；返回 true 表示本次调用真正应用了字体。
+    pub fn poll(&mut self, ctx: &egui::Context) -> bool {
+        if self.done {
+            return false;
+        }
+        match self.rx.try_recv() {
+            Ok(Some((path, bytes))) => {
+                self.done = true;
+                apply_cjk_font(ctx, &path, bytes);
+                log::info!(
+                    "中文 fallback 字体就绪：{path}（后台读取耗时 {:.0}ms）",
+                    self.started_at.elapsed().as_secs_f32() * 1000.0
+                );
+                true
+            }
+            Ok(None) => {
+                self.done = true;
+                log::warn!("未找到系统中文字体，中文按 egui 默认链路渲染");
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.done = true;
+                false
+            }
+        }
+    }
+
+    /// 阻塞到中文 fallback 可用（测试与需要"首帧即有中文"的场景）。
+    pub fn wait_ready(&mut self, ctx: &egui::Context) {
+        if self.done {
+            return;
+        }
+        if let Ok(Some((path, bytes))) = self.rx.recv() {
+            self.done = true;
+            apply_cjk_font(ctx, &path, bytes);
+        }
+        self.done = true;
+    }
+}
+
+/// 把中文字体字节增量并入两个族的末尾（`add_font` + `Lowest` 优先级）。
+///
+/// 不能用"克隆当前定义再 `set_fonts`"：egui 的 `set_fonts` 会比较整份
+/// `FontDefinitions`（含全部 TTF 字节）决定是否更新，跨帧调用时被比较的
+/// 旧定义可能还是首帧前的那份，极易误判 `==` 而吞掉并入——这正是中文字体
+/// 在测试里"读到了却没装上"的根因。`add_font` 直接追加到现行定义之后，
+/// 主字体/符号 fallback 的既有顺序原样保留（中文仍排最后）。
+fn apply_cjk_font(ctx: &egui::Context, path: &str, bytes: Vec<u8>) {
+    use egui::{FontData, FontFamily};
+    use epaint::text::{FontInsert, FontPriority, InsertFontFamily};
+    ctx.add_font(FontInsert {
+        name: "mino_cjk".to_owned(),
+        data: FontData::from_owned(bytes),
+        families: [FontFamily::Proportional, FontFamily::Monospace]
+            .into_iter()
+            .map(|family| InsertFontFamily {
+                family,
+                priority: FontPriority::Lowest,
+            })
+            .collect(),
+    });
+    log::info!("已并入中文 fallback 字体：{path}");
+}
+
+/// 装配字体：主等宽字体 + 符号 fallback + 界面字体同步，中文 fallback 后台。
+pub(crate) fn setup_fonts(ctx: &egui::Context) -> CjkFontLoader {
     use egui::{FontData, FontDefinitions, FontFamily};
 
     let mut fonts = FontDefinitions::default();
+    let started = std::time::Instant::now();
 
     // ==================== 等宽主字体与中文 fallback（按平台） ====================
     #[cfg(target_os = "macos")]
@@ -56,23 +188,6 @@ fn setup_fonts(ctx: &egui::Context) {
     let ui_candidates = [
         "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ];
-
-    #[cfg(target_os = "macos")]
-    let cjk_candidates = [
-        "/System/Library/Fonts/PingFang.ttc",
-        "/System/Library/Fonts/STHeiti Light.ttc",
-    ];
-    #[cfg(target_os = "windows")]
-    let cjk_candidates = [
-        "C:\\Windows\\Fonts\\msyh.ttc", // 微软雅黑
-        "C:\\Windows\\Fonts\\msyhbd.ttc",
-    ];
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let cjk_candidates = [
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", // Noto Sans CJK
-        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",         // 文泉驿微米黑
-        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
     ];
 
     let mut loaded_mono = false;
@@ -148,26 +263,16 @@ fn setup_fonts(ctx: &egui::Context) {
         }
     }
 
-    // 中文 fallback 追加到等宽族末尾。
-    for path in cjk_candidates {
-        if let Ok(bytes) = std::fs::read(path) {
-            fonts.font_data.insert(
-                "mino_cjk".to_owned(),
-                std::sync::Arc::new(FontData::from_owned(bytes)),
-            );
-            for family in [FontFamily::Proportional, FontFamily::Monospace] {
-                fonts
-                    .families
-                    .get_mut(&family)
-                    .unwrap()
-                    .push("mino_cjk".to_owned());
-            }
-            log::info!("加载中文 fallback 字体：{path}");
-            break;
-        }
-    }
+    // 中文 fallback 追加到等宽族末尾；文件最大（本机 STHeiti 55.8MB），
+    // 交给后台线程读取，就绪后由 UI 线程并入（见 `CjkFontLoader`）。
+    let loader = CjkFontLoader::start();
 
     ctx.set_fonts(fonts);
+    log::info!(
+        "同步装配字体完成（{:.0}ms），中文 fallback 后台加载中",
+        started.elapsed().as_secs_f32() * 1000.0
+    );
+    loader
 }
 
 /// 加载应用图标（assets/icon.png → IconData）。
@@ -291,10 +396,12 @@ fn main() -> eframe::Result {
         PRODUCT_NAME,
         native_options,
         Box::new(|cc| {
-            setup_fonts(&cc.egui_ctx);
+            let cjk_fonts = setup_fonts(&cc.egui_ctx);
             // 应用窗口圆角与透明背景（非 macOS/测试环境静默跳过）。
             native::apply_rounded_window(cc);
-            Ok(Box::new(MinoApp::new(cc)))
+            let mut app = MinoApp::new(cc);
+            app.set_cjk_font_loader(cjk_fonts);
+            Ok(Box::new(app))
         }),
     )
 }
@@ -311,10 +418,16 @@ mod font_tests {
         let ctx = egui::Context::default();
         // 先跑一帧初始化字体系统（Context::fonts 在首次 run 前不可用）；
         // set_fonts 延迟到下一帧 begin_pass 生效，因此跑两帧。
+        // 中文 fallback 由下面的 `wait_ready` 显式等待后单独断言。
+        let mut loader: Option<CjkFontLoader> = None;
         let mut output = ctx.run_ui(egui::RawInput::default(), |ctx| {
-            setup_fonts(ctx);
+            loader = Some(setup_fonts(ctx));
         });
         output.textures_delta.clear();
+        let mut loader = loader.expect("setup_fonts 应返回加载器");
+        // 中文不能抢在 Menlo 之前（否则 ➜/❯ 会被中文字体抢先匹配）。
+        loader.wait_ready(&ctx);
+        // `add_font` 的生效在下一帧 begin_pass：再跑一帧让定义落地。
         let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
         output.textures_delta.clear();
         let definitions = ctx.fonts(|f| f.definitions().clone());

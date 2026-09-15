@@ -284,11 +284,8 @@ pub fn connect_sftp_with_handler(
     let thread_cancel = cancel.clone();
     let profile = profile.clone();
     let handle = std::thread::spawn(move || {
-        let runtime = match tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-        {
+        // 共享 runtime 不可用时也必须把失败回传（否则面板永久停在"连接中…"）。
+        let runtime = match crate::ssh::SHARED_RUNTIME.as_ref() {
             Ok(runtime) => runtime,
             Err(e) => {
                 if ev_tx
@@ -300,14 +297,14 @@ pub fn connect_sftp_with_handler(
                 return;
             }
         };
-        runtime.block_on(sftp_main(
+        crate::ssh::wait_for_task(runtime.spawn(sftp_main(
             profile,
             cmd_rx,
             ev_tx,
             thread_shutdown,
             thread_cancel,
             on_event,
-        ));
+        )));
     });
     (
         handle,

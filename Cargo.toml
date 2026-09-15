@@ -3,9 +3,17 @@ resolver = "2"
 members = ["crates/mino-core", "crates/mino-app"]
 
 [workspace.package]
-version = "1.1.1"
+version = "1.1.2"
 edition = "2021"
 license = "MIT"
+
+# 发布构建：剥离调试信息 + thin LTO（体积与启动页映射都受益）。
+# 不剥离符号表：崩溃日志里的堆栈要靠符号名定位（`strip = true` 会让
+# 堆栈只剩地址，用户报闪退时无法定位）。
+[profile.release]
+strip = "debuginfo"
+lto = "thin"
+codegen-units = 1
 
 [workspace.dependencies]
 # 终端内核（生产级 VT 仿真 + PTY）
@@ -13,6 +21,10 @@ alacritty_terminal = "0.26.0"
 # GUI
 eframe = "0.36.1"
 egui = "0.36.1"
+# `bytemuck` 特性给出 `epaint::Vertex` 的 `Pod` 实现（终端行网格要直接
+# 上传顶点缓冲；wgpu 只接受 Pod 切片）。
+epaint = { version = "0.36.1", features = ["bytemuck"] }
+bytemuck = "1"
 # 异步
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "process", "fs"] }
 # 配置
