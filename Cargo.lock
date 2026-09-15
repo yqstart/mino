@@ -2786,7 +2786,7 @@ dependencies = [
 
 [[package]]
 name = "mino-app"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "accesskit",
  "alacritty_terminal",
@@ -2811,7 +2811,7 @@ dependencies = [
 
 [[package]]
 name = "mino-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "alacritty_terminal",
  "env_logger",

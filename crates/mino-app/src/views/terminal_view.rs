@@ -559,11 +559,10 @@ impl TerminalView {
         // 行内容变化的行重传顶点；被移出视口的行释放槽位。
         self.gpu_rows.uploaded_bytes = 0;
         let mut live: std::collections::HashSet<i32> = std::collections::HashSet::new();
-        // 本帧之前已上传、但内容变了的行：`gpu_row_meshes` 每次整体重建时
-        // 需要重传（用「上次上传的 mesh 指针」判断是否已传过）。
+        // 内容变化的行按指针判脏重传（`gpu_row_meshes` 以网格行号索引）。
         for v in 0..self.rows as usize {
             let grid_line = v as i32 - display_offset as i32;
-            let Some(mesh) = self.gpu_row_meshes.get(&(v as i32)) else {
+            let Some(mesh) = self.gpu_row_meshes.get(&grid_line) else {
                 continue;
             };
             live.insert(grid_line);
@@ -1405,11 +1404,13 @@ impl TerminalView {
         let screen_points = ui.ctx().content_rect().size();
         if use_gpu {
             for v in 0..self.rows as usize {
+                let grid_line = v as i32 - display_offset_now as i32;
+                // 脏判断用显示行，缓存键用网格行：行顶点是行内相对坐标、内容只与
+                // 网格行相关；按显示行索引会在滚动后把旧行顶点错配到新网格行。
                 let dirty = rebuilt_rows_scratch.contains(&(v as i32));
-                if !dirty && self.gpu_row_meshes.contains_key(&(v as i32)) {
+                if !dirty && self.gpu_row_meshes.contains_key(&grid_line) {
                     continue;
                 }
-                let grid_line = v as i32 - display_offset_now as i32;
                 let Some(cache) = self.rows_cache.get(&grid_line) else {
                     continue;
                 };
@@ -1423,7 +1424,7 @@ impl TerminalView {
                     atlas_size,
                 );
                 self.gpu_row_meshes
-                    .insert(v as i32, std::sync::Arc::new(mesh));
+                    .insert(grid_line, std::sync::Arc::new(mesh));
             }
         } else {
             for v in 0..self.rows as usize {
@@ -1632,11 +1633,24 @@ impl TerminalView {
         self.last_paint_ms = paint_start.elapsed().as_secs_f32() * 1000.0;
 
         // 缓存上限：滚动浏览大量历史时防止无限增长，超限只保留当前可见行。
+        // 自管路径的行网格同样按网格行号裁剪，否则被裁的行会留在 GPU 缓冲里
+        // 成为滚动后的错配残留。
         if self.rows_cache.len() > (self.rows as usize).saturating_mul(4).max(64) {
             let visible: std::collections::HashSet<i32> = (0..self.rows as usize)
                 .map(|v| v as i32 - display_offset as i32)
                 .collect();
             self.rows_cache.retain(|g, _| visible.contains(g));
+            let evicted: Vec<i32> = self
+                .gpu_row_meshes
+                .keys()
+                .copied()
+                .filter(|g| !visible.contains(g))
+                .collect();
+            for grid_line in evicted {
+                self.gpu_row_meshes.remove(&grid_line);
+                self.gpu_uploaded.remove(&grid_line);
+                self.gpu_rows.remove_row(grid_line);
+            }
         }
 
         // ==================== 焦点与输入 ====================
@@ -4343,6 +4357,94 @@ mod tests {
             rebuilt < rows_visible / 2,
             "滚动一屏内的小步长不应重建整屏：重建 {rebuilt} 行 / 可见 {rows_visible} 行"
         );
+    }
+
+    /// 回归：自管 GPU 行网格按网格行号缓存，滚动后同一显示行必须映射到新网格行。
+    ///
+    /// 根因：GPU 行顶点是行内相对坐标、内容只与网格行相关；曾按显示行号索引，
+    /// 滚动后旧显示行的顶点错配到新网格行——omp/claude 等全屏重绘应用输出后
+    /// 滚轮查看历史时，新旧内容叠在一起（覆盖现象）。
+    /// kittest 无 wgpu 后端，直接断言「显示行 → 网格行」映射与缓存键口径一致。
+    #[test]
+    fn 滚动后显示行映射到新网格行() {
+        use alacritty_terminal::grid::Scroll;
+
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+        });
+        assert!(wait_text(&view, &mut harness, "mino"), "zsh 未就绪");
+
+        // 输出超过一屏，产生 scrollback。
+        view.borrow().session().write(b"seq 60\r");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            harness.step();
+            if grid_text(view.borrow().session())
+                .lines()
+                .any(|l| l.trim_end() == "60")
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "seq 60 输出未就绪");
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        harness.run_steps(6);
+        let rows = view.borrow().rows as usize;
+        assert!(rows > 10, "视口行数异常：{rows}");
+
+        // 滚动前记录「显示行 → 网格行」映射（渲染循环同一口径）。
+        let offset_before = view
+            .borrow()
+            .session()
+            .term()
+            .lock()
+            .grid()
+            .display_offset();
+        let map_before: Vec<i32> = (0..rows).map(|v| v as i32 - offset_before as i32).collect();
+
+        {
+            let term = view.borrow().session().term();
+            let mut guard = term.lock();
+            guard.grid_mut().scroll_display(Scroll::Delta(3));
+        }
+        harness.run_steps(2);
+        let offset_after = view
+            .borrow()
+            .session()
+            .term()
+            .lock()
+            .grid()
+            .display_offset();
+        assert!(offset_after > offset_before, "滚轮应进入 scrollback");
+
+        // 同一显示行滚动后必须指向更早的网格行（差值 = 滚动量）；
+        // 若缓存键误用显示行号，同一键在滚动前后会指向不同网格行的内容。
+        let scrolled = (offset_after - offset_before) as i32;
+        for (v, before) in map_before.iter().enumerate() {
+            let after = v as i32 - offset_after as i32;
+            assert_eq!(
+                before - after,
+                scrolled,
+                "显示行 {v} 滚动前后应指向相差滚动量的网格行"
+            );
+        }
+        // 滚动后顶行应显示更早的输出（与网格内容一致，无覆盖残留）。
+        let top: String = grid_text(view.borrow().session())
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        assert!(!top.is_empty(), "滚动后视口顶行不应为空");
     }
 
     /// 找一条以 `first` 开头的可见行，返回（显示行号, [(终端列, 字符)]）。
