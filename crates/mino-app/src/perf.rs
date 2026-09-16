@@ -145,7 +145,11 @@ impl PerfStats {
         self.upload_bytes.push(upload_bytes as f32);
     }
 
-    /// 汇总一行展示文本。
+    /// 汇总一行展示文本（状态栏常显，最多六项核心读数）。
+    ///
+    /// 常显：帧耗时 / FPS / 构建耗时 / Shape 数 / 行重建 / 上传量。
+    /// 布局、绘制、首帧、终端就绪等次要读数只进 [`Self::details`]（悬浮提示查看），
+    /// 避免状态栏被长串数字挤占。
     pub fn summary(&self) -> String {
         let f = |v: Option<f32>| match v {
             Some(v) => format!("{v:.2}"),
@@ -168,25 +172,45 @@ impl PerfStats {
             None => "—".to_string(),
         };
         format!(
-            "帧 {}ms | FPS {} | 构建 {}ms | 布局 {}ms | 绘制 {}ms | shapes {} | 行重建 {} | 上传 {}KB{}",
+            "帧 {}ms | FPS {} | 构建 {}ms | shapes {} | 行重建 {} | 上传 {}KB",
             f(self.frame_times.avg_ms()),
             fps,
             f(self.build_times.avg_ms()),
-            f(self.layout_times.avg_ms()),
-            f(self.paint_times.avg_ms()),
             u(self.shapes.avg_ms()),
             rows,
             upload,
-            startup_suffix(self.startup_ms, self.terminal_ready_ms),
+        )
+    }
+
+    /// 完整读数（悬浮提示用）：含常显六项 + 布局/绘制/首帧/终端就绪。
+    pub fn details(&self) -> String {
+        format!(
+            "{}{}",
+            self.summary(),
+            details_suffix(
+                self.layout_times.avg_ms(),
+                self.paint_times.avg_ms(),
+                self.startup_ms,
+                self.terminal_ready_ms,
+            ),
         )
     }
 }
 
-/// 启动打点后缀：首帧耗时 +（若已就绪）终端就绪耗时。
+/// 次要读数后缀：布局/绘制耗时 + 首帧耗时 +（若已就绪）终端就绪耗时。
 ///
 /// 单独函数便于单测（HUD 文本格式是给人看的关键读数，不能静默丢字段）。
-fn startup_suffix(startup_ms: Option<f32>, terminal_ready_ms: Option<f32>) -> String {
-    let mut suffix = String::new();
+fn details_suffix(
+    layout_ms: Option<f32>,
+    paint_ms: Option<f32>,
+    startup_ms: Option<f32>,
+    terminal_ready_ms: Option<f32>,
+) -> String {
+    let f = |v: Option<f32>| match v {
+        Some(v) => format!("{v:.2}"),
+        None => "—".to_string(),
+    };
+    let mut suffix = format!(" | 布局 {}ms | 绘制 {}ms", f(layout_ms), f(paint_ms));
     if let Some(ms) = startup_ms {
         suffix.push_str(&format!(" | 首帧 {ms:.0}ms"));
     }
@@ -200,23 +224,35 @@ fn startup_suffix(startup_ms: Option<f32>, terminal_ready_ms: Option<f32>) -> St
 mod tests {
     use super::*;
 
-    /// 打点后 HUD 必须真实反映启动耗时（启动慢是用户可感知的第一体验，
-    /// 这两个读数缺了就无法验证异步化的效果）。
+    /// 打点后 HUD 详情必须真实反映启动耗时（启动慢是用户可感知的第一体验，
+    /// 这两个读数缺了就无法验证异步化的效果）。常显只保留六项核心读数，
+    /// 启动打点只出现在悬浮详情里。
     #[test]
     fn 性能汇总包含启动打点() {
         let mut perf = PerfStats::new();
         assert!(
-            !perf.summary().contains("首帧"),
+            !perf.details().contains("首帧"),
             "未打点时不应出现启动读数：{}",
-            perf.summary()
+            perf.details()
         );
         perf.set_startup_ms(123.4);
         perf.set_terminal_ready_ms(456.7);
-        let summary = perf.summary();
-        assert!(summary.contains("首帧 123ms"), "首帧读数缺失：{summary}");
+        // 常显六项里不应出现启动打点，避免状态栏过长。
         assert!(
-            summary.contains("终端 457ms"),
-            "终端就绪读数缺失：{summary}"
+            !perf.summary().contains("首帧"),
+            "常显不应含启动读数：{}",
+            perf.summary()
+        );
+        assert!(
+            perf.summary().split('|').count() <= 6,
+            "常显最多六项：{}",
+            perf.summary()
+        );
+        let details = perf.details();
+        assert!(details.contains("首帧 123ms"), "首帧读数缺失：{details}");
+        assert!(
+            details.contains("终端 457ms"),
+            "终端就绪读数缺失：{details}"
         );
     }
 
@@ -235,5 +271,16 @@ mod tests {
         assert!(summary.contains("shapes 120"), "Shape 数缺失：{summary}");
         assert!(summary.contains("行重建 3/40"), "行重建缺失：{summary}");
         assert!(summary.contains("上传 8.0KB"), "上传量缺失：{summary}");
+        // 布局/绘制是次要读数，只进悬浮详情，不占常显位置。
+        assert!(
+            !summary.contains("布局") && !summary.contains("绘制"),
+            "常显不应含布局/绘制读数：{summary}"
+        );
+        assert!(summary.split('|').count() <= 6, "常显最多六项：{summary}");
+        let details = perf.details();
+        assert!(
+            details.contains("布局") && details.contains("绘制"),
+            "详情缺失次要读数：{details}"
+        );
     }
 }

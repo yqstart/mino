@@ -68,6 +68,16 @@
 
 ---
 
+## 打包字体
+
+### JetBrains Mono（终端等宽主字体，随应用打包：`crates/mino-app/fonts/`）
+- 仓库：https://github.com/JetBrains/JetBrainsMono
+- 许可证：SIL Open Font License 1.1（许可证全文见 `crates/mino-app/fonts/OFL.txt`；OFL 允许随软件打包分发）
+- 用途：终端 Monospace 族主字体（Regular / Italic / Bold / BoldItalic 四字重，`main.rs::setup_fonts` 经 `include_bytes!` 编译期嵌入）
+- 版本：v2.304（静态 TTF，非 variable）
+
+---
+
 ## 主题参考
 
 - **Catppuccin Mocha**（终端调色板）：https://github.com/catppuccin/catppuccin（MIT）

@@ -2,6 +2,24 @@
 
 本文件为 GitHub Release 正文提供内容（`scripts/release-notes.sh` 提取首个版本段落）。
 
+## [1.1.0] - 2026-09-16
+
+终端字号调节、打包 JetBrains Mono 主字体，并修复 omp 等程序在 kitty 键盘协议下的方向键失效。
+
+### 新功能
+
+- **终端字号调节**：⌘+ / ⌘- 缩放（±1pt）、⌘0 重置；「设置 → 外观」新增字号滑杆（10–24pt，步进 0.5，拖动中即时生效、松手提示）。字号全局生效（所有标签同时变、新标签继承），持久化在 `hosts.toml` 的 `font_size`（老配置缺字段回默认 13pt）；修改即失效 Galley/cell/网格/GPU 顶点缓存，不会留下旧字号的字形或列宽
+- **打包 JetBrains Mono**：终端等宽主字体换成随应用打包的 JetBrains Mono（Regular/Italic/Bold/BoldItalic 四字重约 1.1MB，`include_bytes!` 编译期嵌入；OFL 1.1，许可见 THIRD-PARTY-NOTICES）。0/O、l/1/I 区分明确，自带 `➜`/`❯`/`⚡`/powerline/制表符字形，提示符不再依赖 Menlo 补字；Menlo 与 STHeiti 仍在其后兜底生僻符号与中文
+
+### 修复
+
+- **kitty 键盘协议按键编码（omp 方向键失效根因）**：程序订阅 `DISAMBIGUATE` 后，方向键/Home/End/PgUp/PgDn/Insert/Delete/F1-F12 曾被编成自造私用区编号（`ESC[57358u` 等——那在 kitty 规范里是 CAPS_LOCK 等键的编号），这些键在 omp 等按协议解析的程序里完全无反应（实测 omp 18.2.1：`ESC[57358u`/`ESC[57359u` 不动、`ESC[A`/`ESC[B` 正常）。现按规范分流：上述功能键与无修饰的 Enter/Tab/Backspace/文本键保持 legacy 编码；Escape（`CSI 27u`）、带修饰的 Enter/Tab/Backspace（`CSI 13;2u` 等）与 ctrl/alt 组合文本键走 CSI-u（码点取未移位基准键）；`REPORT_ALL_KEYS_AS_ESC` 亦支持
+
+### 改进
+
+- 性能 HUD 状态栏精简为最多六项核心读数（帧耗时 / FPS / 构建耗时 / Shape 数 / 行重建 / 上传量），布局、绘制、首帧、终端就绪等次要读数移入悬浮提示
+- 项目收藏表单重构：整表包内嵌底与列表分出层级，路径字段的「使用当前终端目录」缩为同行右端行内小操作，页脚右对齐（保存 → 取消）与新建连接弹窗一致；表单错误文案贴到问题输入框下方
+
 ## [1.0.1] - 2026-09-15
 
 修复自管 GPU 渲染滚动时的内容覆盖：`gpu_row_meshes` 行顶点缓存曾按显示行号索引，而行顶点是行内相对坐标、内容只与网格行相关——滚动后旧显示行的顶点错配到新网格行，表现为 omp/claude 等高频重绘应用输出后滚轮查看历史时文字/横线压在背景上。构建、上传判脏、缓存裁剪统一按网格行号索引，uniform 行原点仍按显示行给出（滚动只换 uniform、零重传）。

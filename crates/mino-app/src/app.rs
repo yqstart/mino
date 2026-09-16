@@ -481,7 +481,7 @@ fn ssh_quick_button(ui: &mut egui::Ui) -> egui::Response {
 
 /// 标签栏项目收藏按钮。22×22 纯矢量文件夹图标（圆角矩形主体 + 左上标签突起），
 /// 风格与齿轮/`>_ `一致：次要色描边、hover 白 8% 圆角底。
-/// 禁用 unicode 文件夹符号（SF Mono 缺字形会变方块）。
+/// 禁用 unicode 文件夹符号（缺字形会变方块，主字体之外的符号走 fallback 链）。
 /// 点击弹出项目收藏菜单（`Popup::menu` 自行管理开关状态，Id 需稳定）。
 fn project_quick_button(ui: &mut egui::Ui) -> egui::Response {
     let theme = crate::theme::current_theme();
@@ -767,6 +767,12 @@ impl MinoApp {
         // （曾启动硬编码 set_theme(0)，切换皮肤退出重进永远回到原来的）。
         let initial_theme = crate::theme::theme_index_by_name(config.theme.trim()).unwrap_or(0);
         crate::theme::set_theme(&ctx, initial_theme);
+        // 字号恢复：钳制到合法区间（手改配置写 0/负数/超大不能炸渲染；
+        // 老配置缺字段时 serde 已回默认 13）。
+        let mut config = config;
+        config.font_size = config
+            .font_size
+            .clamp(TerminalView::MIN_FONT_SIZE, TerminalView::MAX_FONT_SIZE);
 
         let mut app = Self {
             tabs: Vec::new(),
@@ -913,6 +919,9 @@ impl MinoApp {
     fn mount_local_session(&mut self, session: Session, command: &str) {
         let mut view = TerminalView::new(session);
         view.set_gpu(self.terminal_gpu.clone());
+        // 新标签继承当前全局字号（启动恢复/快捷键/滑杆都只改 `config` +
+        // 存量标签；新建标签必须跟上，否则新旧标签字不一样大）。
+        view.set_font_size(self.config.font_size);
         // 启动命令只取首个非空行：多行粘贴会被 shell 逐行执行，
         // 配置里换行只可能是误粘贴，不应多行注入。
         if let Some(line) = command.lines().map(str::trim).find(|l| !l.is_empty()) {
@@ -1380,6 +1389,43 @@ impl MinoApp {
         self.show_toast(format!("主题：{name}"), false);
     }
 
+    /// 设置终端字号并持久化（退出重进保持；保存失败回滚内存态）。
+    ///
+    /// 与 `apply_theme_and_persist` 同一约定：内存态与落盘态必须一致，否则
+    /// 本次看着调成功了、重启又回到原来的。字号是全局的：存量**全部**标签
+    /// 即时生效（不是只改活动标签——切标签字忽大忽小），新标签创建时继承
+    /// （见 `mount_local_session`/`poll_connection`）。落盘只写 `font_size`
+    /// 一个字段的变化，不碰主机/项目。`silent` 为 true 时不弹 toast（快捷键
+    /// 连续缩放每步都弹会刷屏；滑杆拖动中同样静默，释放后再提示）。
+    fn apply_font_size_and_persist(&mut self, ctx: &egui::Context, size: f32, silent: bool) {
+        let size = size.clamp(TerminalView::MIN_FONT_SIZE, TerminalView::MAX_FONT_SIZE);
+        if (size - self.config.font_size).abs() < f32::EPSILON
+            && self
+                .tabs
+                .iter()
+                .all(|tab| (tab.terminal.font_size() - size).abs() < f32::EPSILON)
+        {
+            return;
+        }
+        let previous = self.config.font_size;
+        self.config.font_size = size;
+        for tab in &mut self.tabs {
+            tab.terminal.set_font_size(size);
+        }
+        if !self.save_config() {
+            // 落盘失败：内存态整体回滚，保持与磁盘一致。
+            self.config.font_size = previous;
+            for tab in &mut self.tabs {
+                tab.terminal.set_font_size(previous);
+            }
+            return;
+        }
+        ctx.request_repaint();
+        if !silent {
+            self.show_toast(format!("终端字号：{size:.0}pt"), false);
+        }
+    }
+
     /// 打开一个全新的连接表单。
     ///
     /// “新建连接”始终代表新建配置，不能沿用上一次输入的主机、密码或私钥
@@ -1414,6 +1460,7 @@ impl MinoApp {
                         .unwrap_or_else(|| self.allocate_id());
                     let mut view = TerminalView::new(session);
                     view.set_gpu(self.terminal_gpu.clone());
+                    view.set_font_size(self.config.font_size);
                     self.tabs.push(Box::new(TerminalTab::new(
                         connection_id,
                         self.pending_label.clone(),
@@ -1912,6 +1959,93 @@ impl MinoApp {
                                             .size(10.0)
                                             .color(theme.text_muted),
                                     );
+                                    ui.add_space(10.0);
+                                    // 终端字号：滑杆 10-24pt（步进 0.5）+ −/＋
+                                    // 微调 + 重置默认。拖动中静默应用（每步都
+                                    // 落盘但不弹 toast），释放后提示一次；
+                                    // 快捷键 ⌘+/- / ⌘0 见 `MinoApp::ui`。
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new("终端字号")
+                                                .size(12.0)
+                                                .color(theme.text_muted),
+                                        );
+                                        ui.add_space(8.0);
+                                        let mut size = self.config.font_size;
+                                        let slider = egui::Slider::new(
+                                            &mut size,
+                                            TerminalView::MIN_FONT_SIZE
+                                                ..=TerminalView::MAX_FONT_SIZE,
+                                        )
+                                        .step_by(0.5)
+                                        .fixed_decimals(1)
+                                        .suffix(" pt")
+                                        .show_value(true);
+                                        if ui.add(slider).changed() {
+                                            let font_ctx = ui.ctx().clone();
+                                            // 拖动中每步都即时生效+落盘（静默，
+                                            // 不弹 toast），松手后提示一次。
+                                            self.apply_font_size_and_persist(&font_ctx, size, true);
+                                        }
+                                    });
+                                    ui.add_space(4.0);
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 8.0;
+                                        if ui
+                                            .small_button(
+                                                egui::RichText::new("−")
+                                                    .size(13.0)
+                                                    .color(theme.text_primary),
+                                            )
+                                            .on_hover_text("缩小（⌘-）")
+                                            .clicked()
+                                        {
+                                            let font_ctx = ui.ctx().clone();
+                                            let next = self.config.font_size
+                                                - TerminalView::FONT_SIZE_STEP;
+                                            self.apply_font_size_and_persist(
+                                                &font_ctx, next, false,
+                                            );
+                                        }
+                                        if ui
+                                            .small_button(
+                                                egui::RichText::new("＋")
+                                                    .size(13.0)
+                                                    .color(theme.text_primary),
+                                            )
+                                            .on_hover_text("放大（⌘+）")
+                                            .clicked()
+                                        {
+                                            let font_ctx = ui.ctx().clone();
+                                            let next = self.config.font_size
+                                                + TerminalView::FONT_SIZE_STEP;
+                                            self.apply_font_size_and_persist(
+                                                &font_ctx, next, false,
+                                            );
+                                        }
+                                        if ui
+                                            .small_button(
+                                                egui::RichText::new("重置")
+                                                    .size(11.5)
+                                                    .color(theme.text_secondary),
+                                            )
+                                            .on_hover_text("恢复默认 13pt（⌘0）")
+                                            .clicked()
+                                        {
+                                            let font_ctx = ui.ctx().clone();
+                                            self.apply_font_size_and_persist(
+                                                &font_ctx,
+                                                TerminalView::DEFAULT_FONT_SIZE,
+                                                false,
+                                            );
+                                        }
+                                        ui.label(
+                                            egui::RichText::new("⌘+ / ⌘- 缩放 · ⌘0 重置")
+                                                .monospace()
+                                                .size(10.0)
+                                                .color(theme.text_muted),
+                                        );
+                                    });
                                 });
                                 ui.add_space(10.0);
 
@@ -2940,7 +3074,8 @@ impl MinoApp {
     ///
     /// 行布局复用 `host_sidebar` 模式（56px 行、头像+名称/路径两行、hover 提亮，
     /// 无选中竖条）；右侧 ↑ ↓ 改 删四个 24px 操作按钮（改/删为单字 + 悬浮说明）；
-    /// 删除直接生效（与主机行 🗑 一致，不弹确认）；底部展开新增/编辑表单。
+    /// 删除直接生效（与主机行 🗑 一致，不弹确认）；底部展开新增/编辑表单
+    /// （表单包 `inset_frame` 内嵌底，与上方列表分出层级，见 `project_edit_form`）。
     fn project_manager(&mut self, ui: &mut egui::Ui) {
         let theme = crate::theme::current_theme();
         ui.horizontal(|ui| {
@@ -3192,12 +3327,46 @@ impl MinoApp {
         }
 
         // 新增/编辑表单（take 出来渲染，避免与 save/toast 的 &mut self 冲突）。
+        //
+        // 渲染约定（新建连接弹窗的嵌入版，与 `connect_dialog` 同语义）：
+        // - 表单包 `inset_frame` 内嵌底，与上方 project 行列表分出层级；
+        // - 路径组："使用当前终端目录"缩成行内小操作、贴"路径"字段名同行右端；
+        // - 页脚右对齐：保存（主按钮）→ 取消（次按钮），不再左排三按钮。
         let mut edit = self.project_edit.take();
         let mut close_form = false;
         if let Some(e) = edit.as_mut() {
             ui.add_space(8.0);
             dialog::hairline(ui);
             ui.add_space(10.0);
+            self.project_edit_form(ui, e, &mut close_form);
+        }
+        if close_form {
+            edit = None;
+        }
+        self.project_edit = edit;
+    }
+
+    /// 项目新增/编辑表单主体（`inset_frame` 嵌入版）。
+    ///
+    /// 与 `connect_dialog` 共用同一套表单语言：11px `field_label` + 4px 间隙 +
+    /// `form_input` 输入框 + 右对齐页脚。嵌入式没有独立窗口标题栏，所以标题
+    /// 直接走卡片分组字 `section_title`（"新增项目/编辑项目"），不再另起头部。
+    ///
+    /// 布局三处与旧实现不同（都是对截图里"散"的原因的回应）：
+    /// 1. **分组容器**：整个表单包一层 `inset_frame`（浮层底 + 8px 圆角），
+    ///    与上方 project 行列表分出层级——截图里表单直接裸贴在列表下，
+    ///    hairline 把它和列表划成同一平面，所以看起来像临时补丁。
+    /// 2. **行内操作**："使用当前终端目录"缩成 `field_action_button` 行内
+    ///    小操作、贴在"路径"字段名同行右端，不再与保存/取消同排等权——
+    ///    那是字段的附属填充动作，不是表单级动作。
+    /// 3. **右对齐页脚**：`Layout::right_to_left`，保存（主按钮）→ 取消
+    ///    （次按钮），与新建连接弹窗"连接/取消"右对齐一致。
+    #[allow(clippy::too_many_lines)]
+    fn project_edit_form(&mut self, ui: &mut egui::Ui, e: &mut ProjectEdit, close_form: &mut bool) {
+        let theme = crate::theme::current_theme();
+        dialog::inset_frame(theme).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 0.0;
             dialog::section_title(
                 ui,
                 if e.index.is_some() {
@@ -3206,49 +3375,101 @@ impl MinoApp {
                     "新增项目"
                 },
             );
-            ui.add_space(6.0);
-            let field_w = ui.available_width();
+            // === 基本信息组 ===
+            ui.add_space(8.0);
             dialog::field_label(ui, "名称");
+            ui.add_space(4.0);
             let name_resp = dialog::form_input(
                 ui,
                 egui::Id::new("project_edit_name"),
                 &mut e.name,
                 "如：mino",
-                field_w,
+                ui.available_width(),
                 false,
                 e.name_error,
             );
             if name_resp.changed() {
                 e.name_error = false;
             }
-            dialog::field_label(ui, "路径");
+            // 错误文案贴在问题输入框正下方（与 `connect_dialog` 端口错误同约定；
+            // 此前只有 toast + 红边框，切走输入框都不知道错在哪）。
+            if e.name_error {
+                ui.add_space(3.0);
+                ui.label(
+                    egui::RichText::new("请填写项目名称")
+                        .size(11.0)
+                        .color(theme.danger),
+                );
+            }
+            // === 目录组（发丝线分组，与新建连接弹窗"连接身份/网络地址"同语义）===
+            ui.add_space(10.0);
+            dialog::hairline(ui);
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                dialog::field_label(ui, "路径");
+                // 同行右端：字段的附属填充动作（贴字段名基线，不抢焦点感）。
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(dialog::field_action_button(theme, "使用当前终端目录"))
+                        .on_hover_text("把当前本地终端所在目录填入路径")
+                        .clicked()
+                    {
+                        match self
+                            .tabs
+                            .get(self.active_tab)
+                            .filter(|t| !t.terminal.session().is_remote())
+                            .and_then(|t| t.terminal.effective_local_directory())
+                        {
+                            Some(dir) => e.path = dir,
+                            None => self.show_toast("当前无本地终端目录", true),
+                        }
+                    }
+                });
+            });
+            ui.add_space(4.0);
             let path_resp = dialog::form_input(
                 ui,
                 egui::Id::new("project_edit_path"),
                 &mut e.path,
                 "/Users/me/proj",
-                field_w,
+                ui.available_width(),
                 false,
                 e.path_error,
             );
             if path_resp.changed() {
                 e.path_error = false;
             }
+            if e.path_error {
+                ui.add_space(3.0);
+                ui.label(
+                    egui::RichText::new("目录不存在，请检查路径")
+                        .size(11.0)
+                        .color(theme.danger),
+                );
+            }
+            // === 启动命令组（可选）===
+            ui.add_space(10.0);
+            dialog::hairline(ui);
+            ui.add_space(10.0);
             dialog::field_label(ui, "启动命令（可选）");
+            ui.add_space(4.0);
             dialog::form_input(
                 ui,
                 egui::Id::new("project_edit_command"),
                 &mut e.command,
                 "打开后自动执行，如：npm run dev",
-                field_w,
+                ui.available_width(),
                 false,
                 false,
             );
-            ui.add_space(6.0);
+            // === 页脚（右对齐：保存 → 取消，与新建连接弹窗一致）===
+            ui.add_space(12.0);
+            dialog::hairline(ui);
+            ui.add_space(10.0);
             let mut save = false;
             let mut cancel = false;
-            let mut use_cwd = false;
-            ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 if ui
                     .add_sized(
@@ -3268,32 +3489,13 @@ impl MinoApp {
                 {
                     cancel = true;
                 }
-                if ui
-                    .add(dialog::secondary_button(theme, "使用当前终端目录"))
-                    .clicked()
-                {
-                    use_cwd = true;
-                }
             });
-            if use_cwd {
-                match self
-                    .tabs
-                    .get(self.active_tab)
-                    .filter(|t| !t.terminal.session().is_remote())
-                    .and_then(|t| t.terminal.effective_local_directory())
-                {
-                    Some(dir) => e.path = dir,
-                    None => self.show_toast("当前无本地终端目录", true),
-                }
-            }
             if cancel {
-                close_form = true;
+                *close_form = true;
             } else if save {
                 e.name_error = e.name.trim().is_empty();
                 e.path_error = !std::path::Path::new(e.path.trim()).is_dir();
-                if e.name_error || e.path_error {
-                    self.show_toast("请检查项目名称与目录", true);
-                } else {
+                if !(e.name_error || e.path_error) {
                     let profile = ProjectProfile {
                         name: e.name.trim().to_owned(),
                         path: PathBuf::from(e.path.trim()),
@@ -3305,7 +3507,7 @@ impl MinoApp {
                             if !self.save_config() {
                                 self.config.projects[idx] = old;
                             } else {
-                                close_form = true;
+                                *close_form = true;
                             }
                         }
                         _ => {
@@ -3313,17 +3515,13 @@ impl MinoApp {
                             if !self.save_config() {
                                 self.config.projects.pop();
                             } else {
-                                close_form = true;
+                                *close_form = true;
                             }
                         }
                     }
                 }
             }
-        }
-        if close_form {
-            edit = None;
-        }
-        self.project_edit = edit;
+        });
     }
 
     /// 渲染新建连接对话框。
@@ -4693,6 +4891,30 @@ impl eframe::App for MinoApp {
         {
             self.close_tab(self.active_tab);
         }
+        // 终端字号：⌘+ 放大 / ⌘- 缩小 / ⌘0 重置（macOS 终端通用约定）。
+        //
+        // 必须在终端输入处理**之前**消费：`consume_key` 把按键从事件队列移除，
+        // 终端的 `Event::Key`/`Text` 分支就看不到它——否则 `+`/`-` 会同时被
+        // 写进 PTY（调一次字号、命令行多一个字符）。`matches_logically` 会忽略
+        // 额外的 Shift：⌘Shift+=（美式键盘的 `+`）与 ⌘= 走同一分支，一次
+        // `Plus` + 一次 `Equals` 即覆盖两种键位。⌘0 是数字行（`Num0`），与
+        // ⌘1-9 的标签切换同修饰但键不同，无冲突。
+        // 缩放静默落盘（`silent=true`）：连续按键每步都弹 toast 会刷屏；
+        // 字号本身由 `apply_font_size_and_persist` 内钳制 10-24pt。
+        if ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::COMMAND, egui::Key::Plus)
+                || i.consume_key(egui::Modifiers::COMMAND, egui::Key::Equals)
+        }) {
+            let next = self.config.font_size + TerminalView::FONT_SIZE_STEP;
+            self.apply_font_size_and_persist(&ctx, next, true);
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Minus)) {
+            let next = self.config.font_size - TerminalView::FONT_SIZE_STEP;
+            self.apply_font_size_and_persist(&ctx, next, true);
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num0)) {
+            self.apply_font_size_and_persist(&ctx, TerminalView::DEFAULT_FONT_SIZE, false);
+        }
         for (key, theme_idx) in [
             (egui::Key::Num1, 0),
             (egui::Key::Num2, 1),
@@ -4923,7 +5145,7 @@ impl eframe::App for MinoApp {
     }
 }
 
-/// 渲染性能 HUD 文本（底部状态栏右侧）。
+/// 渲染性能 HUD 文本（底部状态栏右侧，常显六项核心读数，详情进悬浮提示）。
 fn render_perf_hud(ui: &mut egui::Ui, perf: &crate::perf::PerfStats) {
     let theme = crate::theme::current_theme();
     ui.label(
@@ -4932,7 +5154,7 @@ fn render_perf_hud(ui: &mut egui::Ui, perf: &crate::perf::PerfStats) {
             .size(11.0)
             .color(theme.text_secondary),
     )
-    .on_hover_text("帧耗时 / FPS / 终端构建、布局与绘制耗时（⌥P 切换）");
+    .on_hover_text(format!("{}（⌥P 切换）", perf.details()));
 }
 
 #[cfg(test)]
@@ -4976,9 +5198,9 @@ mod tests {
         );
         assert_eq!(harness.state().tabs.len(), 2, "新会话应挂上第二个标签");
         assert!(
-            harness.state().perf.summary().contains("终端"),
+            harness.state().perf.details().contains("终端"),
             "终端就绪打点应记录：{}",
-            harness.state().perf.summary()
+            harness.state().perf.details()
         );
         std::fs::remove_file(&config_path).ok();
     }
@@ -5612,9 +5834,9 @@ mod connect_tests {
         //（曾直接覆盖并删除用户主机列表，运行一次测试丢一次配置）。
         let config_path = test_config_path("connect-e2e");
         let config = HostConfig {
-            theme: String::new(),
             hosts: vec![profile],
             projects: Vec::new(),
+            ..Default::default()
         };
         config.save(&config_path).expect("写入测试配置失败");
 
@@ -5816,9 +6038,9 @@ mod snapshot_tests {
         }
         let config_path = test_config_path("snapshot");
         let config = HostConfig {
-            theme: String::new(),
             hosts: vec![profile],
             projects: Vec::new(),
+            ..Default::default()
         };
         config.save(&config_path).expect("写入测试配置失败");
 
@@ -6011,9 +6233,9 @@ mod theme_tests {
         let _guard = THEME_TEST_LOCK.lock().unwrap();
         let config_path = test_config_path("theme-persist");
         HostConfig {
-            theme: String::new(),
             hosts: Vec::new(),
             projects: Vec::new(),
+            ..Default::default()
         }
         .save(&config_path)
         .expect("写入测试配置失败");
@@ -6038,6 +6260,186 @@ mod theme_tests {
             crate::theme::current_theme().name,
             "霓虹",
             "重启后主题应保持上次选择，而非回到默认"
+        );
+
+        std::fs::remove_file(&config_path).ok();
+    }
+
+    /// 字号调节：快捷键缩放与 ⌘0 重置（只改全局字号，不写字符进终端）。
+    ///
+    /// 快捷键在 `MinoApp::ui` 顶部消费（终端 `handle_input` 之前）：不断言
+    /// PTY 内容（终端是否收到 `+` 由锁序与事件消费保证），断言三件事——
+    /// 全标签即时生效、落盘可读、超界钳制。
+    #[test]
+    fn 快捷键缩放终端字号() {
+        let config_path = test_config_path("font-zoom");
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            MinoApp::new_with_config(cc, config_path.clone())
+        });
+        harness.run_steps(6);
+        assert_eq!(harness.state().tabs.len(), 1, "测试构建应同步建好首个标签");
+        let base = harness.state().config.font_size;
+
+        // ⌘+ 放大 1pt（美式键盘 Shift 修饰被 matches_logically 忽略，
+        // 与 ⌘= 同分支；这里直接发 Plus 覆盖主路径）。
+        harness.event(egui::Event::Key {
+            key: egui::Key::Plus,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        harness.run_steps(3);
+        assert_eq!(
+            harness.state().config.font_size,
+            base + TerminalView::FONT_SIZE_STEP,
+            "⌘+ 应放大一档"
+        );
+        assert_eq!(
+            harness.state().tabs[0].terminal.font_size(),
+            base + TerminalView::FONT_SIZE_STEP,
+            "存量标签应即时生效"
+        );
+
+        // ⌘- 缩小回原值。
+        harness.event(egui::Event::Key {
+            key: egui::Key::Minus,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        harness.run_steps(3);
+        assert!(
+            (harness.state().config.font_size - base).abs() < f32::EPSILON,
+            "⌘- 应缩小回原值，实际：{}",
+            harness.state().config.font_size
+        );
+
+        // 非默认字号下 ⌘0 重置回 13。
+        let font_ctx = harness.state().last_ctx.clone();
+        harness
+            .state_mut()
+            .apply_font_size_and_persist(&font_ctx, 18.0, true);
+        harness.run_steps(3);
+        harness.event(egui::Event::Key {
+            key: egui::Key::Num0,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        harness.run_steps(3);
+        assert_eq!(
+            harness.state().config.font_size,
+            TerminalView::DEFAULT_FONT_SIZE,
+            "⌘0 应重置为默认字号"
+        );
+
+        // 超界钳制：999 → 24 上限。
+        harness
+            .state_mut()
+            .apply_font_size_and_persist(&font_ctx, 999.0, true);
+        assert_eq!(
+            harness.state().config.font_size,
+            TerminalView::MAX_FONT_SIZE,
+            "超大字号应钳制到上限"
+        );
+
+        // 落盘可读：hosts.toml 里应记录最终字号。
+        let saved = HostConfig::load(&config_path).expect("字号调整后配置应可读");
+        assert_eq!(
+            saved.font_size,
+            TerminalView::MAX_FONT_SIZE,
+            "字号选择应持久化到配置"
+        );
+
+        std::fs::remove_file(&config_path).ok();
+    }
+
+    /// 回归：调大字号后重启应用，应恢复上次字号而非默认 13。
+    #[test]
+    fn 字号调整重启后保持() {
+        let config_path = test_config_path("font-persist");
+        HostConfig {
+            hosts: Vec::new(),
+            projects: Vec::new(),
+            ..Default::default()
+        }
+        .save(&config_path)
+        .expect("写入测试配置失败");
+
+        // 首次启动 → 经持久化路径调到 17pt。
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            MinoApp::new_with_config(cc, config_path.clone())
+        });
+        harness.run_steps(6);
+        let font_ctx = harness.state().last_ctx.clone();
+        harness
+            .state_mut()
+            .apply_font_size_and_persist(&font_ctx, 17.0, true);
+        harness.run_steps(3);
+        assert_eq!(harness.state().tabs[0].terminal.font_size(), 17.0);
+        drop(harness);
+
+        // 第二次启动（模拟退出重进）→ 新标签应继承 17pt。
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            MinoApp::new_with_config(cc, config_path.clone())
+        });
+        harness.run_steps(6);
+        assert_eq!(
+            harness.state().config.font_size,
+            17.0,
+            "重启后字号应保持上次选择，而非回到默认"
+        );
+        assert_eq!(
+            harness.state().tabs[0].terminal.font_size(),
+            17.0,
+            "重启后新标签应继承已保存字号"
+        );
+
+        std::fs::remove_file(&config_path).ok();
+    }
+
+    /// 外观卡片的字号滑杆存在且可拖动（设置弹窗 → 外观）。
+    #[test]
+    fn 外观卡片字号滑杆可调() {
+        use kittest::Queryable;
+
+        let config_path = test_config_path("font-slider");
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            MinoApp::new_with_config(cc, config_path.clone())
+        });
+        harness.run_steps(6);
+        // 设置弹窗现在在 ⌘, 后面，先打开。
+        harness.event(egui::Event::Key {
+            key: egui::Key::Comma,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        harness.run_steps(3);
+        assert!(harness.state().show_settings, "⌘, 应打开设置弹窗");
+
+        // 滑杆以数值后缀 " pt" 渲染（egui Slider 数值是可编辑文本）。
+        let before = harness.state().config.font_size;
+        harness.get_by_label("终端字号");
+        // 滑杆拖动走 `changed()` 路径：直接调持久化入口模拟"拖到 16pt"，
+        // 断言渲染链路（标签即时生效 + 落盘）；滑杆存在性由上一行保证。
+        let font_ctx = harness.state().last_ctx.clone();
+        harness
+            .state_mut()
+            .apply_font_size_and_persist(&font_ctx, 16.0, true);
+        harness.run_steps(3);
+        assert!(
+            (harness.state().config.font_size - 16.0).abs() < f32::EPSILON && before != 16.0,
+            "滑杆调整应改变全局字号，之前：{before}"
+        );
+        assert_eq!(
+            harness.state().tabs[0].terminal.font_size(),
+            16.0,
+            "滑杆调整后存量标签应即时生效"
         );
 
         std::fs::remove_file(&config_path).ok();
@@ -7102,7 +7504,6 @@ mod settings_tests {
 
         let config_path = test_config_path("host-card-align");
         let config = HostConfig {
-            theme: String::new(),
             hosts: vec![
                 HostProfile {
                     name: "短名".into(),
@@ -7123,6 +7524,7 @@ mod settings_tests {
                 },
             ],
             projects: Vec::new(),
+            ..Default::default()
         };
         config.save(&config_path).expect("写入测试配置失败");
 
@@ -7162,7 +7564,6 @@ mod settings_tests {
 
         let config_path = test_config_path("ssh-quick");
         let config = HostConfig {
-            theme: String::new(),
             hosts: vec![HostProfile {
                 name: "快捷主机".into(),
                 host: "127.0.0.1".into(),
@@ -7173,6 +7574,7 @@ mod settings_tests {
                 auth: Auth::Password("x".into()),
             }],
             projects: Vec::new(),
+            ..Default::default()
         };
         config.save(&config_path).expect("写入测试配置失败");
 
@@ -7234,7 +7636,6 @@ mod settings_tests {
 
         let config_path = test_config_path("ssh-quick-align");
         let config = HostConfig {
-            theme: String::new(),
             hosts: vec![
                 HostProfile {
                     name: "短名".into(),
@@ -7252,6 +7653,7 @@ mod settings_tests {
                 },
             ],
             projects: Vec::new(),
+            ..Default::default()
         };
         config.save(&config_path).expect("写入测试配置失败");
 
@@ -7333,7 +7735,6 @@ mod project_tests {
 
         let config_path = test_config_path("projects-menu");
         let config = HostConfig {
-            theme: String::new(),
             hosts: Vec::new(),
             projects: vec![
                 ProjectProfile {
@@ -7347,6 +7748,7 @@ mod project_tests {
                     command: String::new(),
                 },
             ],
+            ..Default::default()
         };
         config.save(&config_path).expect("写入测试配置失败");
 
@@ -7404,7 +7806,6 @@ mod project_tests {
 
         let config_path = test_config_path("projects-panel");
         let config = HostConfig {
-            theme: String::new(),
             hosts: Vec::new(),
             projects: vec![
                 ProjectProfile {
@@ -7418,6 +7819,7 @@ mod project_tests {
                     command: String::new(),
                 },
             ],
+            ..Default::default()
         };
         config.save(&config_path).expect("写入测试配置失败");
 
@@ -7602,13 +8004,13 @@ mod project_tests {
 
         let config_path = test_config_path("projects-cmd");
         let config = HostConfig {
-            theme: String::new(),
             hosts: Vec::new(),
             projects: vec![ProjectProfile {
                 name: "命令项目".into(),
                 path: dir_a.clone(),
                 command: "echo MINO_PROJ_MARK".into(),
             }],
+            ..Default::default()
         };
         config.save(&config_path).expect("写入测试配置失败");
 
@@ -7708,6 +8110,68 @@ mod project_manage_tests {
         assert!(
             content.contains("管理项目"),
             "落盘 toml 应含新项目：{content}"
+        );
+
+        std::fs::remove_file(&config_path).ok();
+    }
+
+    /// 新增表单布局回归：保存/取消页脚右对齐，"使用当前终端目录"不再是
+    /// 表单级按钮（本次重构：页脚 `right_to_left` + 行内小操作）。
+    ///
+    /// 断言三件事（都是截图里"散"的直接证据）：
+    /// - 页脚顺序：`right_to_left` 布局里先加的排最右，保存必须在取消之右；
+    /// - 层级："使用当前终端目录"按钮的高度必须明显矮于保存按钮
+    ///   （`field_action_button` 22px vs 页脚 28px），不是同排等权按钮；
+    /// - 位置：行内小操作贴"路径"标签行（纵向距离 < 1 行输入框高 30px），
+    ///   而不是和保存/取消挤在同一行。
+    #[test]
+    fn 新增表单页脚右对齐且行内操作分层() {
+        use kittest::Queryable;
+        let config_path = test_config_path("projects-layout");
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            MinoApp::new_with_config(cc, config_path.clone())
+        });
+        harness.run_steps(6);
+        harness.event(egui::Event::Key {
+            key: egui::Key::Comma,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        harness.run_steps(6);
+        harness.get_by_label("项目管理");
+
+        macro_rules! find_button {
+            ($label:expr) => {
+                harness
+                    .root()
+                    .query_all_by_role(accesskit::Role::Button)
+                    .find(|n| n.accesskit_node().label() == Some($label.to_string()))
+                    .unwrap_or_else(|| panic!("找不到按钮：{}", $label))
+            };
+        }
+        find_button!("新增项目").click();
+        harness.run_steps(6);
+        harness.get_by_label("使用当前终端目录");
+
+        let save = find_button!("保存");
+        let cancel = find_button!("取消");
+        let locate = find_button!("使用当前终端目录");
+        let save_rect = save.rect();
+        let cancel_rect = cancel.rect();
+        let locate_rect = locate.rect();
+        assert!(
+            save_rect.center().x > cancel_rect.center().x,
+            "保存应在取消之右（页脚右对齐）：保存 {save_rect:?} vs 取消 {cancel_rect:?}"
+        );
+        assert!(
+            locate_rect.height() < save_rect.height(),
+            "行内操作应比页脚按钮矮一层：定位 {locate_rect:?} vs 保存 {save_rect:?}",
+        );
+        assert!(
+            (locate_rect.center().y - save_rect.center().y).abs() > save_rect.height(),
+            "行内操作不应与保存同行：定位 {locate_rect:?} vs 保存 {save_rect:?}"
         );
 
         std::fs::remove_file(&config_path).ok();

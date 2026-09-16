@@ -46,7 +46,7 @@ fn cjk_candidates() -> &'static [&'static str] {
 ///
 /// 中文 fallback 是启动期最大的一笔字体 IO（本机实测 `STHeiti Light.ttc`
 /// 55.8MB，PingFang.ttc 78MB，均为单一 .ttc 全量读入），同步读完会明显
-/// 推迟首帧。主等宽字体、符号 fallback、界面字体合计约 10MB 仍同步装配
+/// 推迟首帧。打包等宽字体（约 1.1MB）、符号兜底、界面字体仍同步装配
 /// （首帧就必须有正确字形），中文 fallback 交给后台线程，就绪后由 UI
 /// 线程把字节并入当前 `FontDefinitions` 再 `set_fonts` 一次。
 ///
@@ -151,24 +151,104 @@ pub(crate) fn setup_fonts(ctx: &egui::Context) -> CjkFontLoader {
     let mut fonts = FontDefinitions::default();
     let started = std::time::Instant::now();
 
-    // ==================== 等宽主字体与中文 fallback（按平台） ====================
+    // ==================== 等宽主字体（JetBrains Mono，打包随附） ====================
+    // 大多数现代终端（Ghostty 默认、Warp 可选、JetBrains IDE 系默认）都在用
+    // JetBrains Mono：0/O、l/1/I 区分明确，自带 ➜/❯/⚡/powerline/制表符字形，
+    // 终端提示符不再依赖 Menlo 补字。OFL 1.1 允许随应用打包（见 fonts/OFL.txt）。
+    // 注意 egui 0.36 的限制（`FontId` 只有 size + family，无 weight/italics
+    // 字段）：`mino_mono_bold` 等名字只是族内 fallback 顺序，layout 时不会
+    // 按"粗体段→粗体文件"选择——shaping 永远走族内第一个含该字形的字体
+    // （`CachedFamily::find_face_for_char`），即 Regular；`TextFormat`
+    // 只管颜色/下划线（粗体=前景增亮仍在 `singleline_job` 里做），`italics`
+    // 只在 tessellate 时把字形整体剪切（`text_layout.rs:1173`）。但四个文件
+    // 仍有价值：① 链内字形互补——Regular 缺的字（如某些粗体专用符号）由
+    // Bold 补上；② 将来 egui 支持字重时零改动生效；③ 打包体积仅 1.1MB。
+    // 不要删成只留 Regular：删了省不下多少，fallback 覆盖面反而变窄。
+    let bundled_mono: [(&str, &[u8]); 4] = [
+        (
+            "mino_mono",
+            include_bytes!("../fonts/JetBrainsMono-Regular.ttf"),
+        ),
+        (
+            "mino_mono_italic",
+            include_bytes!("../fonts/JetBrainsMono-Italic.ttf"),
+        ),
+        (
+            "mino_mono_bold",
+            include_bytes!("../fonts/JetBrainsMono-Bold.ttf"),
+        ),
+        (
+            "mino_mono_bold_italic",
+            include_bytes!("../fonts/JetBrainsMono-BoldItalic.ttf"),
+        ),
+    ];
+    for (name, bytes) in bundled_mono {
+        fonts.font_data.insert(
+            name.to_owned(),
+            std::sync::Arc::new(FontData::from_static(bytes)),
+        );
+    }
+    {
+        let mono = fonts.families.get_mut(&FontFamily::Monospace).unwrap();
+        // 打包字重插到链首，egui 默认的 Hack/NotoEmoji/emoji-icon 保留在链尾：
+        // 彩色 emoji（如 ✨🔥）只有 NotoEmoji 能画，`clear()` 会让它们变方块。
+        // JetBrains Mono 的 emoji 区是单色符号（如 ⚡ U+26A1），与彩色 emoji
+        // 不冲突——按字形覆盖各取所需。
+        for (i, name) in [
+            "mino_mono",
+            "mino_mono_italic",
+            "mino_mono_bold",
+            "mino_mono_bold_italic",
+        ]
+        .iter()
+        .enumerate()
+        {
+            mono.insert(i, (*name).to_owned());
+        }
+    }
+    log::info!("加载打包等宽字体：JetBrains Mono（Regular/Italic/Bold/BoldItalic）");
+
+    // ==================== 平台兜底（打包字体永远优先，仅防御） ====================
+    // `include_bytes!` 编译期嵌入，打包字体不可能缺失；此分支仅防御"有人手
+    // 动删掉打包字体文件又重新编译"的极端情况。注意 `.ttc` 是字体集合：
+    // `FontData.index` 默认为 0（取集合第一个字重，Menlo.ttc[0] = Regular），
+    // 从 ttc 读到的字节与从 ttf 读到的语义一致，都是"一个文件的全部字节"。
     #[cfg(target_os = "macos")]
-    let mono_candidates = [
+    let mono_fallbacks = [
         "/System/Library/Fonts/SFNSMono.ttf", // SF Mono
         "/System/Library/Fonts/Menlo.ttc",    // Menlo
         "/System/Library/Fonts/Supplemental/Menlo.ttc",
     ];
     #[cfg(target_os = "windows")]
-    let mono_candidates = [
+    let mono_fallbacks = [
         "C:\\Windows\\Fonts\\CascadiaMono.ttf", // Cascadia Code
         "C:\\Windows\\Fonts\\consola.ttf",      // Consolas
     ];
     #[cfg(all(unix, not(target_os = "macos")))]
-    let mono_candidates = [
+    let mono_fallbacks = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", // DejaVu Sans Mono
         "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
         "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
     ];
+
+    for path in mono_fallbacks {
+        if let Ok(bytes) = std::fs::read(path) {
+            // 同名复用：fallback 只在打包字体之后被查到，不抢字形。
+            if !fonts.font_data.contains_key("mino_mono_sys") {
+                fonts.font_data.insert(
+                    "mino_mono_sys".to_owned(),
+                    std::sync::Arc::new(FontData::from_owned(bytes)),
+                );
+                fonts
+                    .families
+                    .get_mut(&FontFamily::Monospace)
+                    .unwrap()
+                    .push("mino_mono_sys".to_owned());
+                log::info!("加载等宽兜底字体：{path}");
+            }
+            break;
+        }
+    }
 
     // ==================== 比例界面字体（按平台） ====================
     // egui 默认比例字体的中英文与符号容易来自不同字体，尤其是 `⌘T` 这类
@@ -189,27 +269,6 @@ pub(crate) fn setup_fonts(ctx: &egui::Context) -> CjkFontLoader {
         "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     ];
-
-    let mut loaded_mono = false;
-    for path in mono_candidates {
-        if let Ok(bytes) = std::fs::read(path) {
-            fonts.font_data.insert(
-                "mino_mono".to_owned(),
-                std::sync::Arc::new(FontData::from_owned(bytes)),
-            );
-            fonts
-                .families
-                .get_mut(&FontFamily::Monospace)
-                .unwrap()
-                .insert(0, "mino_mono".to_owned());
-            loaded_mono = true;
-            log::info!("加载等宽字体：{path}");
-            break;
-        }
-    }
-    if !loaded_mono {
-        log::warn!("未找到系统等宽字体，使用默认字体");
-    }
 
     let mut loaded_ui = false;
     for path in ui_candidates {
@@ -233,10 +292,10 @@ pub(crate) fn setup_fonts(ctx: &egui::Context) -> CjkFontLoader {
     }
 
     // ==================== 等宽符号 fallback（Menlo） ====================
-    // SF Mono 缺少 ➜（U+279C）、❯（U+276F）等常用 zsh 提示符符号，
-    // 缺字形会被 egui 渲染为 `?` 替换符（用户反馈提示符显示错乱）。
-    // Menlo 同为等宽字体且完整覆盖这些符号（宽度一致，行内布局不会错位），
-    // 追加到等宽族、排在中文 fallback 之前。
+    // JetBrains Mono 自带 ➜（U+279C）/❯（U+276F）/⚡/powerline/制表符字形，
+    // 主链路已不再缺字。Menlo 保留为符号兜底（排在中文 fallback 之前、系统
+    // 兜底之前）：只补 JetBrains Mono 没有的生僻符号（如 ⬆ U+2B06），正常
+    // 提示符走主字体、同宽不断裂。
     #[cfg(target_os = "macos")]
     let symbol_candidates = [
         "/System/Library/Fonts/Menlo.ttc",
@@ -251,14 +310,14 @@ pub(crate) fn setup_fonts(ctx: &egui::Context) -> CjkFontLoader {
                 "mino_mono_sym".to_owned(),
                 std::sync::Arc::new(FontData::from_owned(bytes)),
             );
+            // 符号兜底排在四个打包字重之后、中文 fallback 与 egui 默认之前：
+            // 打包字重是 `insert(0..)` 后的 [0..4]，此处 push 到主链末尾。
             fonts
                 .families
                 .get_mut(&FontFamily::Monospace)
                 .unwrap()
-                // 符号 fallback 必须先于 egui 默认 Hack/NotoEmoji，
-                // 但排在主等宽字体之后，保证优先使用同宽 Menlo 字形。
-                .insert(if loaded_mono { 1 } else { 0 }, "mino_mono_sym".to_owned());
-            log::info!("加载等宽符号 fallback 字体：{path}");
+                .push("mino_mono_sym".to_owned());
+            log::info!("加载等宽符号兜底字体：{path}");
             break;
         }
     }
@@ -411,7 +470,7 @@ mod font_tests {
     use super::*;
     use egui::FontFamily;
 
-    /// 等宽字体链应包含符号 fallback（Menlo），
+    /// 等宽字体链应以打包的 JetBrains Mono 开头（含四字重），
     /// 否则 ➜/❯ 等 zsh 提示符符号会渲染为 `?` 替换符（回归测试）。
     #[test]
     fn 等宽字体链含符号fallback() {
@@ -425,7 +484,7 @@ mod font_tests {
         });
         output.textures_delta.clear();
         let mut loader = loader.expect("setup_fonts 应返回加载器");
-        // 中文不能抢在 Menlo 之前（否则 ➜/❯ 会被中文字体抢先匹配）。
+        // 中文不能抢在符号兜底之前（否则 ➜/❯ 会被中文字体抢先匹配）。
         loader.wait_ready(&ctx);
         // `add_font` 的生效在下一帧 begin_pass：再跑一帧让定义落地。
         let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
@@ -435,9 +494,33 @@ mod font_tests {
             .families
             .get(&FontFamily::Monospace)
             .expect("Monospace 族缺失");
+        // 四字重都在链首：族内字形互补、顺序固定，正体永远第一。
+        for (i, name) in [
+            "mino_mono",
+            "mino_mono_italic",
+            "mino_mono_bold",
+            "mino_mono_bold_italic",
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert_eq!(
+                mono.get(i),
+                Some(&name.to_string()),
+                "Monospace 族前四位应为 JetBrains Mono 四字重，实际：{mono:?}"
+            );
+        }
+        // 打包字形自带提示符符号：主链路不断言 has_glyphs（字体是否真实生效
+        // 由下面的字形测试覆盖），这里只保证链路顺序。
+        // egui 默认 fallback（Hack/NotoEmoji/emoji-icon）必须保留在链尾：
+        // 彩色 emoji 只有 NotoEmoji 能画，丢了它们 emoji 全变方块。
         assert!(
-            mono.iter().any(|f| f == "mino_mono"),
-            "Monospace 族应包含主等宽字体 mino_mono，实际：{mono:?}"
+            mono.iter().any(|f| f == "Hack"),
+            "egui 默认 Hack fallback 不应被误删，实际：{mono:?}"
+        );
+        assert!(
+            mono.iter().any(|f| f == "NotoEmoji-Regular"),
+            "egui 默认 emoji fallback 不应被误删，实际：{mono:?}"
         );
         #[cfg(target_os = "macos")]
         {
@@ -450,7 +533,7 @@ mod font_tests {
                 "macOS 比例字体应包含 mino_ui，实际：{proportional:?}"
             );
         }
-        // Menlo 符号 fallback 仅 macOS 加载（SF Mono 缺 ➜/❯ 等字形）；
+        // Menlo 符号兜底仅 macOS 加载（补 JetBrains Mono 没有的生僻符号）；
         // Linux/Windows 使用自带等宽字体，不适用该断言。
         #[cfg(target_os = "macos")]
         {
@@ -458,17 +541,57 @@ mod font_tests {
                 mono.iter().any(|f| f == "mino_mono_sym"),
                 "Monospace 族应包含 mino_mono_sym，实际：{mono:?}"
             );
-            // 符号 fallback 必须排在中文 fallback 之前，且紧邻主等宽字体，
-            // 不能被 egui 内置 Hack/NotoEmoji 抢先匹配。
+            // 符号兜底必须排在中文 fallback 之前、四个打包字重之后，
+            // 不能被 egui 内置 Hack/NotoEmoji 或中文字体抢先匹配。
             let pos_sym = mono.iter().position(|f| f == "mino_mono_sym");
-            let pos_mono = mono.iter().position(|f| f == "mino_mono");
+            let pos_bold_italic = mono.iter().position(|f| f == "mino_mono_bold_italic");
             let pos_cjk = mono.iter().position(|f| f == "mino_cjk");
-            if let (Some(s), Some(m)) = (pos_sym, pos_mono) {
-                assert_eq!(s, m + 1, "mino_mono_sym 应紧邻主等宽字体，实际：{mono:?}");
+            if let (Some(s), Some(b)) = (pos_sym, pos_bold_italic) {
+                assert!(s > b, "mino_mono_sym 应排在打包字重之后，实际：{mono:?}");
             }
             if let (Some(s), Some(c)) = (pos_sym, pos_cjk) {
                 assert!(s < c, "mino_mono_sym 应排在 mino_cjk 之前，实际：{mono:?}");
             }
         }
+    }
+
+    /// JetBrains Mono 打包字形必须真实生效：➜/❯ 不走替换符，且四字重
+    /// 文件都真实装入（只查字体链不断言渲染，会被"链对了但字节坏"漏掉，
+    /// 所以这里直接查字形覆盖与 font_data）。
+    #[test]
+    fn 打包字体符号真实生效() {
+        let ctx = egui::Context::default();
+        let mut loader: Option<CjkFontLoader> = None;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ctx| {
+            loader = Some(setup_fonts(ctx));
+        });
+        output.textures_delta.clear();
+        let mut loader = loader.expect("setup_fonts 应返回加载器");
+        loader.wait_ready(&ctx);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+        output.textures_delta.clear();
+        ctx.fonts_mut(|f| {
+            // 提示符符号在主字体里就有（不依赖 Menlo 兜底）。
+            for ch in ["➜", "❯", "⚡"] {
+                assert!(
+                    f.has_glyphs(&egui::FontId::monospace(13.0), ch),
+                    "JetBrains Mono 应自带 {ch} 字形"
+                );
+            }
+            // 四字重文件都真实装入（坏字节/缺文件会在这里暴露）。
+            let definitions = f.definitions();
+            for name in [
+                "mino_mono",
+                "mino_mono_italic",
+                "mino_mono_bold",
+                "mino_mono_bold_italic",
+            ] {
+                assert!(
+                    definitions.font_data.contains_key(name),
+                    "字重 {name} 应已装入，实际：{:?}",
+                    definitions.font_data.keys().collect::<Vec<_>>()
+                );
+            }
+        });
     }
 }

@@ -199,6 +199,11 @@ pub struct TerminalView {
     /// 行缓存：网格行号 → 渲染数据（Galley + 背景段 + hash）。
     /// 按网格行号索引：滚动后同一网格行直接命中，无需重建。
     rows_cache: HashMap<i32, RowCache>,
+    /// 终端字号（pt；`MinoApp` 快捷键/外观滑杆经 `set_font_size` 修改）。
+    ///
+    /// 渲染侧按此字号 `layout`（`FontId::monospace`）与量 cell（`glyph_width`
+    /// /`row_height`），修改后必须走完整字号失效（见 `set_font_size`），
+    /// 直接赋值会留下旧字号建的 Galley/cell——字不变大或列定位错乱。
     font_size: f32,
     cell_width: f32,
     cell_height: f32,
@@ -407,7 +412,7 @@ impl TerminalView {
         Self {
             session,
             rows_cache: HashMap::new(),
-            font_size: 13.0,
+            font_size: mino_core::config::DEFAULT_FONT_SIZE,
             cell_width: 8.0,
             cell_height: 16.0,
             // 真实尺寸要等到首帧布局后才能从 egui 区域计算出来；不要把
@@ -514,6 +519,44 @@ impl TerminalView {
         self.mesh_atlas_size = [0, 0];
     }
 
+    /// 最小/默认/最大终端字号（pt）。
+    ///
+    /// 最小 10：再小 CJK 笔画糊成一团；最大 24：再大 80 列需要 ~1500px
+    /// 宽，普通窗口只剩十几列且 `MAX_ROWS = 256` 的 GPU 行缓冲更快见顶。
+    pub const MIN_FONT_SIZE: f32 = 10.0;
+    pub const DEFAULT_FONT_SIZE: f32 = mino_core::config::DEFAULT_FONT_SIZE;
+    pub const MAX_FONT_SIZE: f32 = 24.0;
+    /// 快捷键单步（pt）：⌘+/- 每按一次 ±1。
+    pub const FONT_SIZE_STEP: f32 = 1.0;
+
+    /// 当前终端字号（pt）。
+    pub fn font_size(&self) -> f32 {
+        self.font_size
+    }
+
+    /// 设置终端字号（含钳制 + 完整缓存失效）。
+    ///
+    /// 字号是行布局的输入（Galley 字形、cell 宽高、列数、行网格顶点全都由它
+    /// 导出）：只改字段不失效会留下旧字号建的缓存——字不变大（Galley 命中）
+    /// 或列定位错乱（cell 还是旧宽）。此处清 `rows_cache`/`wide_glyphs`/
+    /// `ime_preedit_cache`（含字号键）/网格与 GPU 顶点并把 `cell_width` 置 0
+    /// 强制下帧按新字号重测 cell；列数变化由常规 resize 路径处理。返回钳制
+    /// 后的实际字号（调用方直接拿它落盘/提示，避免两处 clamp 不一致）。
+    pub fn set_font_size(&mut self, size: f32) -> f32 {
+        let size = size.clamp(Self::MIN_FONT_SIZE, Self::MAX_FONT_SIZE);
+        if (size - self.font_size).abs() < f32::EPSILON {
+            return self.font_size;
+        }
+        self.font_size = size;
+        self.invalidate_glyph_caches();
+        self.row_meshes_invalidated = true;
+        // 下帧 `cell_width == 0.0` 分支按新字号重测 cell（`glyph_width`/
+        // `row_height` 都依赖字号），连带清行缓存与重合成网格。
+        self.cell_width = 0.0;
+        self.selection = None;
+        size
+    }
+
     /// 失效行网格缓存（顶点里烘焙了绝对行位，显示位置变化即失效）。
     ///
     /// 触发时机：滚动（`display_offset` 变化）、可见行数变化、内边距原点
@@ -528,7 +571,7 @@ impl TerminalView {
     ///
     /// 顶点是行内相对坐标：滚动只需换 uniform 里的行原点，顶点零重传。
     /// 只在内容变化的行上调用 `upload_row`（`gpu_row_meshes` 已在本帧按
-    /// 脏行更新），因此空闲帧的上传量是 0。
+    /// 脏行更新），因此空闲帧的上传量是 0.
     fn submit_gpu_rows(
         &mut self,
         use_gpu: bool,
@@ -3420,7 +3463,7 @@ fn mix_hash(h: &mut u64, v: u64) {
 /// 同段内字宽一致 → 分段绘制 `x = start_col * cell_width` 精确对齐，
 /// 无字体实际 advance 的累积漂移（见 `CachedRun`）。
 /// 宽字符必须单独成段：字体对 CJK 的 advance 是 1em（13px），双列宽是
-/// 2×cell_width（SF Mono 13px 字号下 16.1px），若同段连续排字，段内每字
+/// 2×cell_width（JetBrains Mono 13px 字号下约 15.6px），若同段连续排字，段内每字
 /// 少 3.1px，5 个字就漂 15px——表现为「中文越打越多，光标离文字越远、
 /// 文字与后面内容之间出现一片空白」。单字符段按终端列定位后，段内无排字，
 /// 每个宽字符精确落在自己的双列起点。
@@ -3838,6 +3881,62 @@ fn scrollback_key(key: &egui::Key, modifiers: egui::Modifiers) -> Option<Scroll>
 mod tests {
     use super::*;
     use mino_core::terminal::{Session, SessionOptions};
+
+    /// `set_font_size` 必须钳制 + 清全部字号相关缓存（回归：曾只改字段，
+    /// 旧字号 Galley 命中导致"字不变大"、旧 cell 宽导致"列定位错乱"）。
+    #[test]
+    fn 字号设置钳制并失效缓存() {
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            std::sync::Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let mut view = TerminalView::new(session);
+        assert_eq!(view.font_size(), TerminalView::DEFAULT_FONT_SIZE);
+
+        // 伪造一份旧字号建的缓存，调大字号后必须全部清空。
+        view.rows_cache.insert(
+            0,
+            RowCache {
+                cell_keys: vec![1],
+                runs: Vec::new(),
+                backgrounds: Vec::new(),
+            },
+        );
+        view.cell_width = 8.0;
+        let applied = view.set_font_size(18.0);
+        assert_eq!(applied, 18.0);
+        assert_eq!(view.font_size(), 18.0);
+        assert!(view.rows_cache.is_empty(), "行缓存必须随字号失效");
+        assert!(view.wide_glyphs.is_empty(), "宽字缓存必须随字号失效");
+        assert_eq!(view.cell_width, 0.0, "cell 必须下帧按新字号重测");
+
+        // 同值重复设置是空操作（不反复清缓存）。
+        view.rows_cache.insert(
+            0,
+            RowCache {
+                cell_keys: vec![1],
+                runs: Vec::new(),
+                backgrounds: Vec::new(),
+            },
+        );
+        view.set_font_size(18.0);
+        assert_eq!(view.rows_cache.len(), 1, "同值设置不应清缓存");
+
+        // 超界钳制。
+        assert_eq!(
+            view.set_font_size(999.0),
+            TerminalView::MAX_FONT_SIZE,
+            "超大字号应钳制到上限"
+        );
+        assert_eq!(
+            view.set_font_size(1.0),
+            TerminalView::MIN_FONT_SIZE,
+            "过小字号应钳制到下限"
+        );
+    }
     /// 高输出吞吐基准（`cargo test -- --ignored --nocapture 行构建吞吐`）。
     ///
     /// 无 criterion 依赖（离线 registry 无该 crate），用 `#[ignore]` 单测
@@ -4589,11 +4688,20 @@ mod tests {
                 _ => runs.push((x, x)),
             }
         }
+        // CJK 区只取前 10 列（5 个中文的双列）：半角 'a' 在第 10 列，
+        // 其墨迹起点紧贴分区线（JetBrains Mono 下实测 a_start=96、
+        // cjk_end=96.3，差 0.3px），用 `< cjk_end` 会把它误判为第 6 个
+        // "中文字"。分区线内收 1px（墨迹光栅取整误差量级）：中文第 5 字
+        // 起点在线左 2*cell ≈ 15px 处，不受影响；'a' 起点在线上，被正确
+        // 归入半角区。找 'a' 时同样用内收后的线（`>= cjk_end` 会先撞上
+        // 'a' 自身左缘 1px 内的取整毛刺簇——上一步已证 'a' 在两种字体下
+        // 都会裂成 (96,102)+(104,110) 两簇）。
         let cjk_end = inner.left() + 10.0 * cell_width;
+        let cjk_edge = cjk_end - 1.0;
         let cjk: Vec<(u32, u32)> = runs
             .iter()
             .copied()
-            .filter(|(start, _)| (*start as f32) < cjk_end)
+            .filter(|(start, _)| (*start as f32) < cjk_edge)
             .collect();
         assert_eq!(
             cjk.len(),
@@ -4611,7 +4719,7 @@ mod tests {
         let a_ink = runs
             .iter()
             .map(|(start, _)| *start)
-            .find(|x| (*x as f32) >= cjk_end)
+            .find(|x| (*x as f32) >= cjk_edge)
             .expect("未找到中文之后的半角字符墨迹");
         let gap = a_ink as f32 - cjk.last().expect("已断言非空").1 as f32;
         assert!(
@@ -5296,10 +5404,12 @@ mod mouse_wheel_tests {
         );
     }
 
-    /// 回归：程序订阅 kitty 键盘（`CSI > 1 u`）后，非可打印键走 CSI-u；
-    /// 可打印字符仍走 legacy（kitty 要求文本键发原文）。
+    /// 回归：程序订阅 kitty 键盘（`CSI > 1 u`）后按键按协议分流——
+    /// Escape 与 ctrl/alt 组合走 CSI-u，无修饰 Enter 与方向键保持 legacy。
+    /// 曾把方向键/功能键编成私用区编号（`ESC[57358u` 实为 CAPS_LOCK），
+    /// omp 等程序解不出“上下左右”（实测 `ESC[57358u` 无反应、`ESC[A` 正常）。
     #[test]
-    fn kitty订阅后按键走csi_u() {
+    fn kitty订阅后按键按协议编码() {
         use mino_core::terminal::{Session, SessionOptions};
         use std::sync::Arc;
         let session = Session::spawn_local(
@@ -5320,7 +5430,23 @@ mod mouse_wheel_tests {
         // 编码层按该 mode 分流（与 `handle_input` 同一 `mode` 变量）。
         assert_eq!(
             keys::encode_key(Key::Enter, Mods::default(), mode).unwrap(),
-            b"\x1b[13u"
+            b"\r"
+        );
+        assert_eq!(
+            keys::encode_key(Key::Up, Mods::default(), mode).unwrap(),
+            b"\x1b[A"
+        );
+        assert_eq!(
+            keys::encode_key(Key::Escape, Mods::default(), mode).unwrap(),
+            b"\x1b[27u"
+        );
+        let ctrl = Mods {
+            ctrl: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            keys::encode_key(Key::Char('a'), ctrl, mode).unwrap(),
+            b"\x1b[97;5u"
         );
         assert_eq!(
             keys::encode_key(Key::Char('a'), Mods::default(), mode).unwrap(),
@@ -5656,6 +5782,98 @@ mod enter_tests {
             "回车未执行命令，终端内容：\n{}",
             grid_text(view.borrow().session())
         );
+    }
+
+    /// 回归：kitty 订阅后按键在 PTY 上产生的真实字节必须符合协议——方向键
+    /// 保持 legacy CSI（`ESC[B`）、无修饰 Enter 发 `\r`、Escape 发 `CSI 27u`。
+    /// 曾把方向键编成私用区编号（`ESC[57359u`＝SCROLL_LOCK），omp 等程序
+    /// 完全收不到“上下左右”（实测 `ESC[57359u` 无反应、`ESC[B` 正常）。
+    #[test]
+    fn kitty订阅后方向键与回车按协议上屏() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn send_special(harness: &mut egui_kittest::Harness, key: egui::Key) {
+            harness.event(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            });
+        }
+        fn wait_for(
+            view: &Rc<RefCell<TerminalView>>,
+            harness: &mut egui_kittest::Harness,
+            needle: &str,
+        ) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while Instant::now() < deadline {
+                harness.step();
+                if grid_text(view.borrow().session()).contains(needle) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(60));
+            }
+            false
+        }
+
+        // 最小被测程序：设 raw 模式后把收到的每个字节以 `<xx>` 回显，
+        // 直接断言 PTY 上真实字节，不依赖 shell 的回显行为。
+        let script = std::env::temp_dir().join(format!("mino-keyecho-{}.py", std::process::id()));
+        let script_body = "#!/usr/bin/env python3\nimport sys, tty\ntty.setraw(0)\nsys.stdout.write('<ready>')\nsys.stdout.flush()\nwhile True:\n    b = sys.stdin.buffer.read(1)\n    if not b:\n        break\n    sys.stdout.write('<%02x>' % b[0])\n    sys.stdout.flush()\n";
+        std::fs::write(&script, script_body).expect("写入回显脚本失败");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("设置脚本权限失败");
+
+        let session = Session::spawn_local(
+            SessionOptions {
+                shell: Some(script.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+        });
+
+        assert!(wait_for(&view, &mut harness, "<ready>"), "回显脚本未就绪");
+
+        // 程序订阅 kitty 键盘协议（DISAMBIGUATE）。
+        view.borrow()
+            .session()
+            .inject_program_output_for_test(b"\x1b[>1u");
+        harness.step();
+
+        // 方向键（Down）：legacy `ESC[B`，不是 CSI-u 编号。
+        send_special(&mut harness, egui::Key::ArrowDown);
+        assert!(
+            wait_for(&view, &mut harness, "<1b><5b><42>"),
+            "方向键未按协议上屏，终端内容：\n{}",
+            grid_text(view.borrow().session())
+        );
+
+        // 无修饰 Enter：`\r`。
+        send_special(&mut harness, egui::Key::Enter);
+        assert!(
+            wait_for(&view, &mut harness, "<0d>"),
+            "回车未按协议上屏，终端内容：\n{}",
+            grid_text(view.borrow().session())
+        );
+
+        // Escape：`CSI 27u`（DISAMBIGUATE 的核心用途）。
+        send_special(&mut harness, egui::Key::Escape);
+        assert!(
+            wait_for(&view, &mut harness, "<1b><5b><32><37><75>"),
+            "Escape 未按协议上屏，终端内容：\n{}",
+            grid_text(view.borrow().session())
+        );
+
+        let _ = std::fs::remove_file(&script);
     }
 
     /// 回归：粘贴 cd 会让输入模型失效，随后执行 pwd 仍应以终端实际输出

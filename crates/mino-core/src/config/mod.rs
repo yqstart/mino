@@ -58,8 +58,16 @@ pub struct ProjectProfile {
     pub command: String,
 }
 
+/// 默认终端字号（pt；`mino-app` 的 `TerminalView::DEFAULT_FONT_SIZE` 同源引用）。
+pub const DEFAULT_FONT_SIZE: f32 = 13.0;
+
+/// serde 默认：老配置缺 `font_size` 字段时回默认（与主题字段同样的兼容约定）。
+fn default_font_size() -> f32 {
+    DEFAULT_FONT_SIZE
+}
+
 /// 全部主机配置。
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HostConfig {
     #[serde(default)]
     pub hosts: Vec<HostProfile>,
@@ -73,6 +81,23 @@ pub struct HostConfig {
     /// 收藏的本地项目（老配置缺字段时默认空）。
     #[serde(default)]
     pub projects: Vec<ProjectProfile>,
+    /// 终端字号（pt；`mino-app` 的快捷键与外观滑杆读写此字段）。
+    ///
+    /// 老配置缺字段时 `default_font_size` 回默认 13（与主题字段同样的
+    /// 兼容约定：缺字段不报错、启动按默认处理）。
+    #[serde(default = "default_font_size")]
+    pub font_size: f32,
+}
+
+impl Default for HostConfig {
+    fn default() -> Self {
+        Self {
+            hosts: Vec::new(),
+            theme: String::new(),
+            projects: Vec::new(),
+            font_size: DEFAULT_FONT_SIZE,
+        }
+    }
 }
 
 impl HostConfig {
@@ -151,6 +176,7 @@ mod tests {
     fn sample() -> HostConfig {
         HostConfig {
             theme: "深蓝".into(),
+            font_size: 15.0,
             hosts: vec![HostProfile {
                 name: "测试服务器".into(),
                 host: "example.com".into(),
@@ -187,6 +213,23 @@ mod tests {
         // 启动按默认主题处理（此前无持久化，升级用户回到第一套）。
         let parsed: HostConfig = toml::from_str("").unwrap();
         assert_eq!(parsed.theme, "");
+    }
+
+    #[test]
+    fn 字号随配置落盘且老配置回默认() {
+        // 新配置的字号必须序列化（否则重启回到 13——主题曾有同类丢失）。
+        let toml_str = toml::to_string_pretty(&sample()).unwrap();
+        assert!(
+            toml_str.contains("font_size"),
+            "终端字号必须随配置落盘：{toml_str}"
+        );
+        // 升级前已存在的 hosts.toml 没有 font_size 字段：不报错、回默认 13。
+        let legacy: HostConfig = toml::from_str("theme = \"深蓝\"\n").unwrap();
+        assert_eq!(legacy.font_size, DEFAULT_FONT_SIZE);
+        // 显式 0/负数等脏值不由解析层兜底（clamp 是应用层的职责），
+        // 但至少不能解析失败。
+        let parsed: HostConfig = toml::from_str("font_size = 0\n").unwrap();
+        assert_eq!(parsed.font_size, 0.0);
     }
 
     #[test]

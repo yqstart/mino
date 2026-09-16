@@ -154,15 +154,19 @@ fn encode_char(c: char, mods: Mods) -> Option<Vec<u8>> {
 ///
 /// 返回 None 表示该按键不产生输出（如纯修饰键组合）。
 ///
-/// kitty 键盘协议（`CSI > flags u`，`DISAMBIGUATE_ESC_CODES` 位）优先：
-/// 程序订阅后，所有“修饰键 + 非可打印键”（Enter/Tab/方向键/功能键/编辑键）
-/// 都走 CSI-u（`ESC[unicode;mods:event u`），不再走 legacy xterm 序列——后者
-/// 在该模式下会有歧义（程序按 kitty 语义解码，legacy 会被误读）。
-/// 可打印字符（`Key::Char`，含 Ctrl/Alt 组合的控制字符形态）永远走 legacy：
-/// kitty 要求文本键仍发原文（`REPORT_ASSOCIATED_TEXT` 另行处理，不在此展开）。
+/// kitty 键盘协议（`CSI > flags u`）优先：程序订阅 `DISAMBIGUATE_ESC_CODES`
+/// （或全量 `REPORT_ALL_KEYS_AS_ESC`，规范中后者隐含前者）后，按键分两类：
+///
+/// - 会产生歧义或 legacy 无法表达的键（Escape、带修饰的 Enter/Tab/Backspace、
+///   ctrl/alt 组合的文本键）改走 CSI-u（`ESC[unicode;mods u`）；
+/// - 无歧义的功能键（方向/Home/End/Insert/Delete/PageUp/PageDown/F1-F12）与
+///   **无修饰**的 Enter/Tab/Backspace/文本键保持 legacy 编码（见 `encode_kitty`
+///   文档：方向键在 kitty 协议里没有 CSI-u 编号，Enter/Tab/Backspace 无修饰时
+///   是规范明文保留的 legacy 例外——保证程序崩溃后还能向 shell 输入 `reset`）。
 pub fn encode_key(key: Key, mods: Mods, mode: TermMode) -> Option<Vec<u8>> {
-    if mode.contains(TermMode::DISAMBIGUATE_ESC_CODES) {
-        if let Some(bytes) = encode_kitty(key, mods) {
+    if mode.intersects(TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_ALL_KEYS_AS_ESC) {
+        let all_keys = mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC);
+        if let Some(bytes) = encode_kitty(key, mods, all_keys) {
             return Some(bytes);
         }
     }
@@ -284,76 +288,79 @@ pub fn encode_key(key: Key, mods: Mods, mode: TermMode) -> Option<Vec<u8>> {
     }
 }
 
-/// kitty 键盘协议 CSI-u 编码（`CSI unicode-key-code:alternate ; mods:event u`）。
+/// kitty 键盘协议 CSI-u 编码（`CSI unicode-key-code ; modifiers u`）。
 ///
-/// 只处理非可打印键：可打印字符返回 `None`，由 legacy 路径继续处理。
-/// unicode 编码按 kitty 规范：Enter=13、Tab=9、Backspace=127、Escape=27、
-/// 功能键 F1-F12 = `0x10 + n`（F1=17…F12=28，对应 `57344+n` 私用区）、
-/// 方向/Home/End/PageUp/PageDown/Insert/Delete 用同名功能键编号
-/// （Insert=2、Delete=3、Left=1…与 legacy `~` 参数同值域，便于记忆）。
-/// 修饰位 = 1+shift+2*alt+4*ctrl（与 xterm `csi_modifier` 同值）；`event`
-/// 恒为 1（press，释放事件由调用方经 `encode_kitty_release` 显式发送）。
-fn encode_kitty(key: Key, mods: Mods) -> Option<Vec<u8>> {
-    // Kitty 要求 Shift+Enter 等仍可区分：unicode=13 + mods 位。
-    // 纯修饰键（legacy 返回 None 的 F13+ 等）同样返回 None。
+/// 只处理需要 CSI-u 的键，其余返回 `None` 交回 legacy 分支：
+///
+/// - Escape：必须 CSI-u（单独 Esc 与转义序列前缀的歧义正是 DISAMBIGUATE 的动机）。
+/// - Enter/Tab/Backspace：**无修饰**时返回 `None`（保持 `\r`/`\t`/`0x7f`）——
+///   规范明文保留该例外（程序崩溃没复位键盘模式时，用户还能输入 `reset`）；
+///   带修饰时 CSI-u，否则修饰信息（Shift+Enter 换行等）无法表达。
+/// - ctrl/alt 组合的文本键：CSI-u（`ctrl+shift+a` 报 `CSI 97;6u`，码点恒为
+///   未移位基准键，移位只由修饰位表达）。
+/// - 其余（方向/Home/End/Insert/Delete/PageUp/PageDown/F1-F12、无修饰文本键）
+///   在 kitty 协议中**仍用 legacy 形式**：功能键没有 CSI-u 编号
+///   （`CSI 1;mods A`、`CSI n;mods ~`、SS3 字母——见 kitty 规范
+///   "Functional key definitions" 表），文本键无修饰时发原文。
+///
+/// `all_keys` 为程序订阅的 `REPORT_ALL_KEYS_AS_ESC`（含 Enter/Tab/Backspace
+/// 与文本键在内全部 CSI-u；功能键的编码形式不受它影响）。
+fn encode_kitty(key: Key, mods: Mods, all_keys: bool) -> Option<Vec<u8>> {
     let code: u32 = match key {
-        Key::Char(_) => return None,
+        Key::Enter | Key::Tab | Key::Backspace if !all_keys && !has_xterm_mods(mods) => {
+            return None;
+        }
+        Key::Escape => 27,
         Key::Enter => 13,
         Key::Tab => 9,
         Key::Backspace => 127,
-        Key::Escape => 27,
-        Key::Up => 57358,
-        Key::Down => 57359,
-        Key::Right => 57360,
-        Key::Left => 57361,
-        Key::End => 57362,
-        // kitty：Begin(keypad 5)=57363，留空不用。
-        Key::Home => 57364,
-        Key::Insert => 57365,
-        Key::Delete => 57366,
-        Key::PageUp => 57369,
-        Key::PageDown => 57370,
-        Key::F(n) => match n {
-            1 => 57345,
-            2 => 57346,
-            3 => 57347,
-            4 => 57348,
-            5 => 57349,
-            6 => 57350,
-            7 => 57351,
-            8 => 57352,
-            9 => 57353,
-            10 => 57354,
-            11 => 57355,
-            12 => 57356,
-            _ => return None,
-        },
+        Key::Char(c) if all_keys || mods.ctrl || mods.alt => unshift_char(c) as u32,
+        _ => return None,
     };
-    let mods_bit = mods.csi_modifier();
-    if mods_bit == 1 && !has_xterm_mods(mods) {
-        // 无修饰：短形态 `CSI code u`（与 legacy 无修饰序列等价信息量，
-        // 但 kitty 程序按 CSI-u 解码；Shift+Tab 等仍带修饰位走长形态）。
-        return Some(format!("\x1b[{code}u").into_bytes());
+    let mods_bit = kitty_modifier(mods);
+    if mods_bit == 1 {
+        // 无修饰：短形态 `CSI code u`（修饰位默认 1，可省略）。
+        Some(format!("\x1b[{code}u").into_bytes())
+    } else {
+        Some(format!("\x1b[{code};{mods_bit}u").into_bytes())
     }
-    Some(format!("\x1b[{code};{mods_bit}u").into_bytes())
 }
 
-/// kitty 键盘释放事件（`CSI code;mods:3 u`，event=3 表释放）。
-///
-/// egui 只给 press 事件（`pressed=true` 才处理，释放帧 `continue` 跳过），
-/// 当前调用方发不出释放；该函数为协议完整性保留（后续释放透传时启用），
-/// 测试覆盖编码正确性。
-#[allow(dead_code)]
-pub fn encode_kitty_release(key: Key, mods: Mods) -> Option<Vec<u8>> {
-    let press = encode_kitty(key, mods)?;
-    // `ESC[code u` → `ESC[code;1:3u`；`ESC[code;mods u` → `ESC[code;mods:3u`。
-    let text = String::from_utf8(press).ok()?;
-    let inner = text.strip_prefix("\x1b[")?.strip_suffix("u")?;
-    let (code, mods_bit) = match inner.split_once(';') {
-        Some((code, mods_bit)) => (code, mods_bit),
-        None => (inner, "1"),
-    };
-    Some(format!("\x1b[{code};{mods_bit}:3u").into_bytes())
+/// kitty 的修饰位：`1 + shift + 2*alt + 4*ctrl + 8*super`（低三位与 xterm 的
+/// `csi_modifier` 同值，super 位只有 kitty 协议有）。
+fn kitty_modifier(mods: Mods) -> u8 {
+    1 + mods.shift as u8 + 2 * mods.alt as u8 + 4 * mods.ctrl as u8 + 8 * mods.super_ as u8
+}
+
+/// CSI-u 里的码点必须是**未移位**的基准键位（kitty 规范：`ctrl+shift+a` 报
+/// `CSI 97;6u` 而不是 `CSI 65;...u`），移位信息只由修饰位表达。
+/// 键位字符来自 `map_char_key`（已按 Shift 产出移位字符），这里还原基准字符。
+fn unshift_char(c: char) -> char {
+    match c {
+        'A'..='Z' => c.to_ascii_lowercase(),
+        '!' => '1',
+        '@' => '2',
+        '#' => '3',
+        '$' => '4',
+        '%' => '5',
+        '^' => '6',
+        '&' => '7',
+        '*' => '8',
+        '(' => '9',
+        ')' => '0',
+        '_' => '-',
+        '+' => '=',
+        '{' => '[',
+        '}' => ']',
+        '|' => '\\',
+        ':' => ';',
+        '"' => '\'',
+        '<' => ',',
+        '>' => '.',
+        '?' => '/',
+        '~' => '`',
+        _ => c,
+    }
 }
 
 /// 将鼠标滚轮事件编码为 xterm 鼠标上报序列。
@@ -617,40 +624,84 @@ mod tests {
     }
 
     #[test]
-    fn kitty模式下非可打印键走csi_u() {
+    fn kitty模式下按键编码符合协议() {
         let kitty = TermMode::DISAMBIGUATE_ESC_CODES;
-        // Enter 无修饰走短形态。
-        assert_eq!(
-            encode_key(Key::Enter, no_mods(), kitty).unwrap(),
-            b"\x1b[13u"
-        );
-        // Shift+Enter 带修饰位（shift=2）。
         let shift = Mods {
             shift: true,
             ..Default::default()
         };
+        let ctrl = Mods {
+            ctrl: true,
+            ..Default::default()
+        };
+        let alt = Mods {
+            alt: true,
+            ..Default::default()
+        };
+        let ctrl_shift = Mods {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+
+        // Escape 必须 CSI-u（单独 Esc 与转义序列前缀去歧义）。
+        assert_eq!(
+            encode_key(Key::Escape, no_mods(), kitty).unwrap(),
+            b"\x1b[27u"
+        );
+        // 无修饰 Enter/Tab/Backspace 保持 legacy 字节（规范保留的例外）。
+        assert_eq!(encode_key(Key::Enter, no_mods(), kitty).unwrap(), b"\r");
+        assert_eq!(encode_key(Key::Tab, no_mods(), kitty).unwrap(), b"\t");
+        assert_eq!(
+            encode_key(Key::Backspace, no_mods(), kitty).unwrap(),
+            b"\x7f"
+        );
+        // 带修饰改走长形态（修饰位 shift=2、ctrl=5）。
         assert_eq!(encode_key(Key::Enter, shift, kitty).unwrap(), b"\x1b[13;2u");
-        // 方向键走功能键编号（Up=57358）。
+        assert_eq!(encode_key(Key::Enter, ctrl, kitty).unwrap(), b"\x1b[13;5u");
+        assert_eq!(encode_key(Key::Tab, shift, kitty).unwrap(), b"\x1b[9;2u");
         assert_eq!(
-            encode_key(Key::Up, no_mods(), kitty).unwrap(),
-            b"\x1b[57358u"
+            encode_key(Key::Backspace, ctrl, kitty).unwrap(),
+            b"\x1b[127;5u"
         );
-        // F1=57345。
+        // 功能键保持 legacy 形式：方向/Home/编辑键/功能键在 kitty 协议里
+        // 没有 CSI-u 编号。曾错误编码为私用区编号（Up→57358 实为 CAPS_LOCK），
+        // omp 解不出方向键（实测 `ESC[57358u` 无反应、`ESC[A` 正常）。
+        assert_eq!(encode_key(Key::Up, no_mods(), kitty).unwrap(), b"\x1b[A");
+        assert_eq!(encode_key(Key::Up, shift, kitty).unwrap(), b"\x1b[1;2A");
+        assert_eq!(encode_key(Key::Left, no_mods(), kitty).unwrap(), b"\x1b[D");
+        assert_eq!(encode_key(Key::Home, no_mods(), kitty).unwrap(), b"\x1b[H");
         assert_eq!(
-            encode_key(Key::F(1), no_mods(), kitty).unwrap(),
-            b"\x1b[57345u"
+            encode_key(Key::Delete, no_mods(), kitty).unwrap(),
+            b"\x1b[3~"
         );
-        // 可打印字符不受影响（仍 legacy）。
+        assert_eq!(encode_key(Key::F(1), no_mods(), kitty).unwrap(), b"\x1bOP");
+        assert_eq!(encode_key(Key::F(5), ctrl, kitty).unwrap(), b"\x1b[15;5~");
+        // ctrl/alt 组合的文本键 CSI-u，码点取未移位基准键（97 而非 65）。
+        assert_eq!(
+            encode_key(Key::Char('a'), ctrl, kitty).unwrap(),
+            b"\x1b[97;5u"
+        );
+        assert_eq!(
+            encode_key(Key::Char('A'), ctrl_shift, kitty).unwrap(),
+            b"\x1b[97;6u"
+        );
+        assert_eq!(
+            encode_key(Key::Char('b'), alt, kitty).unwrap(),
+            b"\x1b[98;3u"
+        );
+        // 无修饰文本键仍发原文。
         assert_eq!(encode_key(Key::Char('a'), no_mods(), kitty).unwrap(), b"a");
-        // 释放事件 event=3。
+        // REPORT_ALL_KEYS_AS_ESC：Enter/Tab/Backspace 与文本键全部 CSI-u，
+        // 功能键编码形式不变。
+        let all = TermMode::REPORT_ALL_KEYS_AS_ESC;
+        assert_eq!(encode_key(Key::Enter, no_mods(), all).unwrap(), b"\x1b[13u");
+        assert_eq!(encode_key(Key::Tab, no_mods(), all).unwrap(), b"\x1b[9u");
         assert_eq!(
-            encode_kitty_release(Key::Enter, no_mods()).unwrap(),
-            b"\x1b[13;1:3u"
+            encode_key(Key::Char('a'), no_mods(), all).unwrap(),
+            b"\x1b[97u"
         );
-        assert_eq!(
-            encode_kitty_release(Key::F(1), shift).unwrap(),
-            b"\x1b[57345;2:3u"
-        );
+        assert_eq!(encode_key(Key::Up, no_mods(), all).unwrap(), b"\x1b[A");
     }
 
     #[test]

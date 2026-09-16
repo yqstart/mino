@@ -51,10 +51,13 @@ pub fn card_frame(theme: &crate::theme::Theme) -> egui::Frame {
         .inner_margin(egui::Margin::symmetric(16, 12))
 }
 
-/// 内嵌信息区（更新说明、错误提示）：比卡片再高半层，8px 圆角。
+/// 内嵌信息区（更新说明、错误提示）：8px 圆角。
+///
+/// 底色必须比所在容器高一层才看得出边界：`card_frame` 底是 `bg_panel`，
+/// 所以这里用 `bg_elevated`（曾同样 `bg_panel`，和卡片融成一块看不出边界）。
 pub fn inset_frame(theme: &crate::theme::Theme) -> egui::Frame {
     egui::Frame::new()
-        .fill(theme.bg_panel)
+        .fill(theme.bg_elevated)
         .stroke(egui::Stroke::new(1.0, theme.border))
         .corner_radius(egui::CornerRadius::same(8))
         .inner_margin(egui::Margin::same(10))
@@ -257,6 +260,22 @@ pub fn secondary_button<'a>(theme: &'a crate::theme::Theme, label: &'a str) -> e
     .min_size(egui::vec2(64.0, BTN_H))
 }
 
+/// 字段行内小操作（"使用当前终端目录"这类填充型辅助动作）。
+///
+/// 不能与保存/取消同排等权：它是某个字段的附属填充，放在字段名同行右端。
+/// 次按钮的缩小版（浮层底 + 细边框 + 22px 高），字号 11.5，比页脚按钮低一层。
+pub fn field_action_button<'a>(theme: &'a crate::theme::Theme, label: &'a str) -> egui::Button<'a> {
+    egui::Button::new(
+        egui::RichText::new(label)
+            .size(11.5)
+            .color(theme.text_secondary),
+    )
+    .fill(theme.bg_elevated)
+    .stroke(egui::Stroke::new(1.0, theme.border))
+    .corner_radius(crate::theme::tokens::RADIUS_ITEM)
+    .min_size(egui::vec2(0.0, 22.0))
+}
+
 /// 危险主按钮（确认删除）：danger 实心 + 白字。
 pub fn danger_button<'a>(theme: &'a crate::theme::Theme, label: &'a str) -> egui::Button<'a> {
     egui::Button::new(
@@ -343,7 +362,6 @@ pub fn paint_avatar(
 }
 
 /// 输入框统一样式：圆角深色底、垂直居中、焦点 accent 边框、错误 danger 边框。
-///
 /// TextEdit 默认 `Align2::LEFT_TOP`（单行输入框文字偏上），这里改为垂直居中。
 ///
 /// **egui 0.36 坑：提供自定义 frame 时 `.margin()` 被整体丢弃**
