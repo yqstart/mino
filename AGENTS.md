@@ -92,7 +92,7 @@ crates/
 - **鼠标上报透传（1000/1002/1003 + SGR 1006）**：程序订阅 `MOUSE_MODE` 后点击/拖拽/释放直接发 xterm 序列（按下→拖拽→释放，按键全程快照一次，释放帧 input 已读不到）；拖拽需 1002+ 才发（只开 1000 不发 Drag）；未订阅走本地选区。滚轮既有分支不变。回归测试 `鼠标上报开启时点击透传程序`
 - **OSC8 超链接**：同 URI 相邻 cell 合并进 `Segment::link`（进 hash 指纹），accent2 下划线 + 悬浮小手 + 单击 `open_url`（`same_tab`）；鼠标上报订阅时点击透传给程序、不抢链接。回归测试 `超链接分段与点击`
 - **OSC52 剪贴板**：store 经 `ClipboardStore` 事件写系统剪贴板（`ClipboardReader::set_clipboard_text`，arboard；失败走 toast，不静默丢），load 用当前剪贴板文本回写（默认 OnlyCopy 下程序发不出 load）。回归测试 `程序复制写入系统剪贴板`
-- **样式细节**：粗体=前景增亮 1/3（egui 无合成粗体，不做描边仿粗）；下划线变体全集（SGR 4/4:2 双线/4:3 波浪/4:4 点/4:5 虚，`UnderlineStyle` 进段合并条件+hash+宽字缓存键），Single 由 Galley 画、其余由 paint 侧矢量补（双线/波浪 8 段正弦/点虚 dash），颜色走 SGR58（无则跟前景）；DECRQM 查 2026 回 `0`（不支持）：alacritty 0.26 的 2026 set/unset 是空实现却回 `2`（已重置），程序会误判支持同步更新——`feed_program_output`（本地注入与远程读循环共用）在解析前改写，混合包暂不拆（omp 查询独包）。回归测试 `下划线变体与颜色进段缓存` / `同步更新查询回不支持` / `铃声与标题重置有响应`
+- **样式细节**：粗体=前景增亮 1/3（egui 无合成粗体，不做描边仿粗）；下划线变体全集（SGR 4/4:2 双线/4:3 波浪/4:4 点/4:5 虚，`UnderlineStyle` 进段合并条件+hash+宽字缓存键），Single 由 Galley 画、其余由 paint 侧矢量补（双线/波浪 8 段正弦/点虚 dash），颜色走 SGR58（无则跟前景）；DECRQM 查 2026 回 `0`（不支持）：alacritty 0.26 的 2026 set/unset 是空实现却回 `2`（已重置），程序据此误判终端支持同步更新并**全程用 BSU/ESU 包裹每次重绘**，而 mino 在 BSU..ESU 之间照常渲染（半成品画面直接上屏，用户现象：在 mino 里跑 omp 交互时"整个输出流都错乱了"）；改写点是 `Listener` 的 `PtyWrite` 应答出口（`rewrite_sync_update_reply`，覆盖本地/远程/测试三条路径），按**任意包内容**匹配——旧实现要求"整包恰好等于查询"，而 omp 实测把 2026 与 kitty/OSC 11/DA1 等混在同一次写入里（`\x1b[?u\x1b[c\x1b]11;?\x07\x1b[c\x1b[?2031h\x1b[?2026$p…`），旧改写从未命中（本地更是完全不经过改写层）。回归测试 `下划线变体与颜色进段缓存` / `同步更新查询回不支持` / `同步更新查询混包也回不支持`（后者在旧实现下失败）/ `铃声与标题重置有响应`
 
 ### 工作目录跟踪（`mino-app/src/workdir.rs`）
 
@@ -188,7 +188,7 @@ crates/
 ## 验证
 
 ```bash
- cargo test --workspace -- --test-threads=1   # 单元 + ssh 集成 + sftp 集成 + UI 渲染 + 字体链 + 标签页（含标题栏双击 zoom/拖拽） + 双击交互 + 表单默认值 + 设置弹窗 + scrollback + 完整应用回车 + TOFU 主机密钥校验 + F 键修饰编码 + SFTP 时间换算 + 目录单击选中再击进入 + ssh 快捷菜单 + 中文宽字符列对齐（像素级）+ 标签标题跟随当前目录 + IME候选窗跟随光标 + 终端能力应答（OSC 颜色查询/焦点上报，需 python3）+ 崩溃日志归档 + 后台会话异步挂载 + 写回队列有界 + 死锁回归；注意 sftp/ssh 集成测试需先 `bash scripts/test-sshd.sh start`
+ cargo test --workspace -- --test-threads=1   # 单元 + ssh 集成 + sftp 集成 + UI 渲染 + 字体链 + 标签页（含标题栏双击 zoom/拖拽） + 双击交互 + 表单默认值 + 设置弹窗 + scrollback + 完整应用回车 + TOFU 主机密钥校验 + F 键修饰编码 + SFTP 时间换算 + 目录单击选中再击进入 + ssh 快捷菜单 + 中文宽字符列对齐（像素级）+ 标签标题跟随当前目录 + IME候选窗跟随光标 + 终端能力应答（OSC 颜色查询/焦点上报/同步更新 2026 混包改写，需 python3）+ 全屏程序字节流下行缓存一致（5 字节分片注入 vim/omp 类序列）+ 崩溃日志归档 + 后台会话异步挂载 + 写回队列有界 + 死锁回归；注意 sftp/ssh 集成测试需先 `bash scripts/test-sshd.sh start`
 cargo clippy --workspace --all-targets   # 零警告
 cargo fmt --all
 ```

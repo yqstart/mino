@@ -610,8 +610,13 @@ impl TerminalView {
             };
             live.insert(grid_line);
             let already = self.gpu_uploaded.get(&grid_line);
+            // 槽位可能因缓冲扩容整体失效（`RowBuffers` 会换缓冲并清空槽位），
+            // 此时"已上传"记录不再成立——必须重传，否则该行在 GPU 上没有
+            // 顶点、本帧不会绘制（表现为整行消失且不自行恢复）。
             let stale = match already {
-                Some(prev) => !std::sync::Arc::ptr_eq(prev, mesh),
+                Some(prev) => {
+                    !std::sync::Arc::ptr_eq(prev, mesh) || !self.gpu_rows.has_row(grid_line)
+                }
                 None => true,
             };
             if stale {
@@ -1288,8 +1293,8 @@ impl TerminalView {
                     continue;
                 };
                 // 有缓存时先做指纹比较：未变化则整行跳过（不解析、不分词、不 layout）。
-                if let (Some(range), Some(c)) = (compare_range, cached) {
-                    if !row_keys_changed(
+                let changed = if let (Some(range), Some(c)) = (compare_range, cached) {
+                    row_keys_changed(
                         grid,
                         grid_line,
                         self.cols as usize,
@@ -1298,11 +1303,9 @@ impl TerminalView {
                         default_bg,
                         Some(range),
                         &c.cell_keys,
-                    ) {
-                        continue;
-                    }
+                    )
                 } else if let Some(c) = cached {
-                    if !row_keys_changed(
+                    row_keys_changed(
                         grid,
                         grid_line,
                         self.cols as usize,
@@ -1311,9 +1314,13 @@ impl TerminalView {
                         default_bg,
                         None,
                         &c.cell_keys,
-                    ) {
-                        continue;
-                    }
+                    )
+                } else {
+                    // 无缓存：必须构建。
+                    true
+                };
+                if !changed {
+                    continue;
                 }
                 // 锁内读取该网格行构建段与 hash（此时已知内容确有变化）。
                 let data = build_line_data(
@@ -5566,7 +5573,8 @@ mod mouse_wheel_tests {
     /// 回归：DECRQM 查 2026 必须回“不支持”（`CSI ? 2026 ; 0 $ y`），不能回
     /// “已重置”（`…; 2 $ y`）。回 2 会让 omp 判定终端支持同步更新并全程包
     /// BSU/ESU，而 alacritty 0.26 的 VT 层对 2026 是空实现（set/unset 都是
-    /// `()`），回执与能力不一致。
+    /// `()`），回执与能力不一致。改写点在 `Listener` 的应答出口（统一覆盖
+    /// 本地 / 远程 / 测试三条路径）。
     #[test]
     fn 同步更新查询回不支持() {
         use mino_core::terminal::{Session, SessionOptions};
@@ -5594,6 +5602,187 @@ mod mouse_wheel_tests {
             reply.contains("\x1b[?2026;0$y"),
             "2026 应回不支持（0），实际：{reply:?}"
         );
+    }
+
+    /// 回归：DECRQM 2026 的“不支持”改写必须在**混包**下也生效。
+    ///
+    /// 旧实现只在“整包恰好等于 `\x1b[?2026$p`”时改写，而真实 TUI（omp 实测
+    /// 为 `\x1b[?u\x1b[c\x1b]11;?\x07\x1b[c\x1b[?2031h\x1b[?2026$p\x1b[c…`）
+    /// 把 2026 查询与 kitty、OSC 11、DA1 等混在同一次写入里——旧改写从未
+    /// 命中，alacritty 回 `2`（已重置），程序据此判定终端支持同步更新并
+    /// 全程用 BSU/ESU 包裹每次重绘；alacritty 对 2026 是空实现、mino 逐帧
+    /// 渲染，BSU..ESU 之间的半成品画面直接上屏（用户现象：在 mino 里跑
+    /// omp 交互时“整个输出流都错乱了”）。
+    #[test]
+    fn 同步更新查询混包也回不支持() {
+        use mino_core::terminal::{Session, SessionOptions};
+        use std::sync::Arc;
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = TerminalView::new(session);
+        // omp 的真实查询混包（kitty + OSC 11 + DA1 + 2026 DECRQM + 其他 DECRQM）。
+        view.session().inject_program_output_for_test(
+            b"\x1b[?u\x1b[c\x1b]11;?\x07\x1b[c\x1b[?2031h\x1b[?2026$p\x1b[c\x1b[?2048$p\x1b[c",
+        );
+        let events = view.session().drain_events();
+        let reply: String = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::PtyWrite(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            reply.contains("\x1b[?2026;0$y"),
+            "混包里的 2026 查询也必须回不支持（0），实际：{reply:?}"
+        );
+        assert!(
+            !reply.contains("\x1b[?2026;2$y"),
+            "不得回“已重置”（2）——程序会据此启用 BSU/ESU 包裹重绘。实际：{reply:?}"
+        );
+    }
+
+    /// 回归：TUI 式字节流（alt screen、EL/ECH 局部重写、CJK 宽字符、滚动
+    /// 区域）不得让 `rows_cache` 与终端真相脱节。
+    ///
+    /// 增量渲染只按 `Term::damage` 给出的区间/行号比较逐列指纹，一旦区间或
+    /// 行号映射出错，屏幕会停在旧内容而终端状态早已前进（用户现象即"输出流
+    /// 错乱"）。这里把字节流按 37 字节切片注入——既模拟 PTY 分片，也让边界
+    /// 刻意落在转义序列中间——每片渲染一帧后断言每个显示行的逐列指纹与
+    /// 全量重建一致。
+    ///
+    /// 会话必须是**哑程序**（不跑真实 shell）：真实 shell 的 prompt/回显会在
+    /// "渲染之后、断言之前"改写终端，断言看到的是"渲染后又被改过"的屏幕。
+    #[test]
+    fn 全屏程序字节流下行缓存与终端一致() {
+        use mino_core::terminal::{Session, SessionOptions};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::sync::Arc;
+
+        /// 每一显示行的缓存指纹必须与终端真相一致（不一致即增量渲染漏更新）。
+        fn assert_rows_in_sync(view: &TerminalView, frame: usize) {
+            let term_arc = view.session().term();
+            let guard = term_arc.lock();
+            let content = guard.renderable_content();
+            let offset = content.display_offset as i32;
+            let colors = content.colors;
+            let grid = guard.grid();
+            let cols = grid.columns();
+            let theme = crate::theme::current_theme();
+            let default_fg = colors[NamedColor::Foreground].unwrap_or(theme.term_fg);
+            let default_bg = theme.term_bg;
+            let default_bg_egui = to_egui(default_bg);
+            for v in 0..view.rows as i32 {
+                let grid_line = v - offset;
+                let expect = build_line_data(
+                    grid,
+                    grid_line,
+                    cols,
+                    colors,
+                    default_fg,
+                    default_bg,
+                    default_bg_egui,
+                );
+                let cache = view
+                    .rows_cache
+                    .get(&grid_line)
+                    .unwrap_or_else(|| panic!("帧 {frame}: 显示行 {v} 缺行缓存"));
+                let diff: Vec<usize> = cache
+                    .cell_keys
+                    .iter()
+                    .zip(&expect.cell_keys)
+                    .enumerate()
+                    .filter(|(_, (a, b))| a != b)
+                    .map(|(i, _)| i)
+                    .collect();
+                assert!(
+                    diff.is_empty(),
+                    "帧 {frame}: 显示行 {v}(网格行 {grid_line}) 缓存与终端不一致，差异列 {diff:?}"
+                );
+            }
+        }
+
+        // 哑程序：占住 PTY 但零输出、不回显（外部写入会污染断言）。
+        let dumb = std::env::temp_dir().join(format!("mino-dumb-{}.sh", std::process::id()));
+        std::fs::write(
+            &dumb,
+            "#!/bin/sh\nstty raw -echo 2>/dev/null\nexec sleep 100000\n",
+        )
+        .expect("写哑程序失败");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dumb, std::fs::Permissions::from_mode(0o755)).ok();
+        }
+        let session = Session::spawn_local(
+            SessionOptions {
+                shell: Some(dumb.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+        });
+        harness.run_steps(4);
+
+        // vim/omp 类的关键绘制模式：alt screen、彩色与 CJK 文本、EL 局部重写、
+        // ECH 擦除、宽字符覆盖半角、滚动区域滚动、反向索引、行尾写入、退出。
+        let stream: &[u8] = concat!(
+            "\x1b[?1049h\x1b[2J\x1b[H",
+            "\x1b[1;1H\x1b[7m== HEADER ==\x1b[0m",
+            "\x1b[2;1Ha line with ascii",
+            "\x1b[3;1H中文混合 content テスト",
+            "\x1b[4;1H\x1b[4munderline\x1b[24m\x1b[38;5;208morange 256color\x1b[39m",
+            "\x1b[5;1H0123456789ABCDEF\x1b[5;1H\x1b[K\x1b[33mREWRITTEN LINE 5\x1b[39m",
+            "\x1b[6;1Habcdefghij\x1b[6;3H\x1b[4X",
+            "\x1b[7;1Habcd\x1b[7;2H中",
+            "\x1b[2;6r\x1b[9;1H\n\n\n\x1b[r",
+            "\x1b[1;1H\x1b[3S",
+            "\x1b[10;1Hprefix-\x1b[10;1Hnew",
+            "\x1b[11;1H\x1b[Ktrailing text at the very end",
+            "\x1b[?1049l\x1b[1;1Hback on main screen",
+        )
+        .as_bytes();
+
+        // 5 字节切片：模拟最坏情况的 PTY 分片——边界必然落在转义序列中间，
+        // 解析器状态若不能跨片保留，半截序列会被当作文本吞进屏幕。
+        for (idx, chunk) in stream.chunks(5).enumerate() {
+            view.borrow()
+                .session()
+                .inject_program_output_for_test(chunk);
+            harness.step();
+            assert_rows_in_sync(&view.borrow(), idx + 1);
+            // 解析正确性：屏幕不得出现转义序列的残骸。解析器状态跨片丢失时
+            // 半截序列（`[3;`、`1H`、`0m` 之类）会被当文本写进屏幕——文本
+            // 内容本身由中文与字母构成，正常路径不会出现 `[`。
+            let visible: String = {
+                let view_ref = view.borrow();
+                view_ref
+                    .rows_cache
+                    .values()
+                    .flat_map(|cache| cache.runs.iter())
+                    .map(|run| run.galley.text())
+                    .collect::<Vec<_>>()
+                    .join("")
+            };
+            assert!(
+                !visible.contains('['),
+                "帧 {}: 屏幕出现转义序列残骸（解析器状态未跨片保留）：{visible:?}",
+                idx + 1
+            );
+        }
+        std::fs::remove_file(&dumb).ok();
     }
 
     #[test]

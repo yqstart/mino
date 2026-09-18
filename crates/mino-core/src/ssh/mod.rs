@@ -26,8 +26,7 @@ use tokio::sync::{
 
 use crate::config::Auth;
 use crate::terminal::{
-    feed_program_output, notify_wakeup, EventHandler, Listener, Session, SessionEvent, Shared,
-    TermSize,
+    notify_wakeup, EventHandler, Listener, Session, SessionEvent, Shared, TermSize,
 };
 
 use known_hosts::{default_known_hosts_path, HostKeyVerifier};
@@ -479,14 +478,10 @@ async fn remote_loop(
                 match msg {
                     Some(ChannelMsg::Data { data }) => {
                         log::debug!("远程收到 {} 字节", data.len());
-                        if feed_program_output(&term, &shared, &data) {
-                            notify_wakeup(&shared, &on_event);
-                        } else {
-                            let mut guard = term.lock();
-                            parser.advance(&mut *guard, &data);
-                            drop(guard);
-                            notify_wakeup(&shared, &on_event);
-                        }
+                        let mut guard = term.lock();
+                        parser.advance(&mut *guard, &data);
+                        drop(guard);
+                        notify_wakeup(&shared, &on_event);
                     }
                     Some(ChannelMsg::ExtendedData { data, .. }) => {
                         // stderr 也喂入解析器（保持输出顺序完整）。

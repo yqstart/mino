@@ -249,31 +249,28 @@ pub(crate) struct Shared {
     pub(crate) wakeup: AtomicBool,
 }
 
-/// 程序侧输出 → VT 解析器之前的改写层（本地测试注入与远程读循环共用）。
+/// 把 DECRQM 2026（同步更新）的应答改写为“不支持”。
 ///
-/// DECRQM 查 2026（同步更新）改写为“不支持”：alacritty 0.26 对 2026 的
-/// set/unset 是空实现（`()`），却按“已重置”回 `CSI ? 2026 ; 2 $ y`——程序
-/// （omp）据此判定支持同步更新并全程包 BSU/ESU，而终端实际不支持，回执与
-/// 能力不一致。改写只动这一条查询（`ModeState::NotSupported = 0`，与 VT 层
-/// 同格式 `CSI ? mode ; state $ y`），其它字节原样透传。
-/// 返回 true 表示已消费（调用方不再进解析器，但仍需发一次 Wakeup 重绘信号）。
-pub(crate) fn feed_program_output(
-    term: &Arc<FairMutex<Term<Listener>>>,
-    shared: &Arc<Shared>,
-    bytes: &[u8],
-) -> bool {
-    if bytes == b"\x1b[?2026$p" {
-        shared
-            .pending
-            .lock()
-            .unwrap()
-            .push(SessionEvent::PtyWrite("\x1b[?2026;0$y".to_string()));
-        return true;
+/// alacritty 0.26 对 2026 的 set/unset 是空实现（`()`），DECRQM 却按
+/// “已重置”（`2`）回执——程序（omp 实测、nvim 类 TUI）据此判定终端支持
+/// 同步更新并逐帧包 BSU/ESU，而 mino 在 BSU..ESU 之间照常渲染中间态，
+/// 半成品画面直接上屏。回执必须与能力一致：统一回 `0`（NotSupported，
+/// 与 VT 层同格式 `CSI ? mode ; state $ y`）。
+///
+/// 只动这一条应答（其他模式的能力回执是正确的），且覆盖任意包内容——
+/// 程序常把 2026 查询与 kitty/OSC 11/DA1 等混在同一次写入里到达，
+/// 按“整包等于查询”匹配的旧实现从未命中（该缺陷的根因）。
+fn rewrite_sync_update_reply(text: &mut String) {
+    const MARK: &str = "\x1b[?2026;";
+    if !text.contains(MARK) {
+        return;
     }
-    // 混合包（含 2026 查询与其它输出同一 TCP 段到达）暂不拆包：整包透传，
-    // VT 层对 2026 回 2（旧行为）。omp 的 DECRQM 是独立短查询，实测独包。
-    let _ = term;
-    false
+    for state in ["1$y", "2$y", "3$y", "4$y"] {
+        let from = format!("{MARK}{state}");
+        if text.contains(&from) {
+            *text = text.replace(&from, "\x1b[?2026;0$y");
+        }
+    }
 }
 
 /// alacritty 事件监听器：把事件记录到共享状态并通知回调。
@@ -352,7 +349,15 @@ impl EventListener for Listener {
                         true
                     }
                 }
-                Event::PtyWrite(text) => {
+                Event::PtyWrite(mut text) => {
+                    // DECRQM 2026（同步更新）应答必须回"不支持"：alacritty 的
+                    // VT 层对 2026 的 set/unset 是空实现（不缓冲任何输出），
+                    // 却按"已重置"回 `CSI ? 2026 ; 2 $ y`——程序（omp 实测、
+                    // nvim 类 TUI）据此判定终端支持同步更新并全程用 BSU/ESU
+                    // 包裹每次重绘；mino 在 BSU..ESU 之间照常渲染，半成品画面
+                    // 直接上屏（用户现象："整个输出流都变错乱了"）。此处是
+                    // 本地/远程/测试三条路径的唯一应答出口，统一改写。
+                    rewrite_sync_update_reply(&mut text);
                     // PtyWrite 是终端能力应答（DA/kitty/DECRQM/OSC 查询回执），
                     // 不是用户数据：单条很短（<100B），但多 tab 高输出并发时
                     // 后台标签长期不消费会无界追加；旧注释称"用户数据"有误。
@@ -752,12 +757,18 @@ impl Session {
     /// 这类 DECSET 必须从程序侧进入解析器；公开的 `Term` API 没有 mode
     /// setter，只能走字节流注入。
     pub fn inject_program_output_for_test(&self, bytes: &[u8]) {
-        if feed_program_output(&self.term, &self.shared, bytes) {
-            return;
+        // 解析器必须**跨调用持久**（与远程 `remote_loop` 同一语义）：分片
+        // 边界常常落在转义序列中间，逐次新建 `Processor` 会丢掉半截状态，
+        // 后半段被当作文本吞进屏幕（按 PTY 分片注入字节的测试会因此看到
+        // 转义残骸）。
+        thread_local! {
+            static PARSER: std::cell::RefCell<Processor<StdSyncHandler>> =
+                std::cell::RefCell::new(Processor::new());
         }
-        let mut parser: Processor<StdSyncHandler> = Processor::new();
-        let mut guard = self.term.lock();
-        parser.advance(&mut *guard, bytes);
+        PARSER.with(|parser| {
+            let mut guard = self.term.lock();
+            parser.borrow_mut().advance(&mut *guard, bytes);
+        });
     }
 
     /// 当前窗口标题。

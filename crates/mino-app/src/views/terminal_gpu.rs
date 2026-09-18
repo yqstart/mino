@@ -466,6 +466,14 @@ impl RowBuffers {
         self.i_end = 0;
     }
 
+    /// 该行当前是否有可用槽位。
+    ///
+    /// 缓冲扩容（`ensure_buffers`）会换缓冲并清空全部槽位，调用方的
+    /// “已上传”记录随之失效——必须用它复查，否则该行在 GPU 上没有顶点。
+    pub fn has_row(&self, grid_line: i32) -> bool {
+        self.slots.contains_key(&grid_line)
+    }
+
     /// 原子缓冲与索引缓冲（未创建时为 `None`）。
     pub fn buffers(&self) -> (Option<&wgpu::Buffer>, Option<&wgpu::Buffer>) {
         (self.vbo.as_ref(), self.ibo.as_ref())
