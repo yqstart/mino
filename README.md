@@ -6,18 +6,20 @@ Mino 是基于 Rust + egui 的轻量级终端与 SFTP 可视化工具。
 
 ## 产品定位
 
-主打**轻量、快速、简洁**的终端体验：本地 / 远程（SSH）终端 + 可视化 SFTP 文件管理，交互参照 Termius / WindTerm 的双栏分屏，视觉采用低干扰的深色界面与紫青渐变标记。核心功能集已收敛，后续迭代围绕性能、流畅度与视觉细节持续打磨。
+主打**轻量、快速、简洁**的终端体验：本地 / 远程（SSH）终端 + 可视化 SFTP 文件管理 + 项目快捷打开；交互是「终端 | SFTP」可拖拽双栏分屏，视觉参照 Tabby 终端的分层深色风格（三套主题：石墨绿 / 深蓝 / 霓虹），品牌标记为 `>_`。核心功能集已收敛，后续迭代围绕性能、流畅度与视觉细节持续打磨。
 
 ## 功能概览
 
 - **本地终端**：基于 [alacritty_terminal](https://github.com/alacritty/alacritty) 生产级内核（VT 仿真 + PTY），256 色、宽字符、滚动、括号粘贴、闪烁光标
 - **SSH 远程终端**：密码 / 私钥认证（支持口令），xterm-256color PTY
-- **SFTP 可视化**：终端 | SFTP 双栏分屏（可拖拽），目录导航、右键菜单操作、上传 / 下载带进度条、删除 / 重命名 / 新建目录（带确认对话框）
-- **主机管理**：主机配置持久化（`~/.config/mino/hosts.toml`），单击选中、双击连接
-- **三套主题**：`深色`（默认）/ `深蓝` / `霓虹`，每套含独立终端调色板（Catppuccin Mocha 16 色 + xterm 256 色表）
-- **品牌**：Mino `>_` 标记、低对比层级、紧凑标签与无持续重绘的轻量动效
-- **快捷键**：⌘N 新建连接、⌘T 新建本地终端、⌘W 关闭标签、⌘1-⌘9 切换标签、⌘, 打开设置、⌘+ / ⌘- 缩放终端字号、⌘0 重置字号、⌥1-⌥3 切换主题
-- **全 Rust 无 C 依赖**：单二进制、启动 < 300ms
+- **SFTP 可视化**：终端 | SFTP 双栏分屏（可拖拽、默认收起），目录导航（单击选中、双击进入）、Shift / ⌘ 多选、右键菜单（上传 / 下载 / 重命名 / 删除 / 新建文件夹 / 刷新 / 定位到终端目录 `⌘⇧L`）、上传下载进度与结果徽标（带确认对话框）
+- **主机管理**：主机配置持久化（`~/.config/mino/hosts.toml`，0600 权限、原子写入、损坏自动备份），单击选中、双击连接；标签栏 `>_` 快捷入口单击主机即连
+- **项目收藏**：`⌘D` 把当前终端目录收藏为项目，`⌘O` 打开项目面板（搜索 + ↑↓ 选择 + 回车在新标签打开）
+- **三套主题**：`深色`（默认，石墨绿）/ `深蓝` / `霓虹`，每套含独立终端调色板（16 色 + xterm 256 色表），切换即持久化
+- **品牌**：黑底圆角 `>_` 标记（白色 `>` + 磷光绿光标块），与应用图标同构图；低对比层级、紧凑标签与无持续重绘的轻量动效
+- **字体**：打包 JetBrains Mono 四字重（Regular / Italic / Bold / BoldItalic）+ 系统 CJK fallback（PingFang / STHeiti），中文与提示符符号开箱即用
+- **快捷键**：⌘N 新建连接、⌘T 新建本地终端、⌘O 项目面板、⌘D 收藏当前目录、⌘W 关闭标签、⌘1-⌘9 切换标签、⌘, 打开设置、⌘+ / ⌘- 缩放终端字号、⌘0 重置字号、⌥1-⌥3 切换主题
+- **全 Rust 无 C 依赖**：单二进制（终端内核 alacritty_terminal，SSH / SFTP 为 russh + russh-sftp）
 
 ## 环境要求
 
@@ -52,7 +54,7 @@ cargo run
 测试与静态检查：
 
 ```bash
-cargo test --workspace
+cargo test --workspace -- --test-threads=1   # UI 测试必须串行（kittest 争抢全局状态）
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```
@@ -60,8 +62,9 @@ cargo fmt --all --check
 集成测试（SSH / SFTP 链路）需要本地测试 sshd，一键脚本：
 
 ```bash
-./scripts/test-sshd.sh start
-cargo test --workspace
+./scripts/test-sshd.sh start     # 127.0.0.1:2222，公钥认证，含 sftp subsystem
+cargo test --workspace -- --test-threads=1
+./scripts/test-sshd.sh stop
 ```
 
 ### macOS 安装

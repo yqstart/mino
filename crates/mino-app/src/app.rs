@@ -1,7 +1,7 @@
 //! Mino 应用主体：布局、连接管理与状态。
 //!
-//! 视觉参照 Warp：分层深色背景、终端绿与琥珀强调、圆角幽灵按钮、
-//! 标签页底部指示条与扫光动效（动效细节见 `crate::anim`）。
+//! 视觉参照 Tabby 终端（tabby-core theme.vars.scss）：分层深色背景、终端绿与琥珀强调、
+//! 扁平控件、标签页底部指示条与扫光动效（动效细节见 `crate::anim`）。
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -3752,7 +3752,7 @@ impl MinoApp {
         }
     }
 
-    /// 渲染标签页栏（Warp 风格圆角标签 + 底部指示条）。
+    /// 渲染标签页栏（Tabby 风圆角标签 + 底部指示条）。
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
         let theme = crate::theme::current_theme();
         // 标签栏即窗口拖拽区：整行注册底层 click_and_drag 背景（先注册，

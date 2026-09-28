@@ -3328,7 +3328,7 @@ fn push_background(backgrounds: &mut Vec<BgRect>, col: usize, color: Color32, de
     });
 }
 
-/// 解析终端颜色为 egui 颜色（Catppuccin 调色板 + xterm 256 色表）。
+/// 解析终端颜色为 egui 颜色（主题调色板 + xterm 256 色表）。
 ///
 /// 优先级：程序直接指定颜色（Spec）> OSC 动态覆盖（term.colors）> 内置调色板。
 fn resolve_color(color: AColor, colors: &Colors, default: Rgb, bold: bool) -> Color32 {
