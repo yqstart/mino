@@ -318,6 +318,30 @@ pub fn apply_theme(ctx: &Context, theme: &Theme) {
     ctx.set_style_of(egui::Theme::Dark, style);
 }
 
+/// 滑块（`egui::Slider`）专用配色。
+///
+/// egui 的滑块没有独立的轨道配色项：轨道恒定使用
+/// `widgets.inactive.bg_fill`，手柄填充按交互态取 `bg_fill`——两者同源。
+/// 全局该字段是面板色（`bg_panel`），而设置弹窗卡片（`dialog::card_frame`）
+/// 底同为面板色：轨道与卡片**完全同色**，只能看到手柄的 1px 描边轮廓
+/// （用户现象「滑块轨道看不清」）。调用方用 `ui.scope` 局部应用本函数，
+/// 不影响其它控件：浅色半透明轨道 + accent 已填充（`trailing_fill`
+/// 取 `selection.bg_fill`）+ 亮描边手柄，拖拽时手柄填充 accent。
+pub fn apply_slider_style(style: &mut egui::Style, theme: &Theme) {
+    style.visuals.slider_trailing_fill = true;
+    // 已填充段（滑块当前值一侧）用不透明 accent，与主题色一致。
+    style.visuals.selection.bg_fill = theme.accent;
+    // 未填充轨道与静止态手柄填充：白色 15% 叠加，在三种深色卡片上都可辨。
+    let track = Color32::from_rgba_unmultiplied(0xff, 0xff, 0xff, 0x26);
+    let widgets = &mut style.visuals.widgets;
+    widgets.inactive.bg_fill = track;
+    widgets.inactive.fg_stroke = Stroke::new(1.5, theme.text_primary);
+    widgets.hovered.bg_fill = theme.accent;
+    widgets.hovered.fg_stroke = Stroke::new(1.5, Color32::WHITE);
+    widgets.active.bg_fill = theme.accent;
+    widgets.active.fg_stroke = Stroke::new(1.5, Color32::WHITE);
+}
+
 // ---- 终端调色板：三套 ----
 
 const PALETTE_GRAPHITE: [Rgb; 16] = TERM_PALETTE_16;

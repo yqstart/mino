@@ -1981,7 +1981,20 @@ impl MinoApp {
                                         .fixed_decimals(1)
                                         .suffix(" pt")
                                         .show_value(true);
-                                        if ui.add(slider).changed() {
+                                        // 滑块配色单独覆盖（见
+                                        // `theme::apply_slider_style` 的说明：全局
+                                        // 控件底色调在弹窗卡片上看不清轨道）。
+                                        let changed = ui
+                                            .scope(|ui| {
+                                                crate::theme::apply_slider_style(
+                                                    ui.style_mut(),
+                                                    theme,
+                                                );
+                                                ui.add(slider)
+                                            })
+                                            .inner
+                                            .changed();
+                                        if changed {
                                             let font_ctx = ui.ctx().clone();
                                             // 拖动中每步都即时生效+落盘（静默，
                                             // 不弹 toast），松手后提示一次。
@@ -6164,6 +6177,74 @@ mod theme_tests {
     /// 一个测试的 `set_theme` 会污染另一个测试的 `current_theme()` 断言。
     /// 本模块两个测试串行化，避免"单跑过、并跑随机挂"。
     static THEME_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// 回归：设置弹窗里的字号滑块必须画得出轨道（egui 滑块的轨道固定取
+    /// 全局 `widgets.inactive.bg_fill`＝面板色，而弹窗卡片底同为面板色，
+    /// 轨道与卡片完全同色——用户反馈「轨道看不清」，肉眼只剩手柄的 1px
+    /// 描边）。断言两点：未填充轨道明显亮于卡片背景、已填充段是主题 accent。
+    #[test]
+    fn 字号滑块轨道在卡片上可辨() {
+        use kittest::Queryable;
+
+        let _guard = THEME_TEST_LOCK.lock().unwrap();
+        let config_path = test_config_path("slider-rail");
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            MinoApp::new_with_config(cc, config_path.clone())
+        });
+        harness.run_steps(6);
+        // ⌘, 打开设置弹窗；外观卡片在主机/项目卡片之后，先滚到滑块再取样。
+        harness.event(egui::Event::Key {
+            key: egui::Key::Comma,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        for _ in 0..3 {
+            harness.step();
+        }
+        harness
+            .root()
+            .query_by_role(accesskit::Role::Slider)
+            .expect("设置弹窗里应存在字号滑块")
+            .scroll_to_me();
+        for _ in 0..3 {
+            harness.step();
+        }
+        let rect = harness
+            .root()
+            .query_by_role(accesskit::Role::Slider)
+            .expect("设置弹窗里应存在字号滑块")
+            .rect();
+        let img = harness.render().expect("渲染失败");
+        let theme = crate::theme::current_theme();
+        // kittest 默认 pixels_per_point = 1：逻辑坐标可直接当像素索引。
+        let px = |x: f32, y: f32| -> [u8; 4] {
+            let p = img.get_pixel(x.round() as u32, y.round() as u32);
+            [p[0], p[1], p[2], p[3]]
+        };
+        let channel = |p: [u8; 4]| p[0].max(p[1]).max(p[2]) as i32;
+        // 卡片底：滑块 rect 顶缘附近（轨道上沿之上，无其它控件）。
+        let card = px(rect.right() - 4.0, rect.top() + 4.0);
+        // 未填充轨道：右端内侧（字号 14pt 靠范围左端，右侧必为未填充段）。
+        let rail = px(rect.right() - 6.0, rect.center().y);
+        assert!(
+            channel(rail) - channel(card) >= 12,
+            "滑块轨道与卡片背景对比不足：rail={rail:?} card={card:?}"
+        );
+        // 已填充段：左端内侧应是主题 accent（trailing_fill）。
+        let filled = px(rect.left() + 6.0, rect.center().y);
+        let near = |p: [u8; 4], c: egui::Color32| {
+            let d = |a: u8, b: u8| (i32::from(a) - i32::from(b)).abs();
+            d(p[0], c.r()) <= 24 && d(p[1], c.g()) <= 24 && d(p[2], c.b()) <= 24
+        };
+        assert!(
+            near(filled, theme.accent),
+            "滑块已填充段应为主题 accent：filled={filled:?} accent={:?}",
+            (theme.accent.r(), theme.accent.g(), theme.accent.b())
+        );
+        std::fs::remove_file(&config_path).ok();
+    }
 
     /// 三套主题切换并渲染截图（视觉验证用）。
     #[test]
