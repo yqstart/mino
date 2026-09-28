@@ -270,8 +270,6 @@ pub struct RowBuffers {
     free_v: Vec<(u64, u64)>,
     free_i: Vec<(u64, u64)>,
     slots: HashMap<i32, RowSlot>,
-    /// 本帧上传的字节数（HUD 读数）。
-    pub uploaded_bytes: usize,
 }
 
 const V_START: u64 = 4 * 1024 * 1024;
@@ -289,7 +287,6 @@ impl Default for RowBuffers {
             free_v: Vec::new(),
             free_i: Vec::new(),
             slots: HashMap::new(),
-            uploaded_bytes: 0,
         }
     }
 }
@@ -441,7 +438,6 @@ impl RowBuffers {
         let i_bytes_slice = bytemuck::cast_slice(&mesh.indices);
         gpu.queue
             .write_buffer(ibo, slot.i_off, &i_bytes_slice[..i_bytes as usize]);
-        self.uploaded_bytes += v_bytes as usize + i_bytes as usize;
         if let Some(slot) = self.slots.get_mut(&grid_line) {
             slot.v_len = v_bytes;
             slot.i_len = i_bytes;

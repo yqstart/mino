@@ -29,7 +29,6 @@ crates/
     ├── src/main.rs           # 入口 + 字体装配（同步主字体，CJK fallback 走后台 CjkFontLoader）+ 圆角注入
     ├── src/native.rs         # macOS 原生窗口定制（无边框窗口整体圆角，AppKit layer）
     ├── src/app.rs            # MinoApp：tabs 列表 + 设置弹窗（show_settings）+ 布局/连接管理/对话框/快捷键；本地会话后台创建（poll_local_spawn 帧内挂载）
-    ├── src/perf.rs           # 性能 HUD（帧耗时/FPS/Shape 数/重建行/上传字节，⌥P 切换）
     ├── src/theme.rs          # 三套深色主题
     ├── src/workdir.rs        # 根据 PTY 输入跟踪本地/远程 cd 工作目录
     └── src/views/
@@ -79,7 +78,6 @@ crates/
 - **图集换代看门狗（双条件）**：行顶点 uv 与图集尺寸强绑定，按「尺寸变化 **或** 填充率骤降」检测——epaint 整份重建字体系统时尺寸可能一模一样但字形位置全变（只比尺寸会漏，表现为字符错位/串码）；图集还会在同帧更晚的位置（其它控件首次用到新字形）继续变大，因此必须在**下一帧开头**再比一次当前尺寸与 `mesh_atlas_size`，不一致立即整屏重建并请求重绘
 - **逐行缓冲 + 区间分配器**：`RowBuffers` 每行独立槽位（容量翻倍冗余、`free_v`/`free_i` 空洞合并），容量不足时返回 false（该行本帧不可见）；uniform 步长按 `min_uniform_buffer_offset_alignment` 放大（`TerminalGpu::new` 读设备 limit），每行一个 `Locals`，**上限 `MAX_ROWS = 256`**
 - **`screen_size` 必须是整个渲染目标的点尺寸**（窗口），不是终端内容区：着色器用「绝对坐标 ÷ 全屏尺寸」→ NDC，传内容区尺寸会把坐标放大（文字整体拉伸错位）
-- 性能 HUD（⌥P）显示每帧 Shape 数 / 重建行 / 复用行 / 上传字节——渲染优化的唯一可观察证据（帧耗时区分不了「CPU 侧重建」与「GPU 侧上传」）
 
 ### 终端能力应答（v1.0.8 起，`terminal/mod.rs` + `terminal_view.rs` + `keys.rs`）
 -
@@ -166,9 +164,8 @@ crates/
 - 主题背景跟随当前深色主题；`apply_theme` 同步系统深色主题（`ctx.set_theme`）
 - 主题快捷键：⌥1-⌥3 快速切换三套主题
 - **新建连接表单**（`connect_dialog`）：默认用户名 `root`、端口 `22`（`ConnectForm` 手写 `Default`，可修改）；输入框统一走 `form_input` helper——圆角深色底（`bg_elevated`）+ 焦点 accent 边框 + `vertical_align(Center)`（**TextEdit 默认 `Align2::LEFT_TOP` 文字偏上，单行输入框必须居中**）
-- **状态栏**（底部）：左侧会话状态（状态点 + 会话标题 + SFTP 状态/错误）——会话标题与标签栏同源（本地 = 当前目录末级名，hover 看全路径，见上条 `TerminalTab::title()`），**右下角快捷键提示块已移除**（曾显示 ⌘B/⌘T/⌘W/⌘N/⌥1-3 五个圆角块，用户要求删除）；主题快捷键 ⌥1-3 仍在（勿写 ⌥1-4）
+- **状态栏**（底部）：左侧会话状态（状态点 + 会话标题 + SFTP 状态/错误）——会话标题与标签栏同源（本地 = 当前目录末级名，hover 看全路径，见上条 `TerminalTab::title()`），**右下角快捷键提示块已移除**（曾显示 ⌘B/⌘T/⌘W/⌘N/⌥1-3 五个圆角块，用户要求删除）；主题快捷键 ⌥1-3 仍在（勿写 ⌥1-4）；右侧不再有常显读数（曾为性能 HUD，已按要求移除）
 - **持续重绘治理（v0.7）**：egui `Spinner` 内部每帧 `request_repaint` 强制 60fps 全帧重绘，全部替换为 `loading_hint`（app.rs 静态圆点 + 文字，零重绘）：连接等待页/状态栏 SFTP 连接中/更新安装中/SFTP 面板加载中；**toast 降频**：滑入动画期（~0.32s）16ms 重绘，动画结束后仅 `request_repaint_after(剩余时长)` 安排到期关闭帧（曾 4 秒全程 60fps）；**Bell 脉冲降频（v1.1.2）**：0.6s 脉冲只在到期时刻 `request_repaint_after(剩余时长)` 安排一帧，不再每帧 `request_repaint`——omp 任务通知走 BEL，频繁 BEL 会把窗口续成永久 60fps 冻窗
-- **性能 HUD（`perf.rs`，v0.7）**：`⌥P` 切换（设置弹窗「关于」卡片也有开关），状态栏右侧常显**最多六项核心读数**（帧耗时/FPS/构建耗时/Shape 数/行重建「重建/总数」/上传 KB，滑动平均）；布局/绘制/首帧/终端就绪等次要读数只进悬浮提示（`details()`），避免状态栏过长；`MinoApp::ui` 开头 `perf.begin_frame()`、末尾 `end_frame()`，活动标签页 `terminal.last_timing()` 喂分段统计；terminal_view 内 `build_start/layout_start/paint_start` 三段打点；**v1.1.2 新增** Shape 数 / 重建行 / 复用行 / GPU 上传字节（`last_stats()`）与「首帧」「终端就绪」启动耗时——帧耗时区分不了「CPU 侧重建」与「GPU 侧上传」，规模计数是渲染优化的唯一可观察证据；**默认开启**（测试 `性能 HUD 启动时应默认展示`），不影响 kittest 截图断言
 - **SFTP 面板**（tabby 形式）：`Panel::right("sftp_panel")` **必须是顶层面板（先于 CentralPanel 注册）**——嵌套在 CentralPanel 内时面板状态会被顶层布局污染，面板错位覆盖终端（表现为"面板打不开"）；**默认收起只显示终端，终端右上角悬浮 `sftp_floating_button`（app.rs 顶层函数，"SFTP" 圆角按钮，点击切换 `TerminalTab.sftp_open`）**；展开用官方 `show_collapsible`（滑动动画，收起后右缘保留细拖拽把手可拖开）；尺寸 `default_size(窗口 40%)/min_size(260)/max_size(窗口 50%)`——曾固定 340px（大窗口下偏窄）与 45% 上限（用户要求 40% 默认、50% 上限）；曾 resizable 无上限拖到 ~70% 窗口宽把终端压成窄条，max_size 每帧按 `viewport_rect().width()*0.50` 钳制；面板 frame 内边距 `Margin::symmetric(12, 10)`；**工具栏三行布局**（`sftp_view.rs`）：①标题行=左 `SFTP · 主机名`（truncate 截断占剩余宽）+ 右缘「刷新」按钮（right_to_left 分居两端，曾与「删除」重叠）②操作行=`horizontal_wrapped` 五按钮（上传/下载/新建目录/重命名/删除，空间不足自动换行——曾单行 horizontal 塞全部按钮，340 宽面板溢出右缘被裁剪）③路径行=「上级」按钮 + 路径 truncate 截断（曾长路径溢出被裁）；按钮统一 `sftp_tool_button` 紧凑样式（11.5px 文字 + bg_elevated 底 + 细边框 + RADIUS_ITEM 圆角）；回归测试 `工具栏按钮不截断不重叠`（340 宽内各按钮 rect 不越界且两两不相交）；`poll_sftp` 处理 `Closed` 事件（连接中断时不能停在"连接中…"），失败写入 `sftp_error` 字段由状态栏**持久显示**（toast 一闪而过易忽略），下次 `start_connect` 清空；**文件列表列布局**（`sftp_view.rs`）：名称列左对齐、大小/时间列右对齐（均 `.halign(egui::Align::LEFT/RIGHT)` 显式声明，避免依赖默认对齐），`new_child` 子 Ui 需 `spacing_mut().item_spacing.x = 0.0` 归零自动间距（否则子项间默认 8px 叠加导致列位错乱），列间距用 add_space 精确控制，名称 `Label::truncate()` 截断；**`cell_width` 必须用 `'0'` 字符宽（数字等宽字体的真实字宽）而非空格宽**——空格 ≈ 0.25em、数字 ≈ 0.6em，用空格宽估算列宽会导致时间列 "2026-08-14" 被截到 "2026-01"（曾用空格宽 + 11 字符列宽只能容 7 字符数字）；大小/时间列宽 12 字符等宽（足够显示 10 字符日期 + 缓冲），名称列 = 总宽 - 12×2 - 12；回归测试 `文件列表列对齐`、`sftp面板默认收起悬浮按钮切换`；kittest 截图布局断言：上传按钮 left > 400（面板在右半侧）、齿轮按钮 right > 400（标签栏最右侧）；**2026-08 面板升级与目录导航**：①标题行加 accent2 状态点（与状态栏同款）②路径改为**圆角"地址条"**（bg_elevated 底 + 细边框 + 内部 truncate）③文件列表**表头行首留 22px 图标位**（`icon_pad`，表头与行共用基准）、行高 22、表头 11px muted ④**".." 行**置顶（点击返回上级目录，文件管理器通用习惯）⑤**行首矢量图标**（`paint_entry_icon`：文件夹 accent2 填充提手+圆角主体、文件细描边轮廓——矢量绘制避免 emoji 字形随字体变化）⑥目录名 text_primary/文件名 text_secondary，选中 accent_soft 底 + 左侧 2px accent 竖条（与主机行一致）、hover 白 8% 叠加 ⑦传输记录用主题语义色（success/danger/accent2）⑧**目录导航 = 单击选中、再次单击已选中的目录进入**（不用 `double_clicked`——egui 多击计数被无关点击污染，双击时灵时不灵）；**行点击必须显式 `ui.interact(row_rect, 稳定 Id, Sense::click())` 且注册在列内容之后**——`allocate_exact_size` 的自动 Id 帧间漂移 + `new_child` 子 Ui 叠加，行点击从未生效（"点击文件夹进不去"的根因，kittest 探针逐步定位：snap_clicked 指向行内容区而非行交互区）；hover 用 `pointer.hover_pos()` 判定（子 Ui 会抢走 `response.hovered()`）；目录进入后 `loading=true` 显示静态加载指示（v0.7 起非 spinner，零持续重绘），相关测试用 `run_steps(6)` 显式步进（`Harness::run()` 会超 max_steps）；回归测试 `单击选中再次单击进入目录`（断言第一次单击只选中无 List 命令、再次单击发 `List("/workspace")`、文件两次单击不导航）、`文件列表列对齐` 已适配 ".." 行（"—" 共 3 个：.. 时间/.. 大小/目录大小）
 
 > 当前 SFTP 交互约定（2026-09-10）：目录和 `..` 行均为单击选中、普通双击导航；传输进度平时只显示标题行右缘的**状态徽标**（点击展开/收起详情卡片）：进行中=accent2 圆底+白色上箭头+总进度弧环、全部完成=success 圆底+白对勾、有失败=danger 圆底+白感叹号；新传输开始自动展开详情，上传全部结束后详情卡片显示「关闭」按钮（只清理已结束的上传）。
@@ -204,4 +201,4 @@ cargo fmt --all
 
 窗口圆角为运行时原生效果（kittest 无真实窗口句柄，无法单测断言）；验证方式：`cargo run -p mino-app` 后 `screencapture -l <CGWindowID>` 截窗，四角像素应全透明（RGBA alpha=0）。
 
-**自管 GPU 渲染路径 kittest 覆盖不到**（测试环境无 wgpu 后端 → 走 egui 回退）：须实机验证——`cargo run -p mino-app`，HUD（⌥P）空闲帧 `shapes` 应为个位数、`上传` 接近 0，且实测输入/中文/滚动/大输出渲染正常。
+**自管 GPU 渲染路径 kittest 覆盖不到**（测试环境无 wgpu 后端 → 走 egui 回退）：须实机验证——`cargo run -p mino-app`，实测输入/中文/滚动/大输出渲染正常。

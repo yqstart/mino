@@ -300,21 +300,11 @@ pub struct MinoApp {
     install_dmg_path: Option<PathBuf>,
     /// 安装脚本启动时间，用于检测脚本无响应。
     install_started_at: Option<f64>,
-    /// 性能 HUD 是否显示（`⌥P` 切换；默认展示）。
-    show_perf_hud: bool,
     /// 终端自管 GPU 渲染资源（`None` = 无 wgpu 后端，走 egui Shape 路径）。
     terminal_gpu: Option<std::sync::Arc<crate::views::terminal_gpu::TerminalGpu>>,
-    /// 帧耗时统计（UI 线程打点）。
-    perf: crate::perf::PerfStats,
     /// 中文 fallback 字体后台加载器（生产路径由 `main` 注入；测试为空，
     /// 中文由需要它的测试自己 `setup_fonts` + `wait_ready`）。
     cjk_fonts: Option<crate::CjkFontLoader>,
-    /// 应用构造时刻（启动打点基准：首帧耗时、终端就绪耗时）。
-    created_at: std::time::Instant,
-    /// 首帧耗时是否已记录（只记一次）。
-    first_frame_reported: bool,
-    /// 终端就绪耗时是否已记录（首个会话挂上标签时记一次）。
-    terminal_ready_reported: bool,
     /// 后台创建中的本地终端会话（PTY fork + shell 启动不再堵住首帧）。
     pending_local: Option<PendingLocalSpawn>,
 }
@@ -813,13 +803,8 @@ impl MinoApp {
             install_result_path: None,
             install_dmg_path: None,
             install_started_at: None,
-            show_perf_hud: true,
-            perf: crate::perf::PerfStats::new(),
             terminal_gpu,
             cjk_fonts: None,
-            created_at: std::time::Instant::now(),
-            first_frame_reported: false,
-            terminal_ready_reported: false,
             pending_local: None,
         };
         // 启动时自动检查更新（后台线程，延迟 3 秒，静默）。
@@ -931,11 +916,6 @@ impl MinoApp {
         let tab = Box::new(TerminalTab::new(id, "本地终端".into(), view));
         self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;
-        if !self.terminal_ready_reported {
-            self.terminal_ready_reported = true;
-            self.perf
-                .set_terminal_ready_ms(self.created_at.elapsed().as_secs_f32() * 1000.0);
-        }
     }
 
     /// 处理后台创建中的本地终端：就绪即挂标签，失败即提示。
@@ -2142,30 +2122,6 @@ impl MinoApp {
                                         {
                                             self.start_update_check(false, ctx);
                                         }
-                                    });
-                                    ui.add_space(10.0);
-                                    dialog::hairline(ui);
-                                    ui.add_space(10.0);
-                                    // 性能 HUD 开关（调试用）。
-                                    ui.horizontal(|ui| {
-                                        ui.label(
-                                            egui::RichText::new("性能 HUD")
-                                                .size(12.0)
-                                                .color(theme.text_secondary),
-                                        );
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                let mut enabled = self.show_perf_hud;
-                                                if ui
-                                                    .checkbox(&mut enabled, "")
-                                                    .on_hover_text("显示帧耗时 / FPS（⌥P 切换）")
-                                                    .changed()
-                                                {
-                                                    self.show_perf_hud = enabled;
-                                                }
-                                            },
-                                        );
                                     });
                                 });
                             });
@@ -4087,18 +4043,12 @@ impl MinoApp {
             if let Some(e) = &self.sftp_error {
                 ui.separator();
                 status_dot(ui, theme.danger, false);
-                // 截断显示，避免长错误把右侧 HUD 挤出状态栏；hover 看全文。
+                // 截断显示，避免长错误把状态栏撑满；hover 看全文。
                 ui.add(
                     egui::Label::new(egui::RichText::new(e).size(11.5).color(theme.danger))
                         .truncate(),
                 )
                 .on_hover_text(format!("{e}\n\n重新连接主机可再次尝试"));
-            }
-            // 性能 HUD 与左侧会话状态同处一行：剩余空间右对齐。
-            if self.show_perf_hud {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    render_perf_hud(ui, &self.perf);
-                });
             }
         });
     }
@@ -4872,13 +4822,8 @@ impl eframe::App for MinoApp {
         let ctx = ui.ctx().clone();
         // 缓存 ctx 供非 UI 回调使用（如复制 tab 时构造 Session）。
         self.last_ctx = ctx.clone();
-        self.perf.begin_frame();
 
         // ==================== 快捷键 ====================
-        // ⌥P：切换性能 HUD。
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::P)) {
-            self.show_perf_hud = !self.show_perf_hud;
-        }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::N))
             && !self.show_new_conn
         {
@@ -4986,12 +4931,6 @@ impl eframe::App for MinoApp {
             if loader.poll(&ctx) {
                 ctx.request_repaint();
             }
-        }
-        if !self.first_frame_reported {
-            // 首帧耗时打点：覆盖"窗口出现→第一帧内容"的真实启动延迟。
-            self.first_frame_reported = true;
-            self.perf
-                .set_startup_ms(self.created_at.elapsed().as_secs_f32() * 1000.0);
         }
         self.poll_local_spawn(&ctx);
         for tab in &mut self.tabs {
@@ -5142,32 +5081,7 @@ impl eframe::App for MinoApp {
                 }
             }
         }
-
-        // ==================== 性能 HUD ====================
-        self.perf.end_frame();
-        // 活动标签页的终端分段耗时喂给统计（无标签页时为 0 不影响）。
-        if let Some(tab) = self.tabs.get(self.active_tab) {
-            let (build, layout, paint) = tab.terminal.last_timing();
-            self.perf.add_build(build);
-            self.perf.add_layout(layout);
-            self.perf.add_paint(paint);
-            let (shapes, rebuilt, reused, upload) = tab.terminal.last_stats();
-            self.perf
-                .add_terminal_counts(shapes, rebuilt, reused, upload);
-        }
     }
-}
-
-/// 渲染性能 HUD 文本（底部状态栏右侧，常显六项核心读数，详情进悬浮提示）。
-fn render_perf_hud(ui: &mut egui::Ui, perf: &crate::perf::PerfStats) {
-    let theme = crate::theme::current_theme();
-    ui.label(
-        egui::RichText::new(perf.summary())
-            .monospace()
-            .size(11.0)
-            .color(theme.text_secondary),
-    )
-    .on_hover_text(format!("{}（⌥P 切换）", perf.details()));
 }
 
 #[cfg(test)]
@@ -5210,11 +5124,6 @@ mod tests {
             "结果到达后 pending 应被消费"
         );
         assert_eq!(harness.state().tabs.len(), 2, "新会话应挂上第二个标签");
-        assert!(
-            harness.state().perf.details().contains("终端"),
-            "终端就绪打点应记录：{}",
-            harness.state().perf.details()
-        );
         std::fs::remove_file(&config_path).ok();
     }
 
@@ -7209,56 +7118,6 @@ mod settings_tests {
                 .next()
                 .is_none(),
             "设置弹窗未打开时不应渲染主机管理"
-        );
-    }
-
-    /// 性能 HUD 默认显示在底部状态栏右侧。
-    #[test]
-    fn 性能_hud默认显示在状态栏右侧() {
-        use kittest::Queryable;
-
-        let mut harness = egui_kittest::Harness::new_eframe(|cc| MinoApp::new(cc));
-        harness.run_steps(6);
-
-        assert!(harness.state().show_perf_hud, "性能 HUD 启动时应默认展示");
-        assert!(
-            harness
-                .ctx
-                .memory(|memory| memory.area_rect(egui::Id::new("perf_hud")))
-                .is_none(),
-            "性能 HUD 不应再创建独立悬浮区域"
-        );
-
-        let hud = harness
-            .root()
-            .query_all_by_label_contains("帧")
-            .next()
-            .expect("状态栏中应显示性能 HUD 文本");
-        let viewport = harness.ctx.viewport_rect();
-        assert!(
-            hud.rect().right() > viewport.right() - 300.0,
-            "性能 HUD 应位于状态栏右侧，实际 right={} viewport right={}",
-            hud.rect().right(),
-            viewport.right()
-        );
-        assert!(
-            hud.rect().bottom() > viewport.bottom() - 40.0,
-            "性能 HUD 应位于底部状态栏，实际 bottom={} viewport bottom={}",
-            hud.rect().bottom(),
-            viewport.bottom()
-        );
-        // 与左侧会话标题同处一行（垂直中心对齐）。启动目录为 home，
-        // 标题显示为 `~`（末级目录名的 home 缩写）。
-        let title = harness
-            .root()
-            .query_all_by_label("~")
-            .find(|node| node.rect().bottom() > viewport.bottom() - 40.0)
-            .expect("状态栏中应显示会话标题");
-        assert!(
-            (hud.rect().center().y - title.rect().center().y).abs() < 8.0,
-            "性能 HUD 应与会话标题同处一行，hud 中心 y={} title 中心 y={}",
-            hud.rect().center().y,
-            title.rect().center().y
         );
     }
 

@@ -261,15 +261,6 @@ pub struct TerminalView {
     /// 多次系统调用；目录在一帧内不可能变化，用极短 TTL 摊掉这些调用。
     /// 需要即时真值的入口（⌘D 收藏、SFTP 定位）走 `fresh_local_directory`。
     dir_cache: std::cell::RefCell<Option<(String, std::time::Instant)>>,
-    /// 分段耗时打点（性能 HUD 读数；默认不共享，仅本视图内部使用）。
-    last_build_ms: f32,
-    last_layout_ms: f32,
-    last_paint_ms: f32,
-    /// 本帧的规模计数 `(shapes, 重建行数, 复用行数, 上传字节)`。
-    ///
-    /// 渲染优化的唯一可观察证据：帧耗时无法区分「CPU 侧重建」与
-    /// 「GPU 侧上传」，两者优化手段完全不同。
-    last_stats: (usize, usize, usize, usize),
     /// 本帧待提交的 Shape 列表（复用缓冲）。
     ///
     /// 逐 Shape 调 `Painter::add` 每次都要取 Context 写锁并做一次 Vec push；
@@ -449,10 +440,6 @@ impl TerminalView {
             remote_home: None,
             had_focus: false,
             dir_cache: std::cell::RefCell::new(None),
-            last_build_ms: 0.0,
-            last_layout_ms: 0.0,
-            last_paint_ms: 0.0,
-            last_stats: (0, 0, 0, 0),
             shapes_scratch: Vec::new(),
             damaged_bits: Vec::new(),
             lines_scratch: Vec::new(),
@@ -619,7 +606,6 @@ impl TerminalView {
         };
 
         // 行内容变化的行重传顶点；被移出视口的行释放槽位。
-        self.gpu_rows.uploaded_bytes = 0;
         let mut live: std::collections::HashSet<i32> = std::collections::HashSet::new();
         // 内容变化的行按指针判脏重传（`gpu_row_meshes` 以网格行号索引）。
         for v in 0..self.rows as usize {
@@ -707,16 +693,6 @@ impl TerminalView {
         self.shapes_scratch.push(egui::Shape::Callback(
             eframe::egui_wgpu::Callback::new_paint_callback(inner, callback),
         ));
-    }
-
-    /// 本帧终端渲染分段耗时（性能 HUD 读取；未渲染时均为 0）。
-    pub fn last_timing(&self) -> (f32, f32, f32) {
-        (self.last_build_ms, self.last_layout_ms, self.last_paint_ms)
-    }
-
-    /// 本帧规模计数 `(shapes, 重建行数, 复用行数, 上传字节)`（性能 HUD 读取）。
-    pub fn last_stats(&self) -> (usize, usize, usize, usize) {
-        self.last_stats
     }
 
     /// 注入自管 GPU 渲染资源（`None` = 回退 egui Shape 路径）。
@@ -1232,7 +1208,6 @@ impl TerminalView {
         let mut cursor_color: Option<Color32> = None;
         let cursor_shape: CursorShape;
         let display_offset: usize;
-        let build_start = std::time::Instant::now();
         // 闪烁重绘意图：锁内置位、锁外统一 `request_repaint_after`。
         let need_blink_repaint: bool;
         // 锁序：持 Term 锁期间禁止调 Context（含 `input`/`request_repaint`，
@@ -1382,13 +1357,11 @@ impl TerminalView {
             // 归还位集缓冲（容量复用，下帧 `clear` + `resize` 零分配）。
             self.damaged_bits = damaged;
         }
-        self.last_build_ms = build_start.elapsed().as_secs_f32() * 1000.0;
         if need_blink_repaint {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
 
         // ==================== 绘制（锁外） ====================
-        let layout_start = std::time::Instant::now();
         // 行网格顶点烘焙了绝对行位（`inner.min.y + v*cell_height`），
         // 显示位置整体变化即失效：滚动（display_offset）、可见行数、
         // 内容区原点任一变化都会让所有行的顶点落到错误位置。
@@ -1450,8 +1423,6 @@ impl TerminalView {
                 rebuilt_rows_scratch.push(display_row);
             }
         }
-        // 重建行数（HUD 读数：滚动/输出时应远小于视口行数）。
-        let rebuilt_rows = lines_data.len();
         // 归还行数据缓冲（`clear` 后复用容量；`LineData` 内的 Vec 已被移走）。
         lines_data.clear();
         self.lines_scratch = lines_data;
@@ -1526,9 +1497,7 @@ impl TerminalView {
             }
         }
         self.rebuilt_display_rows = rebuilt_rows_scratch;
-        self.last_layout_ms = layout_start.elapsed().as_secs_f32() * 1000.0;
 
-        let paint_start = std::time::Instant::now();
         let origin = inner.min;
         let selection_bg = Color32::from_rgba_unmultiplied(
             theme.accent.r(),
@@ -1698,16 +1667,7 @@ impl TerminalView {
         self.paint_ime_preedit(ui, inner, cursor_rect);
         // 一次性提交本帧全部终端 Shape：逐 Shape 的 `Painter::add` 每次都要
         // 取 Context 写锁，`extend` 把满屏 10^3 次写锁合并为一次。
-        let shape_count = self.shapes_scratch.len();
         ui.painter().extend(self.shapes_scratch.drain(..));
-        self.last_stats = (
-            shape_count,
-            rebuilt_rows,
-            (self.rows as usize).saturating_sub(rebuilt_rows),
-            self.gpu_rows.uploaded_bytes,
-        );
-        // 绘制耗时（背景 rect + 文本 galley + 光标形状）。
-        self.last_paint_ms = paint_start.elapsed().as_secs_f32() * 1000.0;
 
         // 缓存上限：滚动浏览大量历史时防止无限增长，超限只保留当前可见行。
         // 自管路径的行网格同样按网格行号裁剪，否则被裁的行会留在 GPU 缓冲里
@@ -4539,7 +4499,7 @@ mod tests {
             guard.grid_mut().scroll_display(Scroll::Delta(4));
         }
         harness.step();
-        let rebuilt = view.borrow().last_stats().1;
+        let rebuilt = view.borrow().rebuilt_display_rows.len();
         assert!(
             rebuilt < rows_visible / 2,
             "滚动一屏内的小步长不应重建整屏：重建 {rebuilt} 行 / 可见 {rows_visible} 行"
@@ -5906,10 +5866,10 @@ mod mouse_wheel_tests {
         harness.run_steps(4);
 
         // 先让首屏内容进入缓存，随后在内容不变的前提下伪造一次「图集换代」。
-        // 只跑一帧：看门狗在该帧内清缓存并全量重建，`last_stats` 读的就是它。
+        // 只跑一帧：看门狗在该帧内清缓存并全量重建，`rebuilt_display_rows` 读的就是它。
         view.borrow_mut().mesh_atlas_size = [0, 0];
         harness.step();
-        let rebuilt = view.borrow().last_stats().1;
+        let rebuilt = view.borrow().rebuilt_display_rows.len();
         assert!(
             rebuilt > 0,
             "图集尺寸变化后，内容未变的帧也必须重建行（实际重建 {rebuilt} 行）"
@@ -5917,7 +5877,7 @@ mod mouse_wheel_tests {
 
         // 对照：下一帧无损坏行，不应再重建（证明上一步来自失效而非每帧重建）。
         harness.step();
-        let steady = view.borrow().last_stats().1;
+        let steady = view.borrow().rebuilt_display_rows.len();
         assert!(
             steady < rebuilt,
             "稳定帧不应重建与换代帧同样多的行（稳定 {steady} vs 换代 {rebuilt}）"

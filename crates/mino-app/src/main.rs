@@ -5,7 +5,6 @@ mod app;
 pub mod clip_image;
 pub mod dialog;
 mod native;
-pub mod perf;
 pub mod theme;
 pub mod views;
 mod workdir;
