@@ -67,6 +67,7 @@ crates/
 - **v1.1.2 追加减负（egui 回退路径同样生效）**：一行 N 个 `CachedRun` 合成为**单个 `Mesh`** 提交（`row_meshes`，键为显示行号——mesh 顶点烘焙了绝对行位，滚动/尺寸变化整体重合成，`rows_cache` 保留）；按 **damage 的列区间**只重建受损列（`damaged_bits`：光标移动只损 1-2 列，曾整行 80-200 cell 重算）；Shape 一次 `Painter::extend` 批量提交（`shapes_scratch`，替代逐 Shape `add` 的上千次 Context 写锁）；装饰网格线 tessellate 结果缓存（`grid_lines_cache`）；输入法预编辑串 Galley 缓存（`ime_preedit_cache`）；标签/状态栏目录读 `effective_local_directory`（300ms TTL，每帧 4 次系统调用 → 1 次；需要即时真值的入口走 `fresh_local_directory`）
 - **一帧输入合并**：输入事件先攒进 `pending_writes` 再一次 `session.write`（曾每个按键/粘贴分片一次通道发送）
 - **resize 节流**：拖拽窗口时 `resize_grid` 每帧更新本地网格（字不越界），后台通知（本地 SIGWINCH / 远程 SSH `window_change`）按 **50ms** 合并 + trailing 补发（`notify_backend_size`）
+- **网格最小尺寸钳制 + 远端尺寸补发窗口（2026-09-28）**：窗口被缩到极小时（拖拽到底、最小化/分辨率变化瞬态），**不得把 1-2 行的尺寸通知远端**——vim/tmux 等全屏程序会据此把界面重绘成 1 行，而恢复尺寸的通知一旦未生效（发送失败/极小窗口下没有渲染帧），程序就永久停在该状态（用户现象：SSH + vim 编辑文件「内容只剩一行、滚动只更新那一行」；实证：跳过恢复通知即完整复现）。①尺寸计算处 `MIN_TERMINAL_COLS=20`/`MIN_TERMINAL_ROWS=4` 钳制，**网格与 `window_change` 同源**（超出窗口的部分由渲染自然裁剪）；②远端尺寸同步从「8 帧重试」改为**时间窗口**（`REMOTE_RESIZE_SYNC_DURATION=2s` 内每个渲染帧补发，`remote_resize_sync_until`），覆盖「窗口被遮挡/最小化时不出帧」导致一次都没送达的情况；回归测试 `极小窗口下终端网格尺寸被钳制`（120×60 窗口 → cols/rows ≥ 钳制值且网格同源，旧实现下只有 10 列）
 - 远程逐 SSH 数据包唤醒合并为每帧一次（`notify_wakeup` 标志位，由 `drain_events` 复位）：`cat` 大文件时重绘请求不再与包数同阶
 
 ### 终端自管 GPU 渲染（v1.1.2 起，`views/terminal_gpu.rs` + `terminal_gpu.wgsl`）

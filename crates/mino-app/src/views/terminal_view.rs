@@ -188,10 +188,27 @@ impl TerminalSelection {
 /// 终端内容内边距（文本与面板边缘的间距，参照 Terminal.app 观感）。
 const PADDING: f32 = 10.0;
 
-/// SSH 的 `window_change` 是异步发送的。连接刚建立或终端刚改变布局时，
-/// 远端 shell 可能在收到第一次尺寸通知前就开始输出动态内容（例如 npm 的
-/// 进度条）。在尺寸稳定后的几帧内重复发送，避免远端仍按旧宽度换行。
-const REMOTE_RESIZE_SYNC_FRAMES: u8 = 8;
+/// 终端网格的最小列数（窗口被缩到极小时的钳制值）。
+const MIN_TERMINAL_COLS: usize = 20;
+
+/// 终端网格的最小行数（窗口极小时的钳制值）。
+///
+/// 窗口被缩到极小时（拖拽到底、最小化/分辨率变化的瞬态），如果如实把
+/// 1-2 行发给远端（`window_change`），vim/tmux 等全屏程序会把界面重绘成
+/// 1 行并可能停在该状态——恢复尺寸的通知一旦没生效，程序不会自己重绘
+/// （用户现象：文件内容只剩一行、滚动只更新那一行）。同时 alacritty 的
+/// 网格被裁剪会丢弃可见区之外的行。钳到最小可用尺寸后远端不会被置于
+/// 不可用布局，超出窗口的部分由渲染自然裁剪。
+const MIN_TERMINAL_ROWS: usize = 4;
+
+/// 远端尺寸同步的持续时长（`window_change` 由 SSH 后台异步发送）。
+///
+/// 尺寸稳定后在这段时间内的**每个渲染帧**都补发当前尺寸：连接刚建立或
+/// 布局刚变化时，远端可能在收到第一次通知前就开始动态输出（例如 npm 的
+/// 进度条），随后需要按新宽度重绘。旧实现按帧数重试（8 帧），若这几帧
+/// 恰好没有渲染（窗口被遮挡/最小化时不出帧）或发送失败，正确尺寸可能
+/// 一次都没送达，远端将永久停在旧尺寸。
+const REMOTE_RESIZE_SYNC_DURATION: Duration = Duration::from_millis(2000);
 
 /// 终端视图。
 pub struct TerminalView {
@@ -351,8 +368,8 @@ pub struct TerminalView {
     /// Bell 脉冲到期时间（`SessionEvent::Bell` 时记录；paint 时若未到期则在
     /// 终端左上角画一个短暂圆点，omp 的任务完成/错误提示音不再静默丢失）。
     bell_until: Option<std::time::Instant>,
-    /// 远程 PTY 尺寸同步重试次数（`window_change` 由 SSH 后台异步发送）。
-    remote_resize_sync_frames: u8,
+    /// 远端尺寸同步截止时刻（`Some` = 仍在按帧补发 `window_change` 的窗口内）。
+    remote_resize_sync_until: Option<std::time::Instant>,
     /// 拖拽中未通知后台的最新尺寸（`Some((cols, rows))` = 有欠账）。
     /// 窗口拖拽时每帧尺寸都变：本地网格必须立即跟上（否则字越界），
     /// 但后台通知节流到 50ms 一次（本地 SIGWINCH/ioctl、远程 SSH
@@ -459,10 +476,12 @@ impl TerminalView {
             last_mesh_origin: egui::pos2(f32::NAN, f32::NAN),
             cached_title,
             bell_until: None,
-            remote_resize_sync_frames: if is_remote {
-                REMOTE_RESIZE_SYNC_FRAMES
+            remote_resize_sync_until: if is_remote {
+                // 连接初始布局可能与 request_pty 的 80x24 不同：开局即进入
+                // 补发窗口，第一帧渲染出的真实尺寸随之送达。
+                Some(std::time::Instant::now() + REMOTE_RESIZE_SYNC_DURATION)
             } else {
-                0
+                None
             },
             pending_backend_resize: None,
             last_backend_resize_at: None,
@@ -1155,8 +1174,10 @@ impl TerminalView {
         let cell_height = self.cell_height;
 
         let avail = inner.size();
-        let cols = ((avail.x / cell_width).floor() as usize).max(2);
-        let rows = ((avail.y / cell_height).floor() as usize).max(1);
+        // 窗口极小时钳到最小可用尺寸（见 `MIN_TERMINAL_ROWS` 的说明）：
+        // 网格与发给远端的 `window_change` 必须同源，否则渲染与 PTY 错位。
+        let cols = ((avail.x / cell_width).floor() as usize).max(MIN_TERMINAL_COLS);
+        let rows = ((avail.y / cell_height).floor() as usize).max(MIN_TERMINAL_ROWS);
         let size_changed = cols as u16 != self.cols || rows as u16 != self.rows;
         if size_changed {
             let prev_cols = self.cols;
@@ -1167,9 +1188,10 @@ impl TerminalView {
             self.session.resize_grid(self.cols, self.rows);
             self.request_backend_resize(false);
             if self.session.is_remote() {
-                // 布局变化后重新开始短暂重试窗口，确保 SSH 的异步
+                // 布局变化后重新开始补发窗口，确保 SSH 的异步
                 // `window_change` 在远端下一次动态渲染前到达。
-                self.remote_resize_sync_frames = REMOTE_RESIZE_SYNC_FRAMES;
+                self.remote_resize_sync_until =
+                    Some(std::time::Instant::now() + REMOTE_RESIZE_SYNC_DURATION);
             }
             // **只有列数变化才需要清行缓存**：宽度变化会让整个网格重新折行，
             // 每行的 cell 内容与列定位全部改变。仅行数变化时网格行号与内容
@@ -1187,12 +1209,17 @@ impl TerminalView {
             // 远程建连初期的重试窗口同样走这里，避免双重通知路径。
             self.flush_pending_resize();
         }
-        if !size_changed && self.remote_resize_sync_frames > 0 {
-            // 连接初始布局可能与 SSH request_pty 的 80x24 不同；即使本帧
-            // 本地尺寸未变，也要把当前尺寸再送几次给远端，覆盖建连/输出
-            // 并发时第一次 window_change 被延后的情况。
-            self.request_backend_resize(true);
-            self.remote_resize_sync_frames -= 1;
+        if !size_changed {
+            if let Some(until) = self.remote_resize_sync_until {
+                // 尺寸稳定后的补发窗口：每个渲染帧重发一次当前尺寸，覆盖
+                // 发送失败与远端延迟（连接初始布局、布局变化都用它）；
+                // 窗口结束即停，不做长期无谓流量。
+                if std::time::Instant::now() < until {
+                    self.request_backend_resize(true);
+                } else {
+                    self.remote_resize_sync_until = None;
+                }
+            }
         }
 
         // ==================== 构建渲染数据（锁内，行级增量） ====================
@@ -4407,6 +4434,60 @@ mod tests {
         assert!(
             top_after < top_before,
             "滚动后视口应显示更早的输出行（{top_before} → {top_after}）"
+        );
+    }
+
+    /// 回归：窗口被缩到极小时，终端网格钳制到最小可用尺寸。
+    ///
+    /// 旧实现按 `max(2)`/`max(1)` 兜底，会把 1-2 行的尺寸经 `window_change`
+    /// 发给远端：vim/tmux 等全屏程序据此把界面重绘成 1 行，而恢复尺寸的通知
+    /// 一旦没生效（发送失败/节流吞掉/窗口期无帧）就永久停在该状态（用户现象：
+    /// 文件内容只剩一行、滚动只更新那一行）。
+    #[test]
+    fn 极小窗口下终端网格尺寸被钳制() {
+        let session = Session::spawn_local(
+            SessionOptions {
+                shell: Some("/bin/cat".to_string()),
+                ..Default::default()
+            },
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_step_dt(1.0 / 60.0)
+            .with_size(egui::vec2(120.0, 60.0))
+            .build_ui(move |ui| {
+                view_show.borrow_mut().show(ui);
+            });
+        harness.run_steps(6);
+
+        let view = view.borrow();
+        assert!(
+            view.cols as usize >= super::MIN_TERMINAL_COLS,
+            "极小窗口下列数应钳制到 {} 以上，实际 {}",
+            super::MIN_TERMINAL_COLS,
+            view.cols
+        );
+        assert!(
+            view.rows as usize >= super::MIN_TERMINAL_ROWS,
+            "极小窗口下行数应钳制到 {} 以上，实际 {}",
+            super::MIN_TERMINAL_ROWS,
+            view.rows
+        );
+        // 网格（= 通知给后台的 PTY 尺寸）与渲染字段同源，不得出现 1-2 行。
+        let term = view.session().term();
+        let guard = term.lock();
+        assert!(
+            guard.grid().columns() >= super::MIN_TERMINAL_COLS,
+            "终端网格列数应与钳制值一致"
+        );
+        assert!(
+            guard.grid().screen_lines() >= super::MIN_TERMINAL_ROWS,
+            "终端网格行数应与钳制值一致"
         );
     }
 
