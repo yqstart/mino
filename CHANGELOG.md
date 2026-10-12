@@ -2,6 +2,36 @@
 
 本文件为 GitHub Release 正文提供内容（`scripts/release-notes.sh` 提取首个版本段落）。
 
+## [2.0.0] - 2026-10-12
+
+以 Kaku（tw93/Kaku，WezTerm 系）为基准的整体重构：外观全盘换成 Kaku Dark / Kaku Light（跟随系统），补齐 Kaku 的终端交互族（分屏、搜索、标签导航、命令面板、右键菜单、复制即选、链接识别、全快捷键），并把「SSH 主机」与「项目收藏」融合为统一「工作区」；另加入 AI 助手（`# 生成命令`、失败命令修复、聊天面板）与 Shell 集成套件（zsh 插件 + Smart Tab）。
+
+### 新功能
+
+- **外观全面 Kaku 化**：Kaku Dark（#15141b / 紫光标 #8e6ad9）与 Kaku Light（#FFFCF0）两套配色跟随 macOS 外观自动切换（`auto`/`dark`/`light` 可强制）；底栏在窗口最底部、激活标签用 surface 色块、单标签也保留（Mino 没有菜单栏，入口按钮都在这里）；标题条与终端同底色、原生红绿灯直接落在深色条上；去掉独立状态栏（会话/SFTP 状态折入底栏右端与 toast）
+- **终端渲染照搬 Kaku**：ANSI 调色板原样搬 Kaku（含「cyan 与 green 同色」等取值）、`color_overrides`/`foreground_color_overrides` 覆写表（Claude Code 类 TUI 的引用块底色可读）、`text_min_contrast_ratio = 3.0` 强制对比度、粗体不增亮（换用 Kaku 字重体系：深色 Regular/Medium、浅色 Medium/SemiBold 命名族）、默认光标改为 2px 闪烁竖条（500ms 恒定）、内边距 40 设备像素（低分屏 26）、默认字号 15/17（低分屏 15；老默认 13 一次性迁移）、标签栏宽度上限 48 列、无网格装饰线
+- **字体**：JetBrains Mono 三字重（Regular/Medium/SemiBold，删去未用的 Italic/Bold/BoldItalic）+ Symbols Nerd Font Mono（补齐私有区图标），Kaku 同款字重体系
+- **分屏（Panes）**：⌘D 左右 / ⌘⇧D 上下拆分、⌘⌥方向键移焦、⌘⌃方向键调整比例（每次 5 列）、⌘⇧S 翻转方向、⌘⇧Enter 放大/还原、⌘W 关窗格；焦点跟随点击、布局树与窗格集合同源
+- **Kaku 快捷键族**：⌘K 清屏并清空回滚、⌘F 搜索浮层（命中高亮/上下导航/大小写开关）、⌘⇧O 标签导航器、⌘⇧P 命令面板、⌘⇧W 关标签、⌘⇧T 重开标签、⌘⇧[ ] 前后标签、⌘M 最小化、⌘⌃F 全屏、⌘B 收藏为工作区（⌘D 让位给分屏）、⌘⇧E 应用 AI 建议、⌘L AI 聊天、⌘⇧A AI 设置；⌘⇧E/⌘⇧T 等 Shift 组合在 ⌘E/⌘T 之前消费（egui 子集匹配）
+- **鼠标**：复制即选中（拖选抬手写剪贴板）、⌘+Click 打开链接（OSC8 + 裸文本 URL/裸域名/文件路径识别，`path:line:col` 支持）、Option+Click 移动 shell 光标（同输入行内）、双击选词/三击选行（Kaku `selection_word_boundary`）、右键菜单（复制/粘贴/全选/搜索/分屏/关窗格/标签操作/清屏/链接）
+- **统一工作区（SSH 与项目收藏融合）**：`hosts.toml` 的 `hosts`/`projects` 迁移为统一的 `[[workspaces]]`（`kind = "local" | "ssh"`，SSH 可带远端目录与启动命令，认证复用原结构）；标签栏单一「工作区」按钮 + ⌘O 面板（搜索/回车打开）+ 设置单卡片（增删改排序）；老配置自动迁移、保存后只写新格式
+- **AI 助手**：助手配置（OpenAI 兼容，支持 `api_key` 与 `codex` 跟随；设置 → AI 助手卡片，0600 落盘）；`# 自然语言` 回车直接生成命令回填提示符（不自动执行）；失败命令自动给修复建议（shell 集成 133;D 退出码触发），⌘⇧E 填入；⌘L 聊天面板（流式、Markdown 围栏/行内 code 渲染、Shift+Tab 切换模型）
+- **Shell 集成套件**：首次运行向 `~/.zshrc` 写入受管片段（幂等、可一键卸载、首次备份），注入 `TERM_PROGRAM=Mino`/`MINO_SHELL_INTEGRATION=1` 守卫；OSC 133 A/B/C/D 提示符标记 + OSC 7 目录上报（本地经 dup fd 包装读取、远程在读循环里嗅探）→ 权威 cwd、命令结束/退出码、shell 空闲检测；zsh-autosuggestions / syntax-highlighting / completions / z / Smart Tab（三模式）与 starship（可选）；插件后台 `git clone` 到 `~/.config/mino/shell/vendor`
+- **窗口快照**：退出时自动保存标签布局（本地记目录、SSH 记主机档案），⌘⌥⇧T 或命令面板恢复（损坏/缺失按「没有快照」处理，0600 落盘）
+- **标签增强**：双击标签标题重命名；Bell/失败命令点亮标签注意力点（橙色，激活即消）
+
+### 改进
+
+- 截图/术语/文档全面对齐 Kaku（`AGENTS.md` 重写相关章节）
+- app 测试新增：分屏拆分与关闭窗格、快捷键关闭与重开标签、Kaku 快捷键族、标签导航与命令面板、窗口快照保存与恢复、收藏远程会话为工作区、应用 AI 建议路径、工作区菜单/面板/管理器、搜索子串语义与命中导航等
+
+### 破坏性变更
+
+- 三套主题（深色/深蓝/霓虹）与 ⌥1-3 主题快捷键移除，改为跟随系统的 Kaku Dark/Light；旧配置里的主题名按「跟随系统」处理
+- 默认字号从 13pt 变为 15/17pt（低分屏/高分屏）；用户显式调过的字号保留
+- ⌘D 从「收藏当前目录」改为「向右分屏」，收藏迁移到 ⌘B
+- 状态栏移除；SFTP 状态/错误显示在底栏右端指示与面板内
+
 ## [1.1.2] - 2026-09-28
 
 修复窗口被缩到极小时把 1–2 行尺寸通知远端、导致 vim/tmux 界面停在「只剩一行」的问题，并把远端尺寸同步改为按时间窗口补发。

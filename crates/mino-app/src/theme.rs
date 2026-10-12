@@ -1,183 +1,517 @@
-//! 主题与配色。
+//! 主题与配色（Kaku 基准）。
 //!
-//! 视觉体系参照 Tabby 终端：石墨分层背景、极淡半透明边线、扁平控件、
-//! 低对比 hover 高亮、小圆角与紧凑排版。三套深色皮肤共用同一套结构。
+//! 全面照搬 Kaku 终端（WezTerm 系）的配色体系：深色「Kaku Dark」（Aura 系，
+//! 背景 `#15141b`、紫色光标 `#8e6ad9`）与浅色「Kaku Light」（Flexoki 系，
+//! 米白 `#FFFCF0`），跟随 macOS 系统外观自动切换。
+//!
+//! 与 Kaku 一致的关键约定：
+//! - 应用底色 == 终端底色 == 标签栏底色（`#15141b`），只有面板（surface
+//!   `#1f1d28`）与激活标签（surface_active `#29263c`）逐级提亮；
+//! - ANSI 调色板原样搬自 Kaku 的 `color_schemes['Kaku Dark'/'Kaku Light']`
+//!   （含「cyan 与 green 同色」「ANSI black 是浅灰」这类 Kaku 特有取值）；
+//! - `color_overrides` / `foreground_color_overrides`：Kaku 为 Claude Code
+//!   等 TUI 补对比度用的前景/背景替换表，渲染层按表替换；
+//! - 粗体不改变颜色（Kaku `bold_brightens_ansi_colors = false`）。
 
 use alacritty_terminal::vte::ansi::Rgb;
 use egui::{Color32, Context, CornerRadius, Stroke, Visuals};
 
-/// 设计 token（默认深色主题基准）。
+/// 设计 token（Kaku Dark 基准；控件半径按 WezTerm 覆盖层风格取小值）。
 pub mod tokens {
     use egui::Color32;
 
-    // ==================== 背景分层（石墨终端） ====================
-    // 默认皮肤使用近黑石墨色作为底层，面板略带冷灰绿，保持终端工具的
-    // 低干扰层级；交互强调使用低饱和青绿与琥珀，不包含粉色或紫色。
-    pub const BG_APP: Color32 = Color32::from_rgb(0x0d, 0x11, 0x12);
-    pub const BG_HEADER: Color32 = Color32::from_rgb(0x08, 0x0b, 0x0c);
-    pub const BG_PANEL: Color32 = Color32::from_rgb(0x12, 0x19, 0x1a);
-    pub const BG_ELEVATED: Color32 = Color32::from_rgb(0x19, 0x21, 0x22);
-    pub const BG_TERMINAL: Color32 = Color32::from_rgb(0x09, 0x0d, 0x0d);
+    // ==================== 背景分层（Kaku Dark） ====================
+    // 应用 / 标签栏 / 终端共用同一底色（Kaku 把三者都设为 `#15141b`），
+    // 面板与浮层用 surface 系提亮。
+    pub const BG_APP: Color32 = Color32::from_rgb(0x15, 0x14, 0x1b);
+    pub const BG_HEADER: Color32 = Color32::from_rgb(0x15, 0x14, 0x1b);
+    pub const BG_PANEL: Color32 = Color32::from_rgb(0x1f, 0x1d, 0x28);
+    pub const BG_ELEVATED: Color32 = Color32::from_rgb(0x29, 0x26, 0x3c);
+    pub const BG_TERMINAL: Color32 = Color32::from_rgb(0x15, 0x14, 0x1b);
 
     pub const BORDER_SUBTLE: Color32 =
-        Color32::from_rgba_unmultiplied_const(0x7e, 0xa1, 0x97, 0x24);
-    pub const GRID_LINE: Color32 = Color32::from_rgba_unmultiplied_const(0x7e, 0xa1, 0x97, 0x09);
+        Color32::from_rgba_unmultiplied_const(0xd5, 0xd4, 0xd6, 0x1a);
 
-    pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xd9, 0xe2, 0xdf);
-    pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(0xa6, 0xb4, 0xb0);
-    pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x67, 0x76, 0x72);
+    pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xd5, 0xd4, 0xd6);
+    pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(0xa8, 0xa6, 0xae);
+    pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x6d, 0x6d, 0x6d);
 
-    // 主动作使用终端绿，辅助强调使用克制的琥珀色。
-    pub const ACCENT: Color32 = Color32::from_rgb(0x4f, 0x9d, 0x83);
-    pub const ACCENT_2: Color32 = Color32::from_rgb(0xc3, 0x9a, 0x5b);
-    pub const ACCENT_SOFT: Color32 = Color32::from_rgba_unmultiplied_const(0x4f, 0x9d, 0x83, 0x2a);
+    // Kaku 的强调色 = 光标紫（选择/焦点/链接同源）；辅助强调 = 琥珀。
+    pub const ACCENT: Color32 = Color32::from_rgb(0x8e, 0x6a, 0xd9);
+    pub const ACCENT_2: Color32 = Color32::from_rgb(0xda, 0xae, 0x76);
+    pub const ACCENT_SOFT: Color32 = Color32::from_rgba_unmultiplied_const(0x8e, 0x6a, 0xd9, 0x2e);
     pub const ACCENT_FG: Color32 = Color32::from_rgb(0xff, 0xff, 0xff);
-    pub const FOCUS_RING: Color32 = Color32::from_rgba_unmultiplied_const(0x4f, 0x9d, 0x83, 0x90);
+    pub const FOCUS_RING: Color32 = Color32::from_rgba_unmultiplied_const(0x8e, 0x6a, 0xd9, 0x90);
 
-    pub const SUCCESS: Color32 = Color32::from_rgb(0x63, 0xa8, 0x78);
-    pub const WARNING: Color32 = Color32::from_rgb(0xc7, 0x9c, 0x55);
-    pub const DANGER: Color32 = Color32::from_rgb(0xb8, 0x5c, 0x54);
+    pub const SUCCESS: Color32 = Color32::from_rgb(0x58, 0xd8, 0xad);
+    pub const WARNING: Color32 = Color32::from_rgb(0xda, 0xae, 0x76);
+    pub const DANGER: Color32 = Color32::from_rgb(0xd8, 0x5d, 0x5d);
 
-    pub const RADIUS_SM: f32 = 9.0;
-    pub const RADIUS_ITEM: f32 = 7.0;
+    // WezTerm 覆盖层控件是小圆角（对话框/按钮 4-6px），不做大圆角气泡。
+    pub const RADIUS_SM: f32 = 6.0;
+    pub const RADIUS_ITEM: f32 = 4.0;
 }
 
-// ==================== 终端调色板（石墨终端基准） ====================
-pub const TERM_PALETTE_16: [Rgb; 16] = [
+// ==================== 终端调色板（Kaku Dark / Kaku Light 原值） ====================
+
+/// Kaku Dark ANSI 0-15（对应 kaku.lua `config.color_schemes['Kaku Dark']`）。
+pub const PALETTE_KAKU_DARK: [Rgb; 16] = [
     Rgb {
-        r: 0x1a,
-        g: 0x1f,
-        b: 0x20,
-    },
+        r: 0xc8,
+        g: 0xc6,
+        b: 0xcc,
+    }, // black（Kaku 把 ANSI black 渲染为浅灰）
     Rgb {
-        r: 0xb8,
-        g: 0x5c,
-        b: 0x54,
-    },
-    Rgb {
-        r: 0x76,
-        g: 0x9c,
-        b: 0x67,
-    },
-    Rgb {
-        r: 0xb8,
-        g: 0x9a,
-        b: 0x5b,
-    },
-    Rgb {
-        r: 0x5f,
-        g: 0x81,
-        b: 0x9d,
-    },
-    Rgb {
-        r: 0xa6,
-        g: 0x7c,
-        b: 0x52,
-    },
-    Rgb {
-        r: 0x5f,
-        g: 0x9a,
-        b: 0x95,
-    },
-    Rgb {
-        r: 0xc7,
-        g: 0xd0,
-        b: 0xcd,
-    },
-    Rgb {
-        r: 0x52,
-        g: 0x60,
-        b: 0x5e,
-    },
-    Rgb {
-        r: 0xcf,
-        g: 0x6a,
+        r: 0xd8,
+        g: 0x5d,
         b: 0x5d,
-    },
+    }, // red
     Rgb {
-        r: 0x8f,
-        g: 0xb4,
-        b: 0x77,
-    },
-    Rgb {
-        r: 0xd0,
-        g: 0xad,
-        b: 0x67,
-    },
-    Rgb {
-        r: 0x7c,
-        g: 0x9b,
-        b: 0xb3,
-    },
-    Rgb {
-        r: 0xc1,
-        g: 0x8b,
-        b: 0x5c,
-    },
-    Rgb {
-        r: 0x78,
-        g: 0xb5,
+        r: 0x58,
+        g: 0xd8,
         b: 0xad,
-    },
+    }, // green
     Rgb {
-        r: 0xe2,
-        g: 0xe7,
-        b: 0xe5,
-    },
+        r: 0xda,
+        g: 0xae,
+        b: 0x76,
+    }, // yellow（橙）
+    Rgb {
+        r: 0x68,
+        g: 0xaf,
+        b: 0xda,
+    }, // blue
+    Rgb {
+        r: 0x8e,
+        g: 0x6a,
+        b: 0xd9,
+    }, // magenta（紫）
+    Rgb {
+        r: 0x58,
+        g: 0xd8,
+        b: 0xad,
+    }, // cyan（与 green 同色，Kaku 特有）
+    Rgb {
+        r: 0xd5,
+        g: 0xd4,
+        b: 0xd6,
+    }, // white
+    Rgb {
+        r: 0x6d,
+        g: 0x6d,
+        b: 0x6d,
+    }, // bright black（灰）
+    Rgb {
+        r: 0xd8,
+        g: 0x5d,
+        b: 0x5d,
+    }, // bright red
+    Rgb {
+        r: 0x58,
+        g: 0xd8,
+        b: 0xad,
+    }, // bright green
+    Rgb {
+        r: 0xda,
+        g: 0xae,
+        b: 0x76,
+    }, // bright yellow
+    Rgb {
+        r: 0x90,
+        g: 0xc9,
+        b: 0xe6,
+    }, // bright blue
+    Rgb {
+        r: 0x8e,
+        g: 0x6a,
+        b: 0xd9,
+    }, // bright magenta
+    Rgb {
+        r: 0x58,
+        g: 0xd8,
+        b: 0xad,
+    }, // bright cyan
+    Rgb {
+        r: 0xd5,
+        g: 0xd4,
+        b: 0xd6,
+    }, // bright white
 ];
 
-pub const TERM_FG: Rgb = Rgb {
-    r: 0xc9,
-    g: 0xd3,
-    b: 0xd0,
-};
-pub const TERM_BG: Rgb = Rgb {
-    r: 0x09,
-    g: 0x0d,
-    b: 0x0d,
-};
-pub const TERM_CURSOR: Rgb = Rgb {
-    r: 0x84,
-    g: 0xb6,
-    b: 0x9f,
-};
+/// Kaku Light ANSI 0-15（对应 kaku.lua `config.color_schemes['Kaku Light']`）。
+pub const PALETTE_KAKU_LIGHT: [Rgb; 16] = [
+    Rgb {
+        r: 0x10,
+        g: 0x0f,
+        b: 0x0f,
+    }, // black
+    Rgb {
+        r: 0xaf,
+        g: 0x30,
+        b: 0x29,
+    }, // red-600
+    Rgb {
+        r: 0x53,
+        g: 0x69,
+        b: 0x07,
+    }, // green-700
+    Rgb {
+        r: 0x8e,
+        g: 0x6b,
+        b: 0x02,
+    }, // yellow-700
+    Rgb {
+        r: 0x20,
+        g: 0x5e,
+        b: 0xa6,
+    }, // blue-600
+    Rgb {
+        r: 0xa0,
+        g: 0x2f,
+        b: 0x6f,
+    }, // magenta-600
+    Rgb {
+        r: 0x1c,
+        g: 0x6c,
+        b: 0x66,
+    }, // cyan-700
+    Rgb {
+        r: 0x57,
+        g: 0x56,
+        b: 0x53,
+    }, // base-700
+    Rgb {
+        r: 0x6f,
+        g: 0x6e,
+        b: 0x69,
+    }, // bright black（base-600）
+    Rgb {
+        r: 0xc0,
+        g: 0x3e,
+        b: 0x35,
+    }, // red-500
+    Rgb {
+        r: 0x66,
+        g: 0x79,
+        b: 0x0d,
+    }, // green-600
+    Rgb {
+        r: 0x8e,
+        g: 0x6b,
+        b: 0x02,
+    }, // yellow-700（与 ansi 黄一致）
+    Rgb {
+        r: 0x31,
+        g: 0x71,
+        b: 0xb2,
+    }, // blue-500
+    Rgb {
+        r: 0xb7,
+        g: 0x45,
+        b: 0x83,
+    }, // magenta-500
+    Rgb {
+        r: 0x27,
+        g: 0x7c,
+        b: 0x75,
+    }, // cyan-500
+    Rgb {
+        r: 0x40,
+        g: 0x3e,
+        b: 0x3c,
+    }, // base-800
+];
+
+/// Kaku Dark 的背景替换表（`color_overrides`）：把 Claude Code 等 TUI 的
+/// 低对比底色替换为可读的深色。
+pub const DARK_BG_OVERRIDES: &[(Rgb, Rgb)] = &[
+    (
+        Rgb {
+            r: 0xc8,
+            g: 0xc6,
+            b: 0xcc,
+        },
+        Rgb {
+            r: 0x15,
+            g: 0x14,
+            b: 0x1b,
+        },
+    ), // ANSI black 背景
+    (
+        Rgb {
+            r: 0x6d,
+            g: 0x6d,
+            b: 0x6d,
+        },
+        Rgb {
+            r: 0x3a,
+            g: 0x39,
+            b: 0x42,
+        },
+    ), // ANSI 8
+    (
+        Rgb {
+            r: 0x6e,
+            g: 0x6e,
+            b: 0x6e,
+        },
+        Rgb {
+            r: 0x3a,
+            g: 0x39,
+            b: 0x42,
+        },
+    ), // Claude Code true color 变体
+    (
+        Rgb {
+            r: 0x8e,
+            g: 0xc3,
+            b: 0xff,
+        },
+        Rgb {
+            r: 0x3a,
+            g: 0x39,
+            b: 0x42,
+        },
+    ), // Claude Code 蓝色标题背景
+    (
+        Rgb {
+            r: 0xd5,
+            g: 0xd4,
+            b: 0xd6,
+        },
+        Rgb {
+            r: 0x4a,
+            g: 0x49,
+            b: 0x54,
+        },
+    ), // ANSI 7/15 背景（比 ANSI 8 底更亮一档）
+];
+
+/// Kaku Dark 的前景替换表（`foreground_color_overrides`）：黑底真彩前景
+/// 在深色主题上不可读，统一提亮。
+pub const DARK_FG_OVERRIDES: &[(Rgb, Rgb)] = &[
+    (
+        Rgb { r: 0, g: 0, b: 0 },
+        Rgb {
+            r: 0xd5,
+            g: 0xd4,
+            b: 0xd6,
+        },
+    ),
+    (
+        Rgb {
+            r: 0x11,
+            g: 0x0f,
+            b: 0x18,
+        },
+        Rgb {
+            r: 0xd5,
+            g: 0xd4,
+            b: 0xd6,
+        },
+    ),
+    (
+        Rgb {
+            r: 0x15,
+            g: 0x14,
+            b: 0x1b,
+        },
+        Rgb {
+            r: 0xd5,
+            g: 0xd4,
+            b: 0xd6,
+        },
+    ),
+    (
+        Rgb {
+            r: 0x1a,
+            g: 0x1a,
+            b: 0x1a,
+        },
+        Rgb {
+            r: 0xd5,
+            g: 0xd4,
+            b: 0xd6,
+        },
+    ),
+    (
+        Rgb {
+            r: 0x1c,
+            g: 0x1c,
+            b: 0x1c,
+        },
+        Rgb {
+            r: 0xd5,
+            g: 0xd4,
+            b: 0xd6,
+        },
+    ),
+];
+
+/// Kaku Light 的背景替换表。
+pub const LIGHT_BG_OVERRIDES: &[(Rgb, Rgb)] = &[
+    (
+        Rgb {
+            r: 0x57,
+            g: 0x56,
+            b: 0x53,
+        },
+        Rgb {
+            r: 0xf2,
+            g: 0xf0,
+            b: 0xeb,
+        },
+    ),
+    (
+        Rgb {
+            r: 0x58,
+            g: 0x57,
+            b: 0x54,
+        },
+        Rgb {
+            r: 0xf2,
+            g: 0xf0,
+            b: 0xeb,
+        },
+    ),
+    (
+        Rgb {
+            r: 0x22,
+            g: 0x5f,
+            b: 0xa6,
+        },
+        Rgb {
+            r: 0xf2,
+            g: 0xf0,
+            b: 0xeb,
+        },
+    ),
+    (
+        Rgb {
+            r: 0x20,
+            g: 0x5e,
+            b: 0xa6,
+        },
+        Rgb {
+            r: 0xc9,
+            g: 0xdd,
+            b: 0xf0,
+        },
+    ),
+    (
+        Rgb {
+            r: 0x1c,
+            g: 0x6c,
+            b: 0x66,
+        },
+        Rgb {
+            r: 0xf2,
+            g: 0xf0,
+            b: 0xeb,
+        },
+    ),
+    (
+        Rgb {
+            r: 0x53,
+            g: 0x69,
+            b: 0x07,
+        },
+        Rgb {
+            r: 0xf2,
+            g: 0xf0,
+            b: 0xeb,
+        },
+    ),
+    (
+        Rgb {
+            r: 0x8e,
+            g: 0x6b,
+            b: 0x02,
+        },
+        Rgb {
+            r: 0xf2,
+            g: 0xf0,
+            b: 0xeb,
+        },
+    ),
+    (
+        Rgb {
+            r: 0x40,
+            g: 0x3e,
+            b: 0x3c,
+        },
+        Rgb {
+            r: 0xe8,
+            g: 0xe6,
+            b: 0xdb,
+        },
+    ),
+];
+
+/// Kaku Light 的前景替换表（米白底上的浅黄文字压暗）。
+pub const LIGHT_FG_OVERRIDES: &[(Rgb, Rgb)] = &[
+    (
+        Rgb {
+            r: 0xff,
+            g: 0xff,
+            b: 0xdb,
+        },
+        Rgb {
+            r: 0x57,
+            g: 0x56,
+            b: 0x53,
+        },
+    ),
+    (
+        Rgb {
+            r: 0xff,
+            g: 0xff,
+            b: 0xdc,
+        },
+        Rgb {
+            r: 0x57,
+            g: 0x56,
+            b: 0x53,
+        },
+    ),
+];
 
 /// xterm 256 色表固定部分（index ≥ 16：216 立方色 + 24 灰阶，与主题调色板无关）。
-/// 一次计算后查表，避免逐 cell 现算乘除（全彩色屏时每帧上万次）。
-static XTERM_FIXED: std::sync::OnceLock<[Rgb; 240]> = std::sync::OnceLock::new();
+/// 声明即初始化（惰性求值一次），避免逐 cell 现算乘除（全彩色屏时每帧上万次）。
+static XTERM_FIXED: std::sync::LazyLock<[Rgb; 240]> = std::sync::LazyLock::new(|| {
+    std::array::from_fn(|i| {
+        let n = i as u8 + 16;
+        if n < 232 {
+            let n2 = n - 16;
+            let r = n2 / 36;
+            let g = (n2 % 36) / 6;
+            let b = n2 % 6;
+            let level = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+            Rgb {
+                r: level(r),
+                g: level(g),
+                b: level(b),
+            }
+        } else {
+            let v = 8 + (n - 232) * 10;
+            Rgb { r: v, g: v, b: v }
+        }
+    })
+});
 
 /// xterm 256 色表（16 基本 + 216 立方色 + 24 灰阶）。
 pub fn xterm256(index: u8, palette: [Rgb; 16]) -> Rgb {
     if index < 16 {
         palette[index as usize]
     } else {
-        let table = XTERM_FIXED.get_or_init(|| {
-            std::array::from_fn(|i| {
-                let n = i as u8 + 16;
-                if n < 232 {
-                    let n2 = n - 16;
-                    let r = n2 / 36;
-                    let g = (n2 % 36) / 6;
-                    let b = n2 % 6;
-                    let level = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
-                    Rgb {
-                        r: level(r),
-                        g: level(g),
-                        b: level(b),
-                    }
-                } else {
-                    let v = 8 + (n - 232) * 10;
-                    Rgb { r: v, g: v, b: v }
-                }
-            })
-        });
-        table[(index - 16) as usize]
+        XTERM_FIXED[(index - 16) as usize]
     }
 }
 
-// ==================== 多主题 ====================
+// ==================== 主题定义（Kaku Dark / Kaku Light） ====================
 
 pub struct Theme {
+    /// 主题名（持久化用；配置里存名称而非下标）。
     pub name: &'static str,
     pub light: bool,
     pub bg_app: Color32,
@@ -191,16 +525,30 @@ pub struct Theme {
     pub accent: Color32,
     pub accent2: Color32,
     pub accent_soft: Color32,
+    /// accent 填充之上的文字色（深色主题白、浅色主题近黑）。
+    pub accent_fg: Color32,
     pub success: Color32,
     pub warning: Color32,
     pub danger: Color32,
+    /// 注意力点色（Kaku 的 tab attention/bell 指示，深色橙 / 浅色金）。
+    pub attention: Color32,
     pub term_bg: Rgb,
     pub term_fg: Rgb,
     pub term_cursor: Rgb,
     pub term_palette: [Rgb; 16],
+    /// 终端选择背景（Kaku Dark 是 55% 紫、Kaku Light 是不透明米灰）。
+    pub term_selection_bg: Color32,
+    /// 背景替换表（`color_overrides`）。
+    pub bg_overrides: &'static [(Rgb, Rgb)],
+    /// 前景替换表（`foreground_color_overrides`）。
+    pub fg_overrides: &'static [(Rgb, Rgb)],
 }
 
+pub const THEME_DARK_NAME: &str = "Kaku Dark";
+pub const THEME_LIGHT_NAME: &str = "Kaku Light";
+
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+/// 0 = Kaku Dark，1 = Kaku Light。
 static CURRENT_THEME: AtomicUsize = AtomicUsize::new(0);
 static THEME_REVISION: AtomicU64 = AtomicU64::new(0);
 
@@ -208,14 +556,30 @@ pub fn current_theme() -> &'static Theme {
     &THEMES[CURRENT_THEME.load(Ordering::Relaxed)]
 }
 
-/// 当前主题下标（持久化用；与 `current_theme()` 对应）。
+/// 当前主题下标（0 深 / 1 浅）。
 pub fn current_theme_index() -> usize {
     CURRENT_THEME.load(Ordering::Relaxed)
 }
 
-/// 按名称查找主题下标（配置持久化用；未知名称返回 `None`）。
+/// 按名称查找主题下标；未知名称返回 `None`（含已废弃的旧主题名）。
 pub fn theme_index_by_name(name: &str) -> Option<usize> {
-    THEMES.iter().position(|t| t.name == name)
+    if name == THEME_DARK_NAME {
+        Some(0)
+    } else if name == THEME_LIGHT_NAME {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// 按配置的外观偏好求有效主题下标：
+/// `auto`/未知 → 跟随系统外观；`dark` / `light` → 强制。
+pub fn resolve_appearance(appearance: &str, system_dark: bool) -> usize {
+    match appearance {
+        "dark" => 0,
+        "light" => 1,
+        _ => usize::from(!system_dark),
+    }
 }
 
 /// 当前主题修订号；主题改变时递增，供终端等缓存消费者失效。
@@ -225,9 +589,11 @@ pub fn theme_revision() -> u64 {
 
 pub fn set_theme(ctx: &Context, index: usize) {
     let index = index.min(THEMES.len() - 1);
-    if CURRENT_THEME.swap(index, Ordering::AcqRel) != index {
+    let changed = CURRENT_THEME.swap(index, Ordering::AcqRel) != index;
+    if changed {
         THEME_REVISION.fetch_add(1, Ordering::AcqRel);
     }
+    // 即使下标未变也重放样式：系统外观变化需要重新套用（幂等）。
     apply_theme(ctx, current_theme());
 }
 
@@ -237,8 +603,17 @@ pub fn apply_theme(ctx: &Context, theme: &Theme) {
     } else {
         egui::ThemePreference::Dark
     });
-    let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
-    let mut visuals = Visuals::dark();
+    let egui_theme = if theme.light {
+        egui::Theme::Light
+    } else {
+        egui::Theme::Dark
+    };
+    let mut style = (*ctx.style_of(egui_theme)).clone();
+    let mut visuals = if theme.light {
+        Visuals::light()
+    } else {
+        Visuals::dark()
+    };
 
     visuals.panel_fill = theme.bg_app;
     visuals.window_fill = theme.bg_elevated;
@@ -262,9 +637,9 @@ pub fn apply_theme(ctx: &Context, theme: &Theme) {
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, theme.text_primary);
     visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, theme.border);
 
-    // 科技感 hover：青色边界的低透明度提亮，避免所有控件都变成一块白底。
+    // hover：accent 低透明度叠加，避免所有控件都变成一块纯色底。
     let hover_overlay =
-        Color32::from_rgba_unmultiplied(theme.accent.r(), theme.accent.g(), theme.accent.b(), 16);
+        Color32::from_rgba_unmultiplied(theme.accent.r(), theme.accent.g(), theme.accent.b(), 20);
     visuals.widgets.hovered.bg_fill = hover_overlay;
     visuals.widgets.hovered.weak_bg_fill = hover_overlay;
     visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, theme.text_primary);
@@ -283,7 +658,6 @@ pub fn apply_theme(ctx: &Context, theme: &Theme) {
     style.spacing.interact_size = egui::vec2(30.0, 26.0);
 
     // 全局滚动条：细窄浮动、不占布局宽度，平时半透明、hover 加深。
-    // 设置弹窗这类窄内容区不再被一条 10px 常驻轨道挤压。
     style.spacing.scroll = egui::style::ScrollStyle {
         floating: true,
         bar_width: 8.0,
@@ -295,18 +669,26 @@ pub fn apply_theme(ctx: &Context, theme: &Theme) {
         ..Default::default()
     };
 
-    visuals.window_corner_radius = CornerRadius::same(14);
+    visuals.window_corner_radius = CornerRadius::same(10);
     visuals.window_shadow = egui::Shadow {
         offset: [0, 6],
         blur: 24,
         spread: 0,
-        color: Color32::from_rgba_unmultiplied(0x00, 0x04, 0x10, 0xd0),
+        color: if theme.light {
+            Color32::from_rgba_unmultiplied(0x10, 0x0f, 0x0f, 0x40)
+        } else {
+            Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, 0xd0)
+        },
     };
     visuals.popup_shadow = egui::Shadow {
         offset: [0, 4],
         blur: 16,
         spread: 0,
-        color: Color32::from_rgba_unmultiplied(0x00, 0x04, 0x10, 0xb0),
+        color: if theme.light {
+            Color32::from_rgba_unmultiplied(0x10, 0x0f, 0x0f, 0x30)
+        } else {
+            Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, 0xb0)
+        },
     };
 
     // 所有可点击控件 hover 时显示小手光标（egui 默认不设置；
@@ -315,206 +697,39 @@ pub fn apply_theme(ctx: &Context, theme: &Theme) {
     visuals.interact_cursor = Some(egui::CursorIcon::PointingHand);
 
     style.visuals = visuals;
-    ctx.set_style_of(egui::Theme::Dark, style);
+    ctx.set_style_of(egui_theme, style);
 }
 
 /// 滑块（`egui::Slider`）专用配色。
 ///
 /// egui 的滑块没有独立的轨道配色项：轨道恒定使用
 /// `widgets.inactive.bg_fill`，手柄填充按交互态取 `bg_fill`——两者同源。
-/// 全局该字段是面板色（`bg_panel`），而设置弹窗卡片（`dialog::card_frame`）
-/// 底同为面板色：轨道与卡片**完全同色**，只能看到手柄的 1px 描边轮廓
-/// （用户现象「滑块轨道看不清」）。调用方用 `ui.scope` 局部应用本函数，
-/// 不影响其它控件：浅色半透明轨道 + accent 已填充（`trailing_fill`
-/// 取 `selection.bg_fill`）+ 亮描边手柄，拖拽时手柄填充 accent。
+/// 全局该字段是面板色（`bg_panel`），而设置弹窗卡片底同为面板色：
+/// 轨道与卡片**完全同色**，只能看到手柄的 1px 描边轮廓（用户现象
+/// 「滑块轨道看不清」）。调用方用 `ui.scope` 局部应用本函数，不影响其它
+/// 控件：浅色半透明轨道 + accent 已填充 + 亮描边手柄，拖拽时手柄填充 accent。
 pub fn apply_slider_style(style: &mut egui::Style, theme: &Theme) {
     style.visuals.slider_trailing_fill = true;
     // 已填充段（滑块当前值一侧）用不透明 accent，与主题色一致。
     style.visuals.selection.bg_fill = theme.accent;
-    // 未填充轨道与静止态手柄填充：白色 15% 叠加，在三种深色卡片上都可辨。
-    let track = Color32::from_rgba_unmultiplied(0xff, 0xff, 0xff, 0x26);
+    // 未填充轨道与静止态手柄填充：在两种主题下都可辨的叠加色。
+    let track = if theme.light {
+        Color32::from_rgba_unmultiplied(0x10, 0x0f, 0x0f, 0x26)
+    } else {
+        Color32::from_rgba_unmultiplied(0xff, 0xff, 0xff, 0x26)
+    };
     let widgets = &mut style.visuals.widgets;
     widgets.inactive.bg_fill = track;
     widgets.inactive.fg_stroke = Stroke::new(1.5, theme.text_primary);
     widgets.hovered.bg_fill = theme.accent;
-    widgets.hovered.fg_stroke = Stroke::new(1.5, Color32::WHITE);
+    widgets.hovered.fg_stroke = Stroke::new(1.5, theme.accent_fg);
     widgets.active.bg_fill = theme.accent;
-    widgets.active.fg_stroke = Stroke::new(1.5, Color32::WHITE);
+    widgets.active.fg_stroke = Stroke::new(1.5, theme.accent_fg);
 }
 
-// ---- 终端调色板：三套 ----
-
-const PALETTE_GRAPHITE: [Rgb; 16] = TERM_PALETTE_16;
-
-const PALETTE_MIDNIGHT: [Rgb; 16] = [
-    Rgb {
-        r: 0x3b,
-        g: 0x42,
-        b: 0x68,
-    },
-    Rgb {
-        r: 0xf7,
-        g: 0x76,
-        b: 0x8e,
-    },
-    Rgb {
-        r: 0x9e,
-        g: 0xce,
-        b: 0x6a,
-    },
-    Rgb {
-        r: 0xe0,
-        g: 0xaf,
-        b: 0x68,
-    },
-    Rgb {
-        r: 0x7a,
-        g: 0xa2,
-        b: 0xf7,
-    },
-    Rgb {
-        r: 0xbb,
-        g: 0x9a,
-        b: 0xf7,
-    },
-    Rgb {
-        r: 0x7d,
-        g: 0xcf,
-        b: 0xff,
-    },
-    Rgb {
-        r: 0xa9,
-        g: 0xb1,
-        b: 0xd6,
-    },
-    Rgb {
-        r: 0x41,
-        g: 0x48,
-        b: 0x68,
-    },
-    Rgb {
-        r: 0xf7,
-        g: 0x76,
-        b: 0x8e,
-    },
-    Rgb {
-        r: 0x9e,
-        g: 0xce,
-        b: 0x6a,
-    },
-    Rgb {
-        r: 0xe0,
-        g: 0xaf,
-        b: 0x68,
-    },
-    Rgb {
-        r: 0x7a,
-        g: 0xa2,
-        b: 0xf7,
-    },
-    Rgb {
-        r: 0xbb,
-        g: 0x9a,
-        b: 0xf7,
-    },
-    Rgb {
-        r: 0x7d,
-        g: 0xcf,
-        b: 0xff,
-    },
-    Rgb {
-        r: 0xc0,
-        g: 0xca,
-        b: 0xf5,
-    },
-];
-
-const PALETTE_CYBER: [Rgb; 16] = [
-    Rgb {
-        r: 0x2a,
-        g: 0x1a,
-        b: 0x3e,
-    },
-    Rgb {
-        r: 0xff,
-        g: 0x5c,
-        b: 0x8a,
-    },
-    Rgb {
-        r: 0x00,
-        g: 0xff,
-        b: 0x9f,
-    },
-    Rgb {
-        r: 0xff,
-        g: 0xd3,
-        b: 0x00,
-    },
-    Rgb {
-        r: 0x00,
-        g: 0xd4,
-        b: 0xff,
-    },
-    Rgb {
-        r: 0xff,
-        g: 0x71,
-        b: 0xce,
-    },
-    Rgb {
-        r: 0x00,
-        g: 0xff,
-        b: 0xe0,
-    },
-    Rgb {
-        r: 0xe0,
-        g: 0xe0,
-        b: 0xff,
-    },
-    Rgb {
-        r: 0x4a,
-        g: 0x2a,
-        b: 0x6e,
-    },
-    Rgb {
-        r: 0xff,
-        g: 0x5c,
-        b: 0x8a,
-    },
-    Rgb {
-        r: 0x00,
-        g: 0xff,
-        b: 0x9f,
-    },
-    Rgb {
-        r: 0xff,
-        g: 0xd3,
-        b: 0x00,
-    },
-    Rgb {
-        r: 0x00,
-        g: 0xd4,
-        b: 0xff,
-    },
-    Rgb {
-        r: 0xff,
-        g: 0x71,
-        b: 0xce,
-    },
-    Rgb {
-        r: 0x00,
-        g: 0xff,
-        b: 0xe0,
-    },
-    Rgb {
-        r: 0xff,
-        g: 0xff,
-        b: 0xff,
-    },
-];
-
-pub static THEMES: [Theme; 3] = [
+pub static THEMES: [Theme; 2] = [
     Theme {
-        name: "深色",
+        name: THEME_DARK_NAME,
         light: false,
         bg_app: tokens::BG_APP,
         bg_header: tokens::BG_HEADER,
@@ -527,81 +742,69 @@ pub static THEMES: [Theme; 3] = [
         accent: tokens::ACCENT,
         accent2: tokens::ACCENT_2,
         accent_soft: tokens::ACCENT_SOFT,
+        accent_fg: tokens::ACCENT_FG,
         success: tokens::SUCCESS,
         warning: tokens::WARNING,
         danger: tokens::DANGER,
-        term_bg: TERM_BG,
-        term_fg: TERM_FG,
-        term_cursor: TERM_CURSOR,
-        term_palette: PALETTE_GRAPHITE,
-    },
-    Theme {
-        name: "深蓝",
-        light: false,
-        bg_app: Color32::from_rgb(0x06, 0x0a, 0x14),
-        bg_header: Color32::from_rgb(0x0c, 0x12, 0x20),
-        bg_panel: Color32::from_rgb(0x10, 0x18, 0x2b),
-        bg_elevated: Color32::from_rgb(0x18, 0x23, 0x3d),
-        border: Color32::from_rgba_unmultiplied_const(0xff, 0xff, 0xff, 0x10),
-        text_primary: Color32::from_rgb(0xe8, 0xee, 0xf8),
-        text_secondary: Color32::from_rgb(0xa9, 0xb6, 0xce),
-        text_muted: Color32::from_rgb(0x6e, 0x7c, 0x99),
-        accent: Color32::from_rgb(0x3b, 0x82, 0xf6),
-        accent2: Color32::from_rgb(0x22, 0xd3, 0xee),
-        accent_soft: Color32::from_rgba_unmultiplied_const(0x3b, 0x82, 0xf6, 0x22),
-        success: Color32::from_rgb(0x2d, 0xd4, 0xbf),
-        warning: Color32::from_rgb(0xfb, 0xbf, 0x24),
-        danger: Color32::from_rgb(0xf4, 0x71, 0x71),
+        attention: Color32::from_rgb(0xda, 0xae, 0x76),
         term_bg: Rgb {
-            r: 0x07,
-            g: 0x0c,
-            b: 0x17,
+            r: 0x15,
+            g: 0x14,
+            b: 0x1b,
         },
         term_fg: Rgb {
-            r: 0xc0,
-            g: 0xca,
-            b: 0xf5,
+            r: 0xd5,
+            g: 0xd4,
+            b: 0xd6,
         },
         term_cursor: Rgb {
-            r: 0x7d,
-            g: 0xcf,
-            b: 0xff,
+            r: 0x8e,
+            g: 0x6a,
+            b: 0xd9,
         },
-        term_palette: PALETTE_MIDNIGHT,
+        term_palette: PALETTE_KAKU_DARK,
+        term_selection_bg: Color32::from_rgba_unmultiplied_const(0x8e, 0x6a, 0xd9, 0x8c),
+        bg_overrides: DARK_BG_OVERRIDES,
+        fg_overrides: DARK_FG_OVERRIDES,
     },
     Theme {
-        name: "霓虹",
-        light: false,
-        bg_app: Color32::from_rgb(0x0a, 0x04, 0x0f),
-        bg_header: Color32::from_rgb(0x14, 0x0a, 0x1d),
-        bg_panel: Color32::from_rgb(0x1b, 0x0d, 0x28),
-        bg_elevated: Color32::from_rgb(0x29, 0x15, 0x40),
-        border: Color32::from_rgba_unmultiplied_const(0xff, 0x71, 0xce, 0x20),
-        text_primary: Color32::from_rgb(0xf2, 0xe9, 0xff),
-        text_secondary: Color32::from_rgb(0xcd, 0xb6, 0xe8),
-        text_muted: Color32::from_rgb(0x96, 0x7f, 0xb0),
-        accent: Color32::from_rgb(0xff, 0x4d, 0xcd),
-        accent2: Color32::from_rgb(0x00, 0xf0, 0xff),
-        accent_soft: Color32::from_rgba_unmultiplied_const(0xff, 0x4d, 0xcd, 0x22),
-        success: Color32::from_rgb(0x00, 0xff, 0x9f),
-        warning: Color32::from_rgb(0xff, 0xd3, 0x00),
-        danger: Color32::from_rgb(0xff, 0x5c, 0x8a),
+        name: THEME_LIGHT_NAME,
+        light: true,
+        bg_app: Color32::from_rgb(0xff, 0xfc, 0xf0),
+        bg_header: Color32::from_rgb(0xff, 0xfc, 0xf0),
+        bg_panel: Color32::from_rgb(0xf2, 0xf0, 0xeb),
+        bg_elevated: Color32::from_rgb(0xe8, 0xe6, 0xdb),
+        border: Color32::from_rgb(0xe8, 0xe1, 0xd0),
+        text_primary: Color32::from_rgb(0x10, 0x0f, 0x0f),
+        text_secondary: Color32::from_rgb(0x57, 0x56, 0x53),
+        text_muted: Color32::from_rgb(0x6f, 0x6e, 0x69),
+        accent: Color32::from_rgb(0x8e, 0x6a, 0xd9),
+        accent2: Color32::from_rgb(0x8e, 0x6b, 0x02),
+        accent_soft: Color32::from_rgba_unmultiplied_const(0x8e, 0x6a, 0xd9, 0x26),
+        accent_fg: Color32::from_rgb(0xff, 0xfc, 0xf0),
+        success: Color32::from_rgb(0x53, 0x69, 0x07),
+        warning: Color32::from_rgb(0x8e, 0x6b, 0x02),
+        danger: Color32::from_rgb(0xaf, 0x30, 0x29),
+        attention: Color32::from_rgb(0xad, 0x83, 0x01),
         term_bg: Rgb {
-            r: 0x0f,
-            g: 0x06,
-            b: 0x17,
+            r: 0xff,
+            g: 0xfc,
+            b: 0xf0,
         },
         term_fg: Rgb {
-            r: 0xe2,
-            g: 0xe2,
-            b: 0xff,
+            r: 0x10,
+            g: 0x0f,
+            b: 0x0f,
         },
         term_cursor: Rgb {
-            r: 0x00,
-            g: 0xff,
-            b: 0xe0,
+            r: 0x34,
+            g: 0x33,
+            b: 0x31,
         },
-        term_palette: PALETTE_CYBER,
+        term_palette: PALETTE_KAKU_LIGHT,
+        term_selection_bg: Color32::from_rgb(0xe8, 0xe6, 0xdb),
+        bg_overrides: LIGHT_BG_OVERRIDES,
+        fg_overrides: LIGHT_FG_OVERRIDES,
     },
 ];
 
@@ -609,70 +812,106 @@ pub static THEMES: [Theme; 3] = [
 mod tests {
     use super::*;
 
-    fn luminance(color: Color32) -> u16 {
-        u16::from(color.r()) * 3 + u16::from(color.g()) * 6 + u16::from(color.b())
-    }
-
-    fn is_pink_or_purple(r: u8, g: u8, b: u8) -> bool {
-        r.saturating_sub(g) > 12 && b.saturating_sub(g) > 12
+    #[test]
+    fn 深色主题取值与kaku一致() {
+        let t = &THEMES[0];
+        assert_eq!(t.name, "Kaku Dark");
+        assert!(!t.light);
+        assert_eq!(
+            t.term_bg,
+            Rgb {
+                r: 0x15,
+                g: 0x14,
+                b: 0x1b
+            }
+        );
+        assert_eq!(
+            t.term_fg,
+            Rgb {
+                r: 0xd5,
+                g: 0xd4,
+                b: 0xd6
+            }
+        );
+        assert_eq!(
+            t.term_cursor,
+            Rgb {
+                r: 0x8e,
+                g: 0x6a,
+                b: 0xd9
+            }
+        );
+        // 应用/标签栏/终端同底色（Kaku 的关键视觉约定）。
+        assert_eq!(t.bg_app, t.bg_header);
+        assert_eq!(t.bg_app, Color32::from_rgb(0x15, 0x14, 0x1b));
+        assert_eq!(t.term_palette[2], t.term_palette[6], "cyan 与 green 同色");
+        assert_ne!(t.term_palette[0], t.term_bg, "ANSI black 是浅灰而非底色");
     }
 
     #[test]
-    fn 默认深色主题保持低亮度石墨层级() {
-        let theme = &THEMES[0];
-        assert_eq!(theme.name, "深色");
-        for background in [
-            theme.bg_header,
-            theme.bg_app,
-            theme.bg_panel,
-            theme.bg_elevated,
-        ] {
-            assert!(
-                background.r().max(background.g()).max(background.b()) <= 0x22,
-                "默认背景过亮：{background:?}"
-            );
-        }
-        assert!(luminance(theme.bg_header) < luminance(theme.bg_app));
-        assert!(luminance(theme.bg_app) < luminance(theme.bg_panel));
-        assert!(luminance(theme.bg_panel) < luminance(theme.bg_elevated));
-        assert!(theme.term_bg.r.max(theme.term_bg.g).max(theme.term_bg.b) <= 0x0d);
+    fn 浅色主题取值与kaku一致() {
+        let t = &THEMES[1];
+        assert_eq!(t.name, "Kaku Light");
+        assert!(t.light);
+        assert_eq!(
+            t.term_bg,
+            Rgb {
+                r: 0xff,
+                g: 0xfc,
+                b: 0xf0
+            }
+        );
+        assert_eq!(
+            t.term_fg,
+            Rgb {
+                r: 0x10,
+                g: 0x0f,
+                b: 0x0f
+            }
+        );
+        assert_eq!(
+            t.term_palette[4],
+            Rgb {
+                r: 0x20,
+                g: 0x5e,
+                b: 0xa6
+            }
+        );
     }
 
     #[test]
-    fn 默认深色主题不含粉色或紫色() {
-        let theme = &THEMES[0];
-        for color in [
-            theme.bg_app,
-            theme.bg_header,
-            theme.bg_panel,
-            theme.bg_elevated,
-            theme.border,
-            theme.text_primary,
-            theme.text_secondary,
-            theme.text_muted,
-            theme.accent,
-            theme.accent2,
-            theme.accent_soft,
-            theme.success,
-            theme.warning,
-            theme.danger,
-        ] {
-            assert!(
-                !is_pink_or_purple(color.r(), color.g(), color.b()),
-                "默认 UI 色包含粉紫倾向：{color:?}"
-            );
-        }
+    fn 外观偏好解析() {
+        assert_eq!(resolve_appearance("dark", false), 0);
+        assert_eq!(resolve_appearance("light", true), 1);
+        assert_eq!(resolve_appearance("auto", true), 0);
+        assert_eq!(resolve_appearance("auto", false), 1);
+        // 旧主题名（如「深色」「深蓝」「霓虹」）一律按 auto 处理。
+        assert_eq!(resolve_appearance("深蓝", true), 0);
+        assert_eq!(resolve_appearance("深蓝", false), 1);
+        assert_eq!(theme_index_by_name("Kaku Dark"), Some(0));
+        assert_eq!(theme_index_by_name("Kaku Light"), Some(1));
+        assert_eq!(theme_index_by_name("霓虹"), None);
+    }
 
-        for color in
-            theme
-                .term_palette
-                .iter()
-                .chain([&theme.term_bg, &theme.term_fg, &theme.term_cursor])
-        {
-            assert!(
-                !is_pink_or_purple(color.r, color.g, color.b),
-                "默认终端色包含粉紫倾向：{color:?}"
-            );
+    #[test]
+    fn 替换表自洽() {
+        // 每个替换条目的键值都不同，且深浅两套互不混用。
+        for table in [
+            DARK_BG_OVERRIDES,
+            DARK_FG_OVERRIDES,
+            LIGHT_BG_OVERRIDES,
+            LIGHT_FG_OVERRIDES,
+        ] {
+            for (from, to) in table {
+                assert_ne!(from, to);
+            }
         }
+        let t = &THEMES[0];
+        assert!(t.bg_overrides.iter().any(|(from, _)| *from
+            == Rgb {
+                r: 0x6d,
+                g: 0x6d,
+                b: 0x6d
+            }));
     }
 }

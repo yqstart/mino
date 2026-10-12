@@ -8,11 +8,17 @@ description = "Mino 终端与 SFTP 引擎"
 [dependencies]
 alacritty_terminal = { workspace = true }
 serde = { workspace = true }
+# AI 客户端解析 Codex auth.json 与 API 响应。
+serde_json = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 tokio = { workspace = true }
 ureq = "3"
+# 与 alacritty_terminal 同版本（实现其 EventedReadWrite trait 需要同源的
+# Poller 类型）；parking_lot 用于读取路径上的轻量锁（无中毒错误分支）。
+polling = "3.8"
+parking_lot = "0.12"
 
 # libc 仅 unix 平台使用（SIGKILL 兜底关闭本地 shell）；Windows 无此概念。
 [target.'cfg(unix)'.dependencies]

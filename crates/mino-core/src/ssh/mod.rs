@@ -14,7 +14,7 @@ use std::sync::{
 use std::time::Duration;
 
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::{self, Term};
+use alacritty_terminal::term::Term;
 use alacritty_terminal::vte::ansi::Processor;
 use russh::client;
 use russh::keys::{decode_secret_key, HashAlg, PrivateKeyWithHashAlg};
@@ -303,11 +303,16 @@ async fn connect_and_serve_remote(
             // 实证，`TERM=xterm-256color` 只判 256 色）；sshd 默认不透传该
             // 变量，`AcceptEnv` 未放行时 set_env 失败也不阻塞建连（want_reply
             // 取 false，失败静默忽略）。
-            let _ = cancellable_connect(
-                &thread_cancel,
-                channel.set_env(false, "COLORTERM", "truecolor"),
-            )
-            .await;
+            // TERM_PROGRAM / MINO_SHELL_INTEGRATION：shell 集成脚本的守卫
+            // （只有 Mino 会话才加载 zsh 集成与 Smart Tab）。
+            for (key, value) in [
+                ("COLORTERM", "truecolor"),
+                ("TERM_PROGRAM", "Mino"),
+                ("MINO_SHELL_INTEGRATION", "1"),
+            ] {
+                let _ =
+                    cancellable_connect(&thread_cancel, channel.set_env(false, key, value)).await;
+            }
             if let Err(e) = cancellable_connect(&thread_cancel, channel.request_shell(true)).await {
                 if e == CONNECT_CANCELLED {
                     return;
@@ -323,10 +328,7 @@ async fn connect_and_serve_remote(
             // ============ 3. 创建终端状态机 ============
             let shared = Arc::new(Shared::default());
             let term: Arc<FairMutex<Term<Listener>>> = Arc::new(FairMutex::new(Term::new(
-                term::Config {
-                    kitty_keyboard: true,
-                    ..term::Config::default()
-                },
+                crate::terminal::term_config(),
                 &TermSize {
                     rows: rows as usize,
                     cols: cols as usize,
@@ -424,6 +426,10 @@ async fn remote_loop(
 ) {
     log::info!("remote_loop 启动");
     let mut parser: alacritty_terminal::vte::ansi::Processor = Processor::new();
+    // shell 集成标记嗅探（OSC 7/133）：远程读循环本来就是自己推进
+    // `Processor::advance`，在此直接喂嗅探器即可（本地路径见
+    // `sniffer::pty::SniffingPty`）。
+    let mut sniffer = crate::terminal::sniffer::OscSniffer::new();
 
     loop {
         tokio::select! {
@@ -478,16 +484,34 @@ async fn remote_loop(
                 match msg {
                     Some(ChannelMsg::Data { data }) => {
                         log::debug!("远程收到 {} 字节", data.len());
+                        let mut markers = Vec::new();
+                        sniffer.feed(&data, &mut markers);
                         let mut guard = term.lock();
                         parser.advance(&mut *guard, &data);
                         drop(guard);
+                        for marker in markers {
+                            crate::terminal::push_marker_event(
+                                &shared,
+                                &on_event,
+                                crate::terminal::marker_to_event(marker),
+                            );
+                        }
                         notify_wakeup(&shared, &on_event);
                     }
                     Some(ChannelMsg::ExtendedData { data, .. }) => {
                         // stderr 也喂入解析器（保持输出顺序完整）。
+                        let mut markers = Vec::new();
+                        sniffer.feed(&data, &mut markers);
                         let mut guard = term.lock();
                         parser.advance(&mut *guard, &data);
                         drop(guard);
+                        for marker in markers {
+                            crate::terminal::push_marker_event(
+                                &shared,
+                                &on_event,
+                                crate::terminal::marker_to_event(marker),
+                            );
+                        }
                         notify_wakeup(&shared, &on_event);
                     }
                     Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) => {

@@ -12,7 +12,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use mino_core::config::{Auth, HostConfig, HostProfile, ProjectProfile};
+use mino_core::config::{HostConfig, HostProfile, Workspace};
 use mino_core::ssh::sftp::{connect_sftp_with_handler, SftpEvent, SftpHandle};
 use mino_core::ssh::{connect_remote_with_cancel, ConnectCancel, ConnectResult};
 use mino_core::terminal::{Session, SessionEvent, SessionOptions};
@@ -21,15 +21,45 @@ use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
 
 use crate::anim;
 use crate::dialog;
+use crate::views::pane_tree::{self, PaneNode, SplitAxis};
 use crate::views::sftp_view::SftpView;
 use crate::views::terminal_view::TerminalView;
 
 /// 应用对外展示名称。
 pub const PRODUCT_NAME: &str = "Mino";
 
-/// 新建连接表单状态。
-struct ConnectForm {
+// ==================== Kaku 窗口样板常量 ====================
+/// 标题条高度（Kaku/WezTerm 集成标题栏：交通灯条，与终端同底色）。
+const TITLEBAR_HEIGHT: f32 = 28.0;
+/// 底部标签栏高度（Kaku/WezTerm 非 fancy 标签栏 ≈ 字号 × 1.6 + 内边距）。
+const TAB_BAR_HEIGHT: f32 = 30.0;
+/// 标签标题字号。
+const TAB_TITLE_SIZE: f32 = 12.5;
+/// 标签左右内边距（左给标题、右给关闭位）。
+const TAB_PADDING_L: f32 = 12.0;
+const TAB_PADDING_R: f32 = 4.0;
+/// 标签关闭位（「×」出现时占用的宽度）。
+const TAB_CLOSE_WIDTH: f32 = 20.0;
+/// 标签宽度夹取范围（上限 ≈ Kaku `tab_max_width = 48` 列）。
+const TAB_MIN_WIDTH: f32 = 84.0;
+const TAB_MAX_WIDTH: f32 = 320.0;
+/// 「＋」新建标签按钮宽度。
+const NEW_TAB_WIDTH: f32 = 34.0;
+/// 分屏窗格间隙（点）。Kaku `split_pane_gap = 2`（WezTerm cells 语义）的
+/// 视觉等效值：窗格底色相同，间隙只提供呼吸空间。
+const PANE_GAP: f32 = 10.0;
+
+/// 工作区编辑表单状态（本地目录 / SSH 主机二选一；新增或编辑既有条目）。
+struct WorkspaceEdit {
+    /// 编辑既有工作区的下标；None = 新增。
+    index: Option<usize>,
+    /// 0 = 本地目录，1 = SSH 主机。
+    kind: usize,
     name: String,
+    // 本地目录
+    path: String,
+    command: String,
+    // SSH
     host: String,
     port: String,
     user: String,
@@ -41,12 +71,15 @@ struct ConnectForm {
     name_focused: bool,
 }
 
-impl Default for ConnectForm {
+impl Default for WorkspaceEdit {
     fn default() -> Self {
         Self {
+            index: None,
+            kind: 1,
             name: String::new(),
+            path: std::env::var("HOME").unwrap_or_else(|_| "~".into()),
+            command: String::new(),
             host: String::new(),
-            // 默认 root / 22 端口，可修改（大多数服务器默认入口）。
             port: "22".into(),
             user: "root".into(),
             auth_kind: 0,
@@ -58,17 +91,113 @@ impl Default for ConnectForm {
     }
 }
 
-/// 项目新增/编辑表单状态（设置弹窗「项目管理」卡片内展开）。
-///
-/// `index` 为 `None` 表示新增，`Some(i)` 表示编辑第 i 个项目。
-/// `name_error`/`path_error` 记录上次保存校验结果，驱动输入框红边框。
-struct ProjectEdit {
-    index: Option<usize>,
-    name: String,
-    path: String,
-    command: String,
-    name_error: bool,
-    path_error: bool,
+impl WorkspaceEdit {
+    /// 用既有工作区填充表单（编辑入口）。
+    fn from_workspace(workspace: &Workspace) -> Self {
+        let mut edit = WorkspaceEdit {
+            name: workspace.name().to_string(),
+            command: workspace.command().to_string(),
+            ..WorkspaceEdit::default()
+        };
+        match workspace {
+            Workspace::Local { path, .. } => {
+                edit.kind = 0;
+                edit.path = path.display().to_string();
+            }
+            Workspace::Ssh {
+                host,
+                port,
+                user,
+                auth,
+                path,
+                ..
+            } => {
+                edit.kind = 1;
+                edit.host = host.clone();
+                edit.port = port.to_string();
+                edit.user = user.clone();
+                edit.path = path.clone();
+                match auth {
+                    mino_core::config::Auth::Password(password) => {
+                        edit.auth_kind = 0;
+                        edit.password = password.clone();
+                    }
+                    mino_core::config::Auth::Key { path, passphrase } => {
+                        edit.auth_kind = 1;
+                        edit.key_path = path.display().to_string();
+                        edit.passphrase = passphrase.clone().unwrap_or_default();
+                    }
+                }
+            }
+        }
+        edit
+    }
+
+    /// 表单 → 工作区（含必填校验；错误信息为中文提示）。
+    fn to_workspace(&self) -> Result<Workspace, String> {
+        if self.kind == 0 {
+            let path = self.path.trim();
+            if path.is_empty() {
+                return Err("请填写目录路径".into());
+            }
+            let path = PathBuf::from(path);
+            let name = if self.name.trim().is_empty() {
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.to_string_lossy().into_owned())
+            } else {
+                self.name.trim().to_string()
+            };
+            Ok(Workspace::Local {
+                name,
+                path,
+                command: self.command.trim().to_string(),
+            })
+        } else {
+            let host = self.host.trim();
+            if host.is_empty() {
+                return Err("请填写主机地址".into());
+            }
+            let port_wrong =
+                !self.port.trim().is_empty() && self.port.trim().parse::<u16>().is_err();
+            let port = if port_wrong {
+                return Err("端口必须是 1-65535 的数字".into());
+            } else {
+                self.port.trim().parse::<u16>().unwrap_or(22)
+            };
+            let user = if self.user.trim().is_empty() {
+                "root".to_string()
+            } else {
+                self.user.trim().to_string()
+            };
+            let auth = if self.auth_kind == 0 {
+                mino_core::config::Auth::Password(self.password.clone())
+            } else {
+                let key_path = self.key_path.trim();
+                if key_path.is_empty() {
+                    return Err("请填写私钥路径".into());
+                }
+                mino_core::config::Auth::Key {
+                    path: PathBuf::from(key_path),
+                    passphrase: (!self.passphrase.is_empty()).then(|| self.passphrase.clone()),
+                }
+            };
+            let name = if self.name.trim().is_empty() {
+                host.to_string()
+            } else {
+                self.name.trim().to_string()
+            };
+            Ok(Workspace::Ssh {
+                name,
+                host: host.to_string(),
+                port,
+                user,
+                auth,
+                path: self.path.trim().to_string(),
+                command: self.command.trim().to_string(),
+            })
+        }
+    }
 }
 
 /// 更新下载事件（后台线程 → UI）。
@@ -116,23 +245,201 @@ struct Toast {
     start: f64,
 }
 
-/// 单个终端标签页（本地或远程会话）。
-pub struct TerminalTab {
-    /// 标签稳定身份，不随 Vec 中的插入、删除或移动变化。
+/// 单个窗格（分屏后的一个终端视图；每个窗格一个独立会话）。
+pub struct Pane {
+    /// 窗格稳定身份（布局树叶子 id；与标签共用同一 id 分配器）。
     id: u64,
-    label: String,
-    terminal: TerminalView,
-    sftp: Option<SftpView>,
-    /// SFTP 面板是否展开（tabby 形式：默认收起，终端右上角悬浮按钮切换）。
-    sftp_open: bool,
-    /// SFTP“定位到终端位置”等待中的终端 `pwd` 探测。
-    ///
-    /// 面板只表达“用户想要定位”，真正的目录要等 shell 的 `pwd` 输出把
-    /// 跟踪器校正到真实值后才能导航（输入跟踪在 Tab/粘贴/别名/函数等
-    /// 场景下会失效，直接用旧推测值就是“只有 pwd 后才好用”的根因）。
-    /// 等待期间每帧检查 `TerminalView::auto_pwd_ready()`，拿到结果就
-    /// 导航；超时则取消探测、用已知目录回退并给明确反馈。
-    locate_pending: Option<LocatePending>,
+    view: TerminalView,
+}
+
+/// 会话来源：分屏时新窗格继承同源会话（本地 → 本地、SSH → 同主机重连），
+/// 快照恢复也按它重建。
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum SessionOrigin {
+    /// 本地 shell（分屏的新窗格以活动窗格当前目录启动）。
+    Local,
+    /// SSH 会话（分屏重连同主机）。
+    Remote(HostProfile),
+}
+
+/// 以 0600 原子写一份 TOML（快照等含凭据的文件；与 `HostConfig::save`
+/// 同一套安全约定：临时文件 + rename + 失败清理）。
+fn save_private_toml<T: serde::Serialize>(
+    value: &T,
+    path: &std::path::Path,
+) -> std::io::Result<()> {
+    let content = toml::to_string_pretty(value)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension(format!("toml.tmp-{}", std::process::id()));
+    let result = (|| {
+        use std::io::Write;
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?
+        };
+        #[cfg(not(unix))]
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Codex 配置目录（`~/.codex`；`auth_type = "codex"` 时读它）。
+fn codex_home_path() -> std::path::PathBuf {
+    std::env::var("HOME")
+        .map(|home| PathBuf::from(home).join(".codex"))
+        .unwrap_or_else(|_| PathBuf::from(".codex"))
+}
+
+/// AI 助手简单模型名（`model`；空则回退 `chat_model`；都空则未配置）。
+fn ai_simple_model(config: &mino_core::ai::AssistantConfig) -> Option<String> {
+    let model = if !config.model.is_empty() {
+        &config.model
+    } else {
+        &config.chat_model
+    };
+    (!model.is_empty()).then(|| model.clone())
+}
+
+/// 当前目录的 git 分支（不在仓库/无 git 时 None；供提示词上下文用）。
+fn git_branch_for(cwd: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!branch.is_empty()).then_some(branch)
+}
+
+/// toast 用的一行摘要（截到 72 个字符，换行折叠为空格）。
+fn truncate_for_toast(text: &str) -> String {
+    let mut out: String = text.chars().take(72).collect();
+    if text.chars().count() > 72 {
+        out.push('…');
+    }
+    out.replace('\n', " ")
+}
+
+/// 失败命令修复的后台作业（阻塞网络调用；返回 None 表示跳过/失败）。
+fn ai_fix_worker(
+    config: &mino_core::ai::AssistantConfig,
+    command: &str,
+    exit_code: i32,
+    cwd: &str,
+    tail: &str,
+    codex_home: &std::path::Path,
+) -> Option<mino_core::ai::FixSuggestion> {
+    let conn = config.resolve_connection(codex_home).ok()?;
+    let model = ai_simple_model(config)?;
+    let branch = git_branch_for(cwd);
+    let context = mino_core::ai::FixContext {
+        failed_command: command,
+        exit_code,
+        cwd,
+        git_branch: branch.as_deref(),
+        tail_output: tail,
+    };
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    mino_core::ai::suggest_fix(&conn, &model, &context, &cancel).ok()
+}
+
+/// `#` 命令生成的后台作业（错误已转中文文案）。
+fn ai_generate_worker(
+    config: &mino_core::ai::AssistantConfig,
+    query: &str,
+    cwd: &str,
+    tail: &str,
+    codex_home: &std::path::Path,
+) -> Result<String, String> {
+    let conn = config
+        .resolve_connection(codex_home)
+        .map_err(|e| format!("{e}"))?;
+    let model =
+        ai_simple_model(config).ok_or_else(|| "未配置模型（设置 → AI 助手）".to_string())?;
+    let branch = git_branch_for(cwd);
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    mino_core::ai::suggest_command(&conn, &model, query, cwd, &branch, tail, &cancel)
+        .map_err(|e| format!("{e}"))
+}
+
+/// AI 失败修复的结果（挂到具体窗格；⌘⇧E 回填）。
+struct AiFixOutcome {
+    tab_id: u64,
+    pane_id: u64,
+    suggestion: mino_core::ai::FixSuggestion,
+}
+
+/// AI `#` 命令生成的结果（挂到具体窗格；成功即回填提示符）。
+struct AiGenerateOutcome {
+    tab_id: u64,
+    pane_id: u64,
+    result: Result<String, String>,
+}
+
+/// Launcher 覆盖层的两种形态（决定每帧是否同步数据源）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LauncherMode {
+    /// 标签导航器（⌘⇧O）。
+    Tabs,
+    /// 命令面板（⌘⇧P）。
+    Palette,
+}
+
+/// 已关闭标签的重开信息（Kaku `Cmd+Shift+T`）。
+struct ClosedTab {
+    title: String,
+    origin: SessionOrigin,
+    /// 本地标签关闭时的当前目录（重开用它恢复工作目录）。
+    dir: Option<PathBuf>,
+}
+
+/// 重开栈上限（超出丢弃最旧；Kaku 同款"最近若干次"语义）。
+const CLOSED_TAB_STACK: usize = 12;
+
+/// 窗口快照（Kaku「Restore Previous Window」：重开上次的全部标签）。
+///
+/// 快照里含 SSH 认证信息（与 hosts.toml 同级的明文口令/私钥口令），因此
+/// 落盘必须 0600；损坏/缺失一律按「没有快照」处理，不阻塞启动。
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct WindowSnapshot {
+    #[serde(default)]
+    tabs: Vec<SnapshotTab>,
+}
+
+/// 单个快照标签：本地记目录，远程记主机档案与远端目录。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SnapshotTab {
+    origin: SessionOrigin,
+    #[serde(default)]
+    dir: Option<PathBuf>,
+}
+
+/// 分屏挂载目标：新会话要挂进哪个标签的哪个窗格、以哪个方向拆分。
+#[derive(Clone, Copy)]
+struct SplitTarget {
+    tab_id: u64,
+    pane_id: u64,
+    axis: SplitAxis,
 }
 
 /// 等待中的一次 SFTP 定位探测。
@@ -151,28 +458,139 @@ struct PendingImagePaste {
     transfer_id: u64,
 }
 
+/// 单个终端标签页（本地或 SSH；可含多个分屏窗格）。
+pub struct TerminalTab {
+    /// 标签稳定身份，不随 Vec 中的插入、删除或移动变化。
+    id: u64,
+    /// 兜底标题（远程标签 = 主机名；目录未知时也用它）。
+    label: String,
+    /// 分屏窗格集合（至少一个）。
+    panes: Vec<Pane>,
+    /// 布局树；叶子 id 与 `panes[].id` 一一对应。
+    layout: PaneNode,
+    /// 活动窗格 id（键盘输入、标题、SFTP 定位都以它为上下文）。
+    active_pane: u64,
+    /// 放大显示的窗格（Kaku `Cmd+Shift+Enter` = TogglePaneZoomState）。
+    zoomed: Option<u64>,
+    /// 最近一帧各窗格的屏幕矩形（渲染时写入；窗格导航/比例调整读它，
+    /// 保证几何判断与真实渲染同源）。
+    pane_rects: Vec<(u64, egui::Rect)>,
+    /// 用户双击重命名后的标签标题（None = 跟随目录/主机）。
+    title_override: Option<String>,
+    /// 会话来源（分屏继承、快照恢复用）。
+    origin: SessionOrigin,
+    sftp: Option<SftpView>,
+    /// SFTP 面板是否展开（tabby 形式：默认收起，终端右上角悬浮按钮切换）。
+    sftp_open: bool,
+    /// SFTP“定位到终端位置”等待中的终端 `pwd` 探测。
+    ///
+    /// 面板只表达“用户想要定位”，真正的目录要等 shell 的 `pwd` 输出把
+    /// 跟踪器校正到真实值后才能导航（输入跟踪在 Tab/粘贴/别名/函数等
+    /// 场景下会失效，直接用旧推测值就是“只有 pwd 后才好用”的根因）。
+    /// 等待期间每帧检查 `TerminalView::auto_pwd_ready()`，拿到结果就
+    /// 导航；超时则取消探测、用已知目录回退并给明确反馈。
+    locate_pending: Option<LocatePending>,
+}
+
 impl TerminalTab {
-    fn new(id: u64, label: String, terminal: TerminalView) -> Self {
+    fn new(
+        id: u64,
+        label: String,
+        view: TerminalView,
+        pane_id: u64,
+        origin: SessionOrigin,
+    ) -> Self {
         Self {
             id,
             label,
-            terminal,
+            panes: vec![Pane { id: pane_id, view }],
+            layout: pane_tree::leaf(pane_id),
+            active_pane: pane_id,
+            zoomed: None,
+            pane_rects: Vec::new(),
+            title_override: None,
+            origin,
             sftp: None,
             sftp_open: false,
             locate_pending: None,
         }
     }
 
-    /// 标签/状态栏标题：`(显示文本, 全路径悬浮提示)`。
+    /// 活动窗格视图。
+    fn active_view(&self) -> &TerminalView {
+        self.view(self.active_pane).unwrap_or(&self.panes[0].view)
+    }
+
+    /// 活动窗格视图（可变）。
+    fn active_view_mut(&mut self) -> &mut TerminalView {
+        let id = self.active_pane;
+        let index = self
+            .panes
+            .iter()
+            .position(|pane| pane.id == id)
+            .unwrap_or(0);
+        &mut self.panes[index].view
+    }
+
+    /// 按窗格 id 取视图。
+    fn view(&self, pane_id: u64) -> Option<&TerminalView> {
+        self.panes
+            .iter()
+            .find(|pane| pane.id == pane_id)
+            .map(|pane| &pane.view)
+    }
+
+    /// 在 `near` 窗格旁按 `axis` 加入一个新窗格并聚焦（分屏挂载）。
     ///
-    /// - 本地标签：当前目录的**末级文件夹名**（与 zsh `%c` 提示符一致，home
+    /// 找不到 `near`（布局与集合不同步）时拒绝：宁可不分屏也不留下
+    /// 树里没有的孤儿窗格。
+    fn add_pane(&mut self, pane_id: u64, view: TerminalView, near: u64, axis: SplitAxis) -> bool {
+        if !pane_tree::split_leaf(&mut self.layout, near, pane_id, axis) {
+            return false;
+        }
+        self.panes.push(Pane { id: pane_id, view });
+        self.active_pane = pane_id;
+        self.zoomed = None;
+        true
+    }
+
+    /// 标签标题：`(显示文本, 全路径悬浮提示)`。
+    ///
+    /// - 用户重命名过：用自定义标题；
+    /// - 多窗格：各窗格目录名以 `∙` 去重连接（Kaku 多窗格标签同款），
+    ///   悬浮提示给出各自全路径；
+    /// - 本地单窗格：当前目录的**末级文件夹名**（与 zsh `%c` 一致，home
     ///   显示 `~`）+ 全路径提示。目录以 shell 子进程的内核 cwd 为准
-    ///   （`Session::child_current_dir`，每帧读取无缓存延迟）；
-    ///   **不**采用 shell 上报的窗口标题——oh-my-zsh 的标题是截断过的
-    ///   `%15<..<%~%<<`，既非末级目录名也拿不到完整路径。
-    /// - 远程标签：主机名（远端目录由 sshd 决定、本地跟踪器不适用，主机名
-    ///   才是用户认得的身份），无悬浮提示；`label` 仅在目录未知时兜底。
+    ///   （`Session::child_current_dir`）；**不**采用 shell 上报的窗口标题
+    ///   （oh-my-zsh 的标题是截断过的 `%15<..<%~%<<`，拿不到完整路径）。
+    /// - 远程标签：主机名（远端目录由 sshd 决定、本地跟踪器不适用）。
     fn title(&self) -> (String, Option<String>) {
+        if let Some(custom) = &self.title_override {
+            return (custom.clone(), None);
+        }
+        let dirs: Vec<(String, String)> = self
+            .panes
+            .iter()
+            .filter_map(|pane| {
+                pane.view
+                    .effective_local_directory()
+                    .map(|full| (dir_display_name(&full), full))
+            })
+            .collect();
+        if dirs.len() >= 2 {
+            let mut seen: Vec<String> = Vec::new();
+            for (name, _) in &dirs {
+                if !seen.contains(name) {
+                    seen.push(name.clone());
+                }
+            }
+            let tooltip = dirs
+                .iter()
+                .map(|(_, full)| full.clone())
+                .collect::<Vec<_>>()
+                .join("\n");
+            return (seen.join("∙"), Some(tooltip));
+        }
         match self.local_dir() {
             Some((name, full)) => (name, Some(full)),
             None => (self.label.clone(), None),
@@ -186,9 +604,112 @@ impl TerminalTab {
     /// 标题不能依赖它；也不采用 shell 上报的窗口标题（oh-my-zsh 的标题是
     /// 截断过的 `%15<..<%~%<<`）。
     fn local_dir(&self) -> Option<(String, String)> {
-        let full = self.terminal.effective_local_directory()?;
+        let full = self.active_view().effective_local_directory()?;
         Some((dir_display_name(&full), full))
     }
+}
+
+/// 绘制一行工作区条目（头像 + 名称 + 类型/地址 + 选中/悬停底），返回行点击响应。
+///
+/// 三处共用（快捷菜单、⌘O 面板、设置卡片）保证观感与命中行为一致；
+/// 行交互用显式 `ui.interact(row_rect, 稳定 Id, Sense::click())` 注册在内容
+/// 之后（egui 响应链：后注册者在上层，参考 SFTP 行的既有做法）。
+fn paint_workspace_row(
+    ui: &mut egui::Ui,
+    workspace: &Workspace,
+    selected: bool,
+    row_id: egui::Id,
+    row_height: f32,
+    avatar: f32,
+) -> egui::Response {
+    let theme = crate::theme::current_theme();
+    let width = ui.available_width();
+    let (row_rect, _) = ui.allocate_exact_size(egui::vec2(width, row_height), egui::Sense::hover());
+    let highlight = row_rect.shrink2(egui::vec2(4.0, 1.0));
+    let hovered = ui.rect_contains_pointer(highlight);
+    if selected {
+        ui.painter().rect_filled(
+            highlight,
+            crate::theme::tokens::RADIUS_ITEM,
+            theme.accent_soft,
+        );
+    } else if hovered {
+        ui.painter().rect_filled(
+            highlight,
+            crate::theme::tokens::RADIUS_ITEM,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16),
+        );
+    }
+    let mut inner = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt(row_id)
+            .max_rect(row_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    inner.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+    inner.add_space(10.0);
+    let (avatar_rect, _) =
+        inner.allocate_exact_size(egui::vec2(avatar, avatar), egui::Sense::hover());
+    let initial = workspace.name().chars().next().unwrap_or('?');
+    dialog::paint_avatar(inner.painter(), avatar_rect, initial, theme, selected);
+    // 类型徽标（本地 / SSH）：小圆角片，颜色区分两类工作区。
+    let kind_color = if workspace.is_remote() {
+        theme.accent2
+    } else {
+        theme.accent
+    };
+    let kind_label = if workspace.is_remote() {
+        "SSH"
+    } else {
+        "本地"
+    };
+    inner.add_space(8.0);
+    let (badge_rect, _) = inner.allocate_exact_size(egui::vec2(34.0, 16.0), egui::Sense::hover());
+    inner.painter().rect_filled(
+        badge_rect,
+        3.0,
+        egui::Color32::from_rgba_unmultiplied(kind_color.r(), kind_color.g(), kind_color.b(), 40),
+    );
+    let mut badge = inner.new_child(
+        egui::UiBuilder::new()
+            .id_salt(row_id.with("badge"))
+            .max_rect(badge_rect)
+            .layout(egui::Layout::centered_and_justified(
+                egui::Direction::TopDown,
+            )),
+    );
+    badge.label(egui::RichText::new(kind_label).size(9.5).color(kind_color));
+    inner.add_space(8.0);
+    let text_width = (row_rect.width() - 10.0 * 2.0 - avatar - 34.0 - 8.0 * 2.0).max(80.0);
+    let text_rect = inner
+        .allocate_exact_size(egui::vec2(text_width, 30.0), egui::Sense::hover())
+        .0;
+    let mut text = inner.new_child(
+        egui::UiBuilder::new()
+            .id_salt(row_id.with("text"))
+            .max_rect(text_rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    text.spacing_mut().item_spacing.y = 1.0;
+    text.add_space(2.0);
+    text.add(
+        egui::Label::new(
+            egui::RichText::new(workspace.name())
+                .size(12.5)
+                .color(theme.text_primary),
+        )
+        .truncate(),
+    );
+    text.add(
+        egui::Label::new(
+            egui::RichText::new(workspace.detail())
+                .size(10.5)
+                .color(theme.text_secondary),
+        )
+        .truncate(),
+    );
+    ui.interact(row_rect, row_id.with("click"), egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// 目录的展示名：只保留最末级文件夹名（与 zsh `%c` 提示符语义一致）。
@@ -237,32 +758,34 @@ pub struct MinoApp {
     pending_tab: Option<u64>,
     /// 当前等待 SSH 结果的连接身份。
     pending_connection_id: Option<u64>,
+    /// 当前等待中的连接若为分屏用途，目标窗格信息（None = 建新标签）。
+    pending_split: Option<SplitTarget>,
+    /// 当前等待中的连接主机档案（分屏/新标签挂载时写入会话来源）。
+    pending_profile: Option<HostProfile>,
     /// 标签与连接身份分配器。
     next_id: u64,
-    /// 主机行最近一次点击（时间, 行索引），自实现双击检测。
-    last_row_click: Option<(f64, usize)>,
-    /// 设置中的当前主机焦点（单击后保持，双击连接）。
-    selected_host: Option<usize>,
     /// 设置弹窗是否打开（`⌘,` 或齿轮按钮切换；Esc/× 关闭）。
     show_settings: bool,
     /// 项目打开面板是否打开（`⌘O` 切换；Esc/回车关闭）。
-    show_projects: bool,
+    show_workspaces: bool,
     /// 项目搜索过滤词（快捷菜单与 ⌘O 面板共用）。
-    project_filter: String,
+    workspace_filter: String,
     /// 过滤后项目列表的选中下标（⌘O 面板上下键导航用）。
-    project_selected: usize,
+    workspace_selected: usize,
     /// 最近一帧的 egui::Context（`new_local_tab` 等非 UI 闭包内构造时使用）。
     last_ctx: egui::Context,
     config: HostConfig,
     config_path: PathBuf,
     /// 原配置无法读取且备份也失败时，禁止用空配置覆盖原文件。
     config_write_blocked: bool,
-    show_new_conn: bool,
     /// 新建连接弹窗关闭后是否恢复此前被其遮住的设置窗口。
-    settings_before_new_conn: bool,
-    form: ConnectForm,
-    /// 项目新增/编辑表单（`None` 表示未展开）。
-    project_edit: Option<ProjectEdit>,
+    settings_before_workspace_edit: bool,
+    /// 工作区编辑表单（`None` = 对话框关闭；新增/编辑共用同一表单）。
+    workspace_edit: Option<WorkspaceEdit>,
+    /// AI 聊天面板（⌘L，Kaku 同款；输入门禁在渲染处统一处理）。
+    ai_panel: crate::views::ai_panel::AiPanel,
+    /// Launcher 覆盖层：标签导航（⌘⇧O）或命令面板（⌘⇧P），互斥。
+    launcher: Option<(LauncherMode, crate::views::launcher::Launcher)>,
     pending: Option<UnboundedReceiver<ConnectResult>>,
     /// 当前 SSH 连接建立阶段的取消句柄；替换或销毁等待中的连接时立即取消。
     pending_connect_cancel: Option<ConnectCancel>,
@@ -307,6 +830,24 @@ pub struct MinoApp {
     cjk_fonts: Option<crate::CjkFontLoader>,
     /// 后台创建中的本地终端会话（PTY fork + shell 启动不再堵住首帧）。
     pending_local: Option<PendingLocalSpawn>,
+    /// 已关闭标签的重开栈（Kaku `Cmd+Shift+T`；上限 `CLOSED_TAB_STACK`）。
+    closed_tabs: Vec<ClosedTab>,
+    /// 正在重命名的标签 `(标签 id, 编辑缓冲)`（双击标签标题进入，Kaku 同款）。
+    renaming_tab: Option<(u64, String)>,
+    /// `~/.zshrc` 路径（测试用隔离路径；shell 集成的受管块写入目标）。
+    zshrc_path: PathBuf,
+    /// 进行中的 AI 失败修复请求（单飞：新失败覆盖旧请求的结果展示）。
+    ai_fix_rx: Option<std::sync::mpsc::Receiver<Option<AiFixOutcome>>>,
+    /// 进行中的 `#` 命令生成请求。
+    ai_generate_rx: Option<std::sync::mpsc::Receiver<Option<AiGenerateOutcome>>>,
+    /// 最近一次失败修复建议（⌘⇧E 应用到对应窗格；应用后清空）。
+    ai_fix_suggestion: Option<AiFixOutcome>,
+    /// Shell 集成插件后台下载的结果通道。
+    vendor_rx: Option<
+        std::sync::mpsc::Receiver<Vec<Result<mino_core::shell_integration::Plugin, String>>>,
+    >,
+    /// 插件下载进行中（按钮状态与重复点击防护）。
+    vendor_running: bool,
 }
 
 /// 正在后台创建的本地终端会话。
@@ -319,6 +860,8 @@ struct PendingLocalSpawn {
     rx: std::sync::mpsc::Receiver<std::io::Result<Session>>,
     /// 打开后自动执行的启动命令（项目收藏；取首个非空行）。
     command: String,
+    /// 分屏挂载目标；None = 作为新标签挂载。
+    target: Option<SplitTarget>,
 }
 
 /// 本地终端会话选项：默认工作目录为 home，注入 TERM 与颜色环境变量。
@@ -346,6 +889,11 @@ fn local_session_options_at(dir: Option<PathBuf>) -> SessionOptions {
             // 实证）；`TERM=xterm-256color` 只判 8。mino 渲染层本就走真彩
             // （`resolve_color` 直接 RGB），此前缺这一行让 omp 全程降级 256 色。
             ("COLORTERM".to_string(), "truecolor".to_string()),
+            // 终端身份（Kaku 用 TERM_PROGRAM=Kaku 同款）：shell 集成脚本按
+            // `TERM_PROGRAM == "Mino"` / `MINO_SHELL_INTEGRATION=1` 守卫，
+            // 只在 Mino 会话里加载 zsh 集成与 Smart Tab，其它终端不受影响。
+            ("TERM_PROGRAM".to_string(), "Mino".to_string()),
+            ("MINO_SHELL_INTEGRATION".to_string(), "1".to_string()),
             ("CLICOLOR".to_string(), "1".to_string()),
             ("LSCOLORS".to_string(), "Gxfxcxdxbxegedabagacad".to_string()),
         ]
@@ -360,9 +908,10 @@ fn sftp_floating_button(ui: &mut egui::Ui, open: bool) -> bool {
     let theme = crate::theme::current_theme();
     let area = ui.max_rect();
     let btn_size = egui::vec2(60.0, 24.0);
-    // 与终端内容内边距一致（PADDING=10），悬浮于终端区域右上角。
+    // 与终端内容内边距一致（Kaku 的 40 设备像素），悬浮于终端区域右上角。
+    let pad = crate::views::terminal_view::padding_points(ui.ctx().pixels_per_point());
     let btn_rect = egui::Rect::from_min_size(
-        egui::pos2(area.right() - 10.0 - btn_size.x, area.top() + 10.0),
+        egui::pos2(area.right() - pad - btn_size.x, area.top() + pad),
         btn_size,
     );
     let (fill, stroke, fg) = if open {
@@ -439,41 +988,12 @@ fn settings_gear_button(ui: &mut egui::Ui) -> bool {
     response.clicked()
 }
 
-/// 标签栏快速 SSH 连接按钮。22×22 纯图标按钮（">_" 终端符号，业界通用的
-/// "命令行/终端"标识），风格与齿轮一致：次要色、hover 白 8% 圆角底。
-/// 点击弹出已保存主机列表（`Popup::menu` 自行管理开关状态，Id 需稳定）。
-fn ssh_quick_button(ui: &mut egui::Ui) -> egui::Response {
-    let theme = crate::theme::current_theme();
-    let btn_size = 22.0;
-    let btn = egui::Button::new(
-        egui::RichText::new(">_")
-            .monospace()
-            .size(11.0)
-            .color(theme.text_secondary),
-    )
-    .fill(egui::Color32::TRANSPARENT)
-    .stroke(egui::Stroke::NONE)
-    .min_size(egui::vec2(btn_size, btn_size));
-    let response = ui
-        .add(btn)
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text("快速连接已保存主机");
-    if response.hovered() && ui.is_rect_visible(response.rect) {
-        // hover：白色 8% 圆角底（与全局控件 hover 一致）。
-        ui.painter().rect_filled(
-            response.rect,
-            crate::theme::tokens::RADIUS_ITEM,
-            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18),
-        );
-    }
-    response
-}
-
-/// 标签栏项目收藏按钮。22×22 纯矢量文件夹图标（圆角矩形主体 + 左上标签突起），
-/// 风格与齿轮/`>_ `一致：次要色描边、hover 白 8% 圆角底。
-/// 禁用 unicode 文件夹符号（缺字形会变方块，主字体之外的符号走 fallback 链）。
-/// 点击弹出项目收藏菜单（`Popup::menu` 自行管理开关状态，Id 需稳定）。
-fn project_quick_button(ui: &mut egui::Ui) -> egui::Response {
+/// 标签栏「工作区」按钮（SSH 与项目收藏的融合入口）。
+///
+/// 22×22 纯矢量图标（三个堆叠的圆角方块 = 集合/工作区），风格与齿轮一致：
+/// 次要色描边、hover 白 8% 圆角底、无 unicode 依赖（缺字形会变方块）。
+/// 点击弹出统一工作区菜单（`Popup::menu` 自行管理开关状态，Id 需稳定）。
+fn workspace_quick_button(ui: &mut egui::Ui) -> egui::Response {
     let theme = crate::theme::current_theme();
     let btn_size = 22.0;
     let btn = egui::Button::new("")
@@ -483,7 +1003,7 @@ fn project_quick_button(ui: &mut egui::Ui) -> egui::Response {
     let response = ui
         .add(btn)
         .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text("打开项目（⌘O）");
+        .on_hover_text("工作区：本地目录与 SSH 主机（⌘O）");
     let rect = response.rect;
     if ui.is_rect_visible(rect) {
         if response.hovered() {
@@ -499,30 +1019,23 @@ fn project_quick_button(ui: &mut egui::Ui) -> egui::Response {
             theme.text_secondary
         };
         let center = rect.center();
-        // 文件夹主体：12×8.5 圆角矩形；标签突起在左上。
-        let body =
-            egui::Rect::from_center_size(center + egui::vec2(0.0, 1.0), egui::vec2(12.0, 8.5));
-        ui.painter().rect_stroke(
-            body,
-            2.0,
-            egui::Stroke::new(1.4, icon_color),
-            egui::StrokeKind::Inside,
-        );
-        let tab = egui::Rect::from_min_size(
-            egui::pos2(body.left() + 1.0, body.top() - 2.5),
-            egui::vec2(5.0, 3.0),
-        );
-        ui.painter().rect_stroke(
-            tab,
-            1.0,
-            egui::Stroke::new(1.4, icon_color),
-            egui::StrokeKind::Inside,
-        );
+        for (offset_y, size) in [
+            (4.0_f32, egui::vec2(12.0, 4.0)),
+            (0.5, egui::vec2(8.5, 3.5)),
+            (-3.0, egui::vec2(5.0, 3.0)),
+        ] {
+            let block = egui::Rect::from_center_size(center + egui::vec2(0.0, offset_y), size);
+            ui.painter().rect_stroke(
+                block,
+                1.5,
+                egui::Stroke::new(1.3, icon_color),
+                egui::StrokeKind::Inside,
+            );
+        }
     }
     response
 }
 
-/// 当前 macOS 架构 → 发布产物命名（release.yml 约定）。
 fn macos_arch() -> &'static str {
     match std::env::consts::ARCH {
         "aarch64" => "arm64",
@@ -753,13 +1266,37 @@ impl MinoApp {
             }
         };
 
-        // 主题恢复：已保存的主题名 → 对应下标；未知/空则默认第一套
-        // （曾启动硬编码 set_theme(0)，切换皮肤退出重进永远回到原来的）。
-        let initial_theme = crate::theme::theme_index_by_name(config.theme.trim()).unwrap_or(0);
-        crate::theme::set_theme(&ctx, initial_theme);
-        // 字号恢复：钳制到合法区间（手改配置写 0/负数/超大不能炸渲染；
-        // 老配置缺字段时 serde 已回默认 13）。
+        // shell 集成的受管块目标：生产写用户 `~/.zshrc`；测试写到隔离配置
+        // 同目录（测试绝不能改用户的真实 shell 配置——与主机配置隔离同理）。
+        let zshrc_path = {
+            #[cfg(test)]
+            {
+                config_path.with_extension("zshrc")
+            }
+            #[cfg(not(test))]
+            {
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+                PathBuf::from(home).join(".zshrc")
+            }
+        };
+
+        // 外观恢复：`auto` 跟随系统、`dark`/`light` 强制；旧配置的主题名
+        // （「深色/深蓝/霓虹」）解析为 auto（`resolve_appearance` 语义）。
+        // 字号恢复：老默认 13 视为“未设置”，提升到 Kaku 基准（高分屏 17 /
+        // 低分屏 15——Kaku `get_font_size`）；用户显式调过的其它值保留并钳制。
         let mut config = config;
+        let system_dark = ctx.system_theme() != Some(egui::Theme::Light);
+        crate::theme::set_theme(
+            &ctx,
+            crate::theme::resolve_appearance(config.appearance.trim(), system_dark),
+        );
+        if (config.font_size - 13.0).abs() < 0.01 {
+            config.font_size = if ctx.pixels_per_point() <= 1.0 {
+                15.0
+            } else {
+                17.0
+            };
+        }
         config.font_size = config
             .font_size
             .clamp(TerminalView::MIN_FONT_SIZE, TerminalView::MAX_FONT_SIZE);
@@ -769,21 +1306,21 @@ impl MinoApp {
             active_tab: 0,
             pending_tab: None,
             pending_connection_id: None,
+            pending_split: None,
+            pending_profile: None,
             next_id: 1,
-            last_row_click: None,
-            selected_host: None,
             show_settings: false,
-            show_projects: false,
-            project_filter: String::new(),
-            project_selected: 0,
+            show_workspaces: false,
+            workspace_filter: String::new(),
+            workspace_selected: 0,
             last_ctx: cc.egui_ctx.clone(),
             config,
             config_path,
             config_write_blocked,
-            show_new_conn: false,
-            settings_before_new_conn: false,
-            form: ConnectForm::default(),
-            project_edit: None,
+            settings_before_workspace_edit: false,
+            workspace_edit: None,
+            ai_panel: crate::views::ai_panel::AiPanel::new(),
+            launcher: None,
             pending: None,
             pending_connect_cancel: None,
             pending_label: String::new(),
@@ -806,6 +1343,14 @@ impl MinoApp {
             terminal_gpu,
             cjk_fonts: None,
             pending_local: None,
+            closed_tabs: Vec::new(),
+            renaming_tab: None,
+            zshrc_path: zshrc_path.clone(),
+            ai_fix_rx: None,
+            ai_generate_rx: None,
+            ai_fix_suggestion: None,
+            vendor_rx: None,
+            vendor_running: false,
         };
         // 启动时自动检查更新（后台线程，延迟 3 秒，静默）。
         if let Some(message) = load_message {
@@ -825,6 +1370,27 @@ impl MinoApp {
         }
         if auto_update {
             app.start_update_check(true, &ctx);
+        }
+        // 首次运行：安装 Shell 集成（Kaku 的 first-run 体验：受管块幂等可
+        // 卸载，插件后台补下载；已安装则零动作、不再打扰）。
+        #[cfg(not(test))]
+        {
+            if !mino_core::shell_integration::is_installed(&app.zshrc_path) {
+                match mino_core::shell_integration::install(
+                    &app.zshrc_path,
+                    app.config_path
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new(".")),
+                ) {
+                    Ok(_) => {
+                        app.show_toast("已安装 Shell 集成（zsh）：重启终端后生效", false);
+                        app.start_vendor_bootstrap(&ctx);
+                    }
+                    Err(e) => {
+                        log::warn!("Shell 集成安装失败：{e}");
+                    }
+                }
+            }
         }
         // 初始一个本地终端 tab；设置改弹窗（`show_settings`）。
         app.new_local_tab(&ctx);
@@ -846,15 +1412,37 @@ impl MinoApp {
         self.new_local_tab_at(ctx, home, "");
     }
 
-    /// 打开项目收藏：新建以项目目录为工作目录的本地标签，启动命令非空时自动执行。
+    /// 打开工作区（本地目录 → 本地标签；SSH → 远程连接；名称即标签标题）。
     ///
-    /// 目录不存在（被删/移动/外接盘拔出）时只 toast，不建 tab。
-    fn open_project(&mut self, ctx: &egui::Context, project: &ProjectProfile) {
-        if !project.path.is_dir() {
-            self.show_toast(format!("项目目录不存在：{}", project.path.display()), true);
-            return;
+    /// 本地目录不存在（被删/移动/外接盘拔出）时只 toast，不建标签。
+    fn open_workspace(&mut self, ctx: &egui::Context, workspace: &Workspace) {
+        match workspace {
+            Workspace::Local { path, command, .. } => {
+                if !path.is_dir() {
+                    self.show_toast(format!("目录不存在：{}", path.display()), true);
+                    return;
+                }
+                self.new_local_tab_at(ctx, Some(path.clone()), command);
+            }
+            Workspace::Ssh { .. } => {
+                if let Some(profile) = workspace.to_host_profile() {
+                    self.start_connect_into(ctx, profile, None);
+                }
+            }
         }
-        self.new_local_tab_at(ctx, Some(project.path.clone()), &project.command);
+    }
+
+    /// 打开工作区编辑表单（新增：`kind` 预选 0 本地 / 1 SSH；已有连接流程
+    /// 默认 SSH，保持「⌘N = 新建连接」的肌肉记忆）。
+    fn open_workspace_editor(&mut self, kind: usize) {
+        let edit = WorkspaceEdit {
+            kind,
+            ..WorkspaceEdit::default()
+        };
+        // 工作区编辑弹窗是前台模态：从设置里的入口打开时先收起设置。
+        self.settings_before_workspace_edit = self.show_settings;
+        self.show_settings = false;
+        self.workspace_edit = Some(edit);
     }
 
     /// 带目录与启动命令的本地标签构造（`new_local_tab` 与 `open_project` 共用）。
@@ -863,6 +1451,17 @@ impl MinoApp {
     /// 可达数百毫秒，同步做会推迟首帧、也让 ⌘T 明显卡顿），本帧只登记
     /// `pending_local`，就绪后由 `poll_local_spawn` 挂上标签。
     fn new_local_tab_at(&mut self, ctx: &egui::Context, dir: Option<PathBuf>, command: &str) {
+        self.spawn_local_into(ctx, dir, command, None);
+    }
+
+    /// 启动一个本地会话并挂到 `target`（None = 新标签；Some = 目标窗格旁分屏）。
+    fn spawn_local_into(
+        &mut self,
+        ctx: &egui::Context,
+        dir: Option<PathBuf>,
+        command: &str,
+        target: Option<SplitTarget>,
+    ) {
         let options = local_session_options_at(dir);
         let command = command.to_string();
 
@@ -874,7 +1473,7 @@ impl MinoApp {
             let on_event = Arc::new(move |_ev: &SessionEvent| {});
             let _ = ctx;
             match Session::spawn_local(options, 80, 24, on_event) {
-                Ok(session) => self.mount_local_session(session, &command),
+                Ok(session) => self.mount_local_session(ctx, session, &command, target),
                 Err(e) => {
                     log::error!("启动本地终端失败：{e}");
                     self.show_toast(format!("启动本地终端失败：{e}"), true);
@@ -894,14 +1493,24 @@ impl MinoApp {
                 // 结果到达即唤醒 UI 去取（本帧之外才有结果，必须自己请求重绘）。
                 notify_ctx.request_repaint();
             });
-            self.pending_local = Some(PendingLocalSpawn { rx, command });
+            self.pending_local = Some(PendingLocalSpawn {
+                rx,
+                command,
+                target,
+            });
             // 让"正在启动终端…"占位立刻可见。
             ctx.request_repaint();
         }
     }
 
-    /// 把已创建的本地会话挂上标签栏（异步与同步路径共用）。
-    fn mount_local_session(&mut self, session: Session, command: &str) {
+    /// 把已创建的本地会话挂上标签栏 / 分屏（异步与同步路径共用）。
+    fn mount_local_session(
+        &mut self,
+        ctx: &egui::Context,
+        session: Session,
+        command: &str,
+        target: Option<SplitTarget>,
+    ) {
         let mut view = TerminalView::new(session);
         view.set_gpu(self.terminal_gpu.clone());
         // 新标签继承当前全局字号（启动恢复/快捷键/滑杆都只改 `config` +
@@ -912,13 +1521,50 @@ impl MinoApp {
         if let Some(line) = command.lines().map(str::trim).find(|l| !l.is_empty()) {
             view.session().write(format!("{line}\n").as_bytes());
         }
-        let id = self.allocate_id();
-        let tab = Box::new(TerminalTab::new(id, "本地终端".into(), view));
+        // 分屏目标：把新会话挂进已有标签的目标窗格旁。
+        if let Some(target) = target {
+            let pane_id = self.allocate_id();
+            let mut view_slot = Some(view);
+            let mounted = match self.tabs.iter_mut().find(|tab| tab.id == target.tab_id) {
+                Some(tab) => {
+                    let view = view_slot.take().expect("view 仅在挂载时被取走");
+                    tab.add_pane(pane_id, view, target.pane_id, target.axis)
+                }
+                None => false,
+            };
+            if mounted {
+                if let Some(tab) = self.tabs.iter().find(|tab| tab.id == target.tab_id) {
+                    Self::request_pane_focus(tab, ctx, pane_id);
+                }
+                return;
+            }
+            // 目标标签已被关闭：退化为新标签，不丢会话。
+            let view = view_slot.take().expect("未挂载时 view 必须仍在");
+            let tab_id = self.allocate_id();
+            self.tabs.push(Box::new(TerminalTab::new(
+                tab_id,
+                "本地终端".into(),
+                view,
+                pane_id,
+                SessionOrigin::Local,
+            )));
+            self.active_tab = self.tabs.len() - 1;
+            return;
+        }
+        let tab_id = self.allocate_id();
+        let pane_id = self.allocate_id();
+        let tab = Box::new(TerminalTab::new(
+            tab_id,
+            "本地终端".into(),
+            view,
+            pane_id,
+            SessionOrigin::Local,
+        ));
         self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;
     }
 
-    /// 处理后台创建中的本地终端：就绪即挂标签，失败即提示。
+    /// 处理后台创建中的本地终端：就绪即挂标签/分屏，失败即提示。
     ///
     /// 每帧调用；无等待中的会话时零成本。
     fn poll_local_spawn(&mut self, ctx: &egui::Context) {
@@ -934,14 +1580,14 @@ impl MinoApp {
                 return;
             }
         };
-        let command = self
+        let (command, target) = self
             .pending_local
             .take()
-            .map(|pending| pending.command)
+            .map(|pending| (pending.command, pending.target))
             .unwrap_or_default();
         match result {
             Ok(session) => {
-                self.mount_local_session(session, &command);
+                self.mount_local_session(ctx, session, &command, target);
                 ctx.request_repaint();
             }
             Err(e) => {
@@ -956,56 +1602,90 @@ impl MinoApp {
         self.cjk_fonts = Some(loader);
     }
 
-    /// 收藏当前终端目录为项目（⌘D 与快捷菜单空态入口共用）。
+    /// 收藏当前会话为工作区（⌘B 与空态入口共用）。
     ///
-    /// 仅本地标签可用：目录取 `TerminalView::fresh_local_directory`
-    /// （内核 cwd 优先、跟踪值回退，不走标题用的 TTL 缓存——用户按 ⌘D 的
-    /// 那一刻目录可能刚变过，缓存 300ms 的旧值会收藏错地方）——纯跟踪值在
-    /// 粘贴/补全/别名场景下会停在启动目录，标题与 SFTP 定位都不依赖它；
-    /// 去重只看规范路径（重名允许），默认名取末级目录名。
-    fn bookmark_current_directory(&mut self) {
+    /// - 本地标签：收藏当前目录（内核 cwd 优先，⌘B 那一刻的即时真值），
+    ///   默认名取末级目录名，按规范路径去重；
+    /// - SSH 标签：收藏其主机档案（含认证信息，落盘与 hosts.toml 同级
+    ///   0600），按 user@host:port 去重。
+    fn bookmark_current_workspace(&mut self) {
         let Some(tab) = self.tabs.get(self.active_tab) else {
             self.show_toast("没有可收藏的终端", true);
             return;
         };
-        if tab.terminal.session().is_remote() {
-            self.show_toast("仅支持收藏本地终端目录", true);
-            return;
-        }
-        let Some(cwd) = tab.terminal.fresh_local_directory() else {
-            self.show_toast("当前目录未知，稍后再试", true);
-            return;
-        };
-        let canonical = match std::fs::canonicalize(&cwd) {
-            Ok(p) => p,
-            Err(e) => {
-                self.show_toast(format!("无法读取当前目录：{e}"), true);
+        // 以会话来源判定（origin 是"这个标签是什么"的事实来源；远程标签的
+        // session 必然远程，两者一致，origin 还覆盖快照/测试构造的场景）。
+        let workspace = if matches!(tab.origin, SessionOrigin::Remote(_)) {
+            let SessionOrigin::Remote(profile) = &tab.origin else {
+                self.show_toast("远程会话信息缺失，无法收藏", true);
+                return;
+            };
+            let duplicate = self
+                .config
+                .workspaces
+                .iter()
+                .any(|existing| match existing {
+                    Workspace::Ssh {
+                        host, port, user, ..
+                    } => *host == profile.host && *port == profile.port && *user == profile.user,
+                    _ => false,
+                });
+            if duplicate {
+                self.show_toast("已收藏过该主机", true);
                 return;
             }
+            Workspace::Ssh {
+                name: profile.name.clone(),
+                host: profile.host.clone(),
+                port: profile.port,
+                user: profile.user.clone(),
+                auth: profile.auth.clone(),
+                path: String::new(),
+                command: String::new(),
+            }
+        } else {
+            let Some(cwd) = tab.active_view().fresh_local_directory() else {
+                self.show_toast("当前目录未知，稍后再试", true);
+                return;
+            };
+            let canonical = match std::fs::canonicalize(&cwd) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.show_toast(format!("无法读取当前目录：{e}"), true);
+                    return;
+                }
+            };
+            let duplicate = self
+                .config
+                .workspaces
+                .iter()
+                .any(|existing| match existing {
+                    Workspace::Local { path, .. } => {
+                        std::fs::canonicalize(path).is_ok_and(|existing| existing == canonical)
+                    }
+                    _ => false,
+                });
+            if duplicate {
+                self.show_toast("已收藏过该目录", true);
+                return;
+            }
+            let name = canonical
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| canonical.to_string_lossy().into_owned());
+            Workspace::Local {
+                name,
+                path: canonical,
+                command: String::new(),
+            }
         };
-        let duplicate =
-            self.config.projects.iter().any(|p| {
-                std::fs::canonicalize(&p.path).is_ok_and(|existing| existing == canonical)
-            });
-        if duplicate {
-            self.show_toast("已收藏过该目录", true);
-            return;
-        }
-        // 默认名 = 末级目录名；根目录无 file_name 时用全路径本身。
-        let name = canonical
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| canonical.to_string_lossy().into_owned());
-        self.config.projects.push(ProjectProfile {
-            name: name.clone(),
-            path: canonical,
-            command: String::new(),
-        });
+        let name = workspace.name().to_string();
+        self.config.workspaces.push(workspace);
         if !self.save_config() {
-            self.config.projects.pop();
+            self.config.workspaces.pop();
             return;
         }
-        self.show_toast(format!("已收藏「{name}」"), false);
+        self.show_toast(format!("已收藏「{name}」到工作区"), false);
     }
 
     fn close_tab(&mut self, index: usize) {
@@ -1029,6 +1709,22 @@ impl MinoApp {
         if let Some(sftp) = self.tabs[index].sftp.as_ref() {
             sftp.close();
         }
+        // 记录重开信息（⌘⇧T）：本地记目录，远程记主机档案。
+        {
+            let tab = &self.tabs[index];
+            let dir = (!tab.active_view().session().is_remote())
+                .then(|| tab.active_view().fresh_local_directory())
+                .flatten()
+                .map(PathBuf::from);
+            self.closed_tabs.push(ClosedTab {
+                title: tab.title().0,
+                origin: tab.origin.clone(),
+                dir,
+            });
+            if self.closed_tabs.len() > CLOSED_TAB_STACK {
+                self.closed_tabs.remove(0);
+            }
+        }
         self.tabs.remove(index);
         if self.tabs.is_empty() {
             self.active_tab = 0;
@@ -1036,6 +1732,300 @@ impl MinoApp {
             self.active_tab = self.tabs.len() - 1;
         } else if self.active_tab > index {
             self.active_tab -= 1;
+        }
+    }
+
+    /// 关闭窗格；最后一个窗格关闭时整个标签一起关闭。
+    ///
+    /// 布局树的兄弟节点上提（`pane_tree::remove_leaf`）；关闭的是活动
+    /// 窗格时焦点交给布局顺序的第一个窗格（Kaku 同款行为：不悬空焦点）。
+    fn close_pane(&mut self, ctx: &egui::Context, tab_index: usize, pane_id: u64) {
+        let Some(tab) = self.tabs.get_mut(tab_index) else {
+            return;
+        };
+        if tab.panes.len() <= 1 {
+            self.close_tab(tab_index);
+            return;
+        }
+        if pane_tree::remove_leaf(&mut tab.layout, pane_id) != pane_tree::RemoveOutcome::NotFound {
+            tab.panes.retain(|pane| pane.id != pane_id);
+            if tab.zoomed == Some(pane_id) {
+                tab.zoomed = None;
+            }
+            if tab.active_pane == pane_id {
+                tab.active_pane = pane_tree::leaves(&tab.layout)
+                    .first()
+                    .copied()
+                    .unwrap_or(tab.panes[0].id);
+                let next = tab.active_pane;
+                Self::request_pane_focus(tab, ctx, next);
+            }
+        }
+    }
+
+    /// 快照文件路径（与主机配置同目录：`…/snapshot.toml`；测试用隔离路径）。
+    fn snapshot_path(&self) -> PathBuf {
+        self.config_path.with_file_name("snapshot.toml")
+    }
+
+    /// 保存窗口快照（关闭/退出时调用；Kaku 的自动保存语义）。
+    ///
+    /// 原子写 + 0600（快照含 SSH 明文认证信息）。失败只记日志：快照是
+    /// 便利功能，不能拦住退出。
+    fn save_window_snapshot(&self) {
+        let tabs: Vec<SnapshotTab> = self
+            .tabs
+            .iter()
+            .map(|tab| {
+                let dir = (!tab.active_view().session().is_remote())
+                    .then(|| tab.active_view().fresh_local_directory())
+                    .flatten()
+                    .map(PathBuf::from);
+                SnapshotTab {
+                    origin: tab.origin.clone(),
+                    dir,
+                }
+            })
+            .collect();
+        let snapshot = WindowSnapshot { tabs };
+        let path = self.snapshot_path();
+        if let Err(e) = save_private_toml(&snapshot, &path) {
+            log::warn!("保存窗口快照失败：{e}");
+        }
+    }
+
+    /// ⌘⌥⇧T：恢复上次窗口（Kaku Restore Previous Window）。
+    ///
+    /// 快照缺失/损坏与「没有快照」同义（Kaku 同款容错）；恢复是**追加**
+    /// 标签而不是替换当前窗口（不销毁用户正在用的会话）。
+    fn restore_window_snapshot(&mut self, ctx: &egui::Context) {
+        let path = self.snapshot_path();
+        let snapshot = match std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| toml::from_str::<WindowSnapshot>(&text).ok())
+        {
+            Some(snapshot) if !snapshot.tabs.is_empty() => snapshot,
+            _ => {
+                self.show_toast("没有可恢复的窗口快照", false);
+                return;
+            }
+        };
+        let count = snapshot.tabs.len();
+        for tab in snapshot.tabs {
+            match tab.origin {
+                SessionOrigin::Local => {
+                    self.spawn_local_into(ctx, tab.dir, "", None);
+                }
+                SessionOrigin::Remote(profile) => {
+                    self.start_connect_into(ctx, profile, None);
+                }
+            }
+        }
+        self.show_toast(format!("正在恢复上次窗口（{count} 个标签）…"), false);
+    }
+
+    /// ⌘⇧T：重开最近关闭的标签（Kaku Reopen closed tab）。
+    ///
+    /// 本地标签按关闭时目录重建；SSH 标签重连同主机（认证来自同一档案）。
+    /// 栈空时给出轻提示而不是静默无操作。
+    fn reopen_closed_tab(&mut self, ctx: &egui::Context) {
+        let Some(closed) = self.closed_tabs.pop() else {
+            self.show_toast("没有可重开的标签", false);
+            return;
+        };
+        self.show_toast(format!("已重开标签：{}", closed.title), false);
+        match closed.origin {
+            SessionOrigin::Local => {
+                self.spawn_local_into(ctx, closed.dir, "", None);
+            }
+            SessionOrigin::Remote(profile) => {
+                self.start_connect_into(ctx, profile, None);
+            }
+        }
+    }
+
+    /// ⌘W 智能关闭（Kaku 语义）：多窗格 → 关窗格；多标签 → 关标签；
+    /// 最后一个标签 → 最小化窗口。
+    ///
+    /// Kaku 在最后一种情况下隐藏应用（HideApplication）；Mino 没有 Dock
+    /// 重新打开应用的通道（点击 Dock 图标恢复窗口依赖 macOS reopen 事件），
+    /// 用最小化代替——同样「不退出应用」，且用户一定能从 Dock 找回窗口。
+    fn smart_close(&mut self, ctx: &egui::Context) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        if tab.panes.len() > 1 {
+            let pane_id = tab.active_pane;
+            self.close_pane(ctx, self.active_tab, pane_id);
+            ctx.request_repaint();
+        } else if self.tabs.len() > 1 {
+            self.close_tab(self.active_tab);
+            ctx.request_repaint();
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+    }
+
+    /// 在活动窗格旁分屏（Kaku `Cmd+D` 左右并排 / `Cmd+Shift+D` 上下堆叠）。
+    ///
+    /// 新窗格继承标签的会话来源：本地 → 在活动窗格当前目录启动本地
+    /// shell（继承字号等全局设置）；SSH → 重连同一主机（认证信息来自同一
+    /// `HostProfile`），SFTP 仍按标签挂载、不重复建连。
+    fn split_active_pane(&mut self, ctx: &egui::Context, axis: SplitAxis) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        let target = SplitTarget {
+            tab_id: tab.id,
+            pane_id: tab.active_pane,
+            axis,
+        };
+        match tab.origin.clone() {
+            SessionOrigin::Local => {
+                let dir = tab.active_view().fresh_local_directory().map(PathBuf::from);
+                self.spawn_local_into(ctx, dir, "", Some(target));
+            }
+            SessionOrigin::Remote(profile) => {
+                self.start_connect_into(ctx, profile, Some(target));
+            }
+        }
+    }
+
+    /// 按方向把焦点移到相邻窗格（Kaku `Cmd+Opt+方向键`）。
+    fn focus_pane_neighbor(&mut self, ctx: &egui::Context, dx: i32, dy: i32) {
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        if tab.zoomed.is_some() || tab.panes.len() <= 1 {
+            return;
+        }
+        let rects = tab.pane_rects.clone();
+        if let Some(next) = pane_tree::neighbor(&rects, tab.active_pane, dx, dy) {
+            tab.active_pane = next;
+            Self::request_pane_focus(tab, ctx, next);
+            ctx.request_repaint();
+        }
+    }
+
+    /// 把 egui 键盘焦点移到指定窗格。
+    ///
+    /// 渲染期的「焦点跟随」（egui 焦点决定活动窗格）会覆盖任何程序化切换：
+    /// 只改 `active_pane` 而不动 egui 焦点，下一帧焦点跟随就把活动窗格拉回
+    /// 旧窗格（⌘⌥方向键"按了没反应"）。程序化切换必须同时请求焦点。
+    fn request_pane_focus(tab: &TerminalTab, ctx: &egui::Context, pane_id: u64) {
+        if let Some(view) = tab.view(pane_id) {
+            ctx.memory_mut(|m| m.request_focus(view.focus_id()));
+        }
+    }
+
+    /// 调整活动窗格所在分割的比例（Kaku `Cmd+Ctrl+方向键`，每次 5 列）。
+    fn adjust_pane_size(&mut self, ctx: &egui::Context, axis: SplitAxis, delta: f32) {
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        if tab.zoomed.is_some() {
+            return;
+        }
+        let rects = tab.pane_rects.clone();
+        let extent = rects
+            .iter()
+            .find(|(id, _)| *id == tab.active_pane)
+            .map(|(_, rect)| match axis {
+                SplitAxis::Horizontal => rect.width(),
+                SplitAxis::Vertical => rect.height(),
+            })
+            .filter(|value| *value > 1.0)
+            .unwrap_or(1.0);
+        // 5 列 ≈ 5 × cell 宽；按窗格当前尺寸换算成比例增量。
+        let cell = tab
+            .active_view()
+            .cell_metrics()
+            .map(|(w, _)| w)
+            .unwrap_or(8.0);
+        let delta_ratio = (5.0 * cell) / extent * delta;
+        if pane_tree::adjust_ratio(&mut tab.layout, tab.active_pane, axis, delta_ratio) {
+            ctx.request_repaint();
+        }
+    }
+
+    /// 切换活动窗格最近一层的拆分方向（Kaku `Cmd+Shift+S`
+    /// TogglePaneSplitDirection）：左右并排 ⇄ 上下堆叠，比例保持。
+    fn toggle_split_direction(&mut self, ctx: &egui::Context) {
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        if tab.panes.len() <= 1 || tab.zoomed.is_some() {
+            return;
+        }
+        if pane_tree::flip_axis(&mut tab.layout, tab.active_pane) {
+            ctx.request_repaint();
+        }
+    }
+
+    /// 放大/还原活动窗格（Kaku `Cmd+Shift+Enter` = TogglePaneZoomState）。
+    fn toggle_pane_zoom(&mut self, ctx: &egui::Context) {
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        if tab.panes.len() <= 1 {
+            return;
+        }
+        tab.zoomed = if tab.zoomed == Some(tab.active_pane) {
+            None
+        } else {
+            Some(tab.active_pane)
+        };
+        ctx.request_repaint();
+    }
+
+    /// 渲染活动标签的全部分屏窗格。
+    ///
+    /// - 布局：`pane_tree::layout` 按窗口可用区分配（相邻窗格间留
+    ///   `PANE_GAP`；Kaku/WezTerm 的 split gap 同构）；
+    /// - 放大态：只渲染被放大的窗格、独占整个区域；
+    /// - 输入：只有活动窗格消费键盘/鼠标（Kaku `swallow_mouse_click_on_pane_focus`
+    ///   同款——点击非活动窗格先聚焦、点击内容不透传给程序）；
+    /// - 焦点跟随：egui 焦点落在哪个窗格，活动窗格就切到哪个（点击/导航/新
+    ///   分屏统一收敛到这一处）。
+    fn render_tab_panes(&mut self, ui: &mut egui::Ui, input_enabled: bool) {
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        let area = ui.max_rect();
+        let mut rects: Vec<(u64, egui::Rect)> = Vec::new();
+        if let Some(zoom) = tab.zoomed {
+            rects.push((zoom, area));
+        } else {
+            pane_tree::layout(&tab.layout, area, PANE_GAP, &mut rects);
+        }
+        let active = tab.active_pane;
+        tab.pane_rects = rects.clone();
+        for (pane_id, rect) in rects {
+            let enabled = input_enabled && pane_id == active;
+            let Some(pane) = tab.panes.iter_mut().find(|pane| pane.id == pane_id) else {
+                continue;
+            };
+            let mut child = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(rect)
+                    .id_salt(("pane", pane_id)),
+            );
+            child.set_clip_rect(rect);
+            pane.view.show_with_input(&mut child, enabled);
+        }
+        // 焦点跟随：egui 焦点对应的窗格即活动窗格。
+        if let Some(focused) = ui.ctx().memory(|m| m.focused()) {
+            if let Some(pane) = tab
+                .panes
+                .iter()
+                .find(|pane| pane.view.focus_id() == focused)
+            {
+                let new_active = pane.id;
+                if new_active != tab.active_pane {
+                    tab.active_pane = new_active;
+                    ui.ctx().request_repaint();
+                }
+            }
         }
     }
 
@@ -1350,23 +2340,34 @@ impl MinoApp {
         }
     }
 
-    /// 切换主题并持久化到配置（退出重进保持所选皮肤）。
+    /// 切换外观偏好并持久化（`auto` / `dark` / `light`）。
     ///
-    /// 保存失败时回退到原主题并 toast 提示：内存态与落盘态必须一致，
-    /// 否则本次看着切成功了、重启又回到原来的（用户反馈的根因）。
-    fn apply_theme_and_persist(&mut self, ctx: &egui::Context, index: usize) {
-        let previous = self.config.theme.clone();
-        let name = crate::theme::THEMES[index.min(crate::theme::THEMES.len() - 1)].name;
-        crate::theme::set_theme(ctx, index);
-        self.config.theme = name.to_string();
+    /// 保存失败时回退到原偏好并 toast 提示：内存态与落盘态必须一致，
+    /// 否则本次看着切成功了、重启又回到原来的。
+    fn apply_appearance_and_persist(&mut self, ctx: &egui::Context, preference: &str) {
+        let previous = self.config.appearance.clone();
+        self.config.appearance = preference.to_string();
+        let system_dark = ctx.system_theme() != Some(egui::Theme::Light);
+        crate::theme::set_theme(
+            ctx,
+            crate::theme::resolve_appearance(preference, system_dark),
+        );
         if !self.save_config() {
             // 落盘失败：内存态回滚，保持与磁盘一致。
-            self.config.theme = previous;
-            let rollback = crate::theme::theme_index_by_name(self.config.theme.trim()).unwrap_or(0);
-            crate::theme::set_theme(ctx, rollback);
+            self.config.appearance = previous;
+            let rollback_dark = ctx.system_theme() != Some(egui::Theme::Light);
+            crate::theme::set_theme(
+                ctx,
+                crate::theme::resolve_appearance(self.config.appearance.trim(), rollback_dark),
+            );
             return;
         }
-        self.show_toast(format!("主题：{name}"), false);
+        let label = match preference {
+            "dark" => "深色",
+            "light" => "浅色",
+            _ => "跟随系统",
+        };
+        self.show_toast(format!("外观：{label}"), false);
     }
 
     /// 设置终端字号并持久化（退出重进保持；保存失败回滚内存态）。
@@ -1380,23 +2381,28 @@ impl MinoApp {
     fn apply_font_size_and_persist(&mut self, ctx: &egui::Context, size: f32, silent: bool) {
         let size = size.clamp(TerminalView::MIN_FONT_SIZE, TerminalView::MAX_FONT_SIZE);
         if (size - self.config.font_size).abs() < f32::EPSILON
-            && self
-                .tabs
-                .iter()
-                .all(|tab| (tab.terminal.font_size() - size).abs() < f32::EPSILON)
+            && self.tabs.iter().all(|tab| {
+                tab.panes
+                    .iter()
+                    .all(|pane| (pane.view.font_size() - size).abs() < f32::EPSILON)
+            })
         {
             return;
         }
         let previous = self.config.font_size;
         self.config.font_size = size;
         for tab in &mut self.tabs {
-            tab.terminal.set_font_size(size);
+            for pane in &mut tab.panes {
+                pane.view.set_font_size(size);
+            }
         }
         if !self.save_config() {
             // 落盘失败：内存态整体回滚，保持与磁盘一致。
             self.config.font_size = previous;
             for tab in &mut self.tabs {
-                tab.terminal.set_font_size(previous);
+                for pane in &mut tab.panes {
+                    pane.view.set_font_size(previous);
+                }
             }
             return;
         }
@@ -1406,18 +2412,447 @@ impl MinoApp {
         }
     }
 
-    /// 打开一个全新的连接表单。
+    /// 活动窗格的终端上下文（AI 面板的 system 上下文：目录 + 最近输出）。
+    fn active_terminal_context(&self) -> String {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return String::new();
+        };
+        let view = tab.active_view();
+        let cwd = view.current_directory().unwrap_or_else(|| "~".to_string());
+        let rows = view.visible_rows_snapshot();
+        format!(
+            "当前终端：{}；工作目录：{}\n最近输出：\n{}",
+            tab.title().0,
+            cwd,
+            rows.join("\n")
+        )
+    }
+
+    /// 标签导航器条目（⌘⇧O）：标题 = 标签名，详情 = 全路径/主机，快捷键 = 序号。
+    fn tab_navigator_items(&self) -> Vec<crate::views::launcher::LauncherItem> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .map(|(i, tab)| {
+                let (title, tooltip) = tab.title();
+                crate::views::launcher::LauncherItem {
+                    key: format!("tab:{i}"),
+                    title,
+                    detail: tooltip.unwrap_or_else(|| {
+                        if tab.active_view().session().is_remote() {
+                            "SSH 会话".to_string()
+                        } else {
+                            String::new()
+                        }
+                    }),
+                    shortcut: if i < 9 {
+                        format!("⌘{}", i + 1)
+                    } else {
+                        String::new()
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// 命令面板条目（⌘⇧P）：Mino 的常用动作（Kaku Command Palette 的本地化）。
+    fn command_palette_items() -> Vec<crate::views::launcher::LauncherItem> {
+        use crate::views::launcher::LauncherItem;
+        let item = |key: &str, title: &str, shortcut: &str| LauncherItem {
+            key: key.to_string(),
+            title: title.to_string(),
+            detail: String::new(),
+            shortcut: shortcut.to_string(),
+        };
+        vec![
+            item("tab.new", "新建本地终端标签", "⌘T"),
+            item("tab.close", "关闭当前标签", "⌘⇧W"),
+            item("tab.reopen", "重开上次关闭的标签", "⌘⇧T"),
+            item("pane.split.right", "向右分屏", "⌘D"),
+            item("pane.split.down", "向下分屏", "⌘⇧D"),
+            item("pane.zoom", "放大 / 还原窗格", "⌘⇧↩"),
+            item("pane.close", "关闭当前窗格", ""),
+            item("search.open", "搜索滚动缓冲", "⌘F"),
+            item("shell.clear", "清屏并清空回滚", "⌘K"),
+            item("font.inc", "增大字号", "⌘+"),
+            item("font.dec", "减小字号", "⌘-"),
+            item("font.reset", "重置字号", "⌘0"),
+            item("workspaces.open", "打开工作区面板", "⌘O"),
+            item("workspace.bookmark", "收藏当前会话为工作区", "⌘B"),
+            item("workspace.new", "新增工作区", "⌘N"),
+            item("ai.chat", "AI 聊天面板", "⌘L"),
+            item("ai.settings", "AI 助手设置", "⌘⇧A"),
+            item("sftp.toggle", "切换 SFTP 面板", ""),
+            item("appearance.dark", "外观：深色（Kaku Dark）", ""),
+            item("appearance.light", "外观：浅色（Kaku Light）", ""),
+            item("appearance.auto", "外观：跟随系统", ""),
+            item("settings.open", "打开设置", "⌘,"),
+            item("shell.integration", "安装 / 修复 Shell 集成", ""),
+        ]
+    }
+
+    /// 执行命令面板动作。
+    fn run_palette_action(&mut self, ctx: &egui::Context, action: &str) {
+        match action {
+            "tab.new" => self.new_local_tab(ctx),
+            "tab.close" => {
+                if !self.tabs.is_empty() {
+                    self.close_tab(self.active_tab);
+                }
+            }
+            "tab.reopen" => self.reopen_closed_tab(ctx),
+            "pane.split.right" => self.split_active_pane(ctx, SplitAxis::Horizontal),
+            "pane.split.down" => self.split_active_pane(ctx, SplitAxis::Vertical),
+            "pane.zoom" => self.toggle_pane_zoom(ctx),
+            "pane.close" => {
+                let pane = self
+                    .tabs
+                    .get(self.active_tab)
+                    .map(|tab| tab.active_pane)
+                    .unwrap_or_default();
+                self.close_pane(ctx, self.active_tab, pane);
+            }
+            "search.open" => {
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    tab.active_view_mut().toggle_search();
+                }
+            }
+            "shell.clear" => {
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    tab.active_view_mut().clear_scrollback_and_screen();
+                }
+            }
+            "font.inc" => {
+                let next = self.config.font_size + TerminalView::FONT_SIZE_STEP;
+                self.apply_font_size_and_persist(ctx, next, false);
+            }
+            "font.dec" => {
+                let next = self.config.font_size - TerminalView::FONT_SIZE_STEP;
+                self.apply_font_size_and_persist(ctx, next, false);
+            }
+            "font.reset" => {
+                self.apply_font_size_and_persist(ctx, TerminalView::DEFAULT_FONT_SIZE, false);
+            }
+            "workspaces.open" => self.toggle_workspaces(),
+            "workspace.bookmark" => self.bookmark_current_workspace(),
+            "workspace.new" => self.open_workspace_editor(1),
+            "ai.chat" => {
+                let context = self.active_terminal_context();
+                self.ai_panel.set_context(context);
+                self.ai_panel.open();
+            }
+            "ai.settings" => self.show_settings = true,
+            "sftp.toggle" => {
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    if tab.sftp.is_some() {
+                        tab.sftp_open = !tab.sftp_open;
+                    }
+                }
+            }
+            "appearance.dark" => self.apply_appearance_and_persist(ctx, "dark"),
+            "appearance.light" => self.apply_appearance_and_persist(ctx, "light"),
+            "appearance.auto" => self.apply_appearance_and_persist(ctx, "auto"),
+            "settings.open" => self.show_settings = true,
+            "shell.integration" => self.install_shell_integration(ctx),
+            _ => {}
+        }
+    }
+
+    /// 读取助手配置；未启用/未配置（无 key 且非 codex）时返回 None。
     ///
-    /// “新建连接”始终代表新建配置，不能沿用上一次输入的主机、密码或私钥
-    /// 口令；关闭对话框后再次打开也必须回到默认值。
-    fn open_new_connection(&mut self) {
-        self.form = ConnectForm::default();
-        self.last_row_click = None;
-        // 新建连接弹窗和设置弹窗都是居中的模态窗口；从设置里的入口
-        // 打开时必须先收起设置，否则设置层会盖住新建连接表单。
-        self.settings_before_new_conn = self.show_settings;
-        self.show_settings = false;
-        self.show_new_conn = true;
+    /// 每次触发读一次文件（几 KB、频率极低），避免缓存与「设置里刚改完
+    /// 不生效」的不一致。
+    fn assistant_config(&self) -> Option<mino_core::ai::AssistantConfig> {
+        let path = mino_core::ai::default_assistant_path();
+        let config = mino_core::ai::AssistantConfig::load(&path).ok()?;
+        if !config.enabled {
+            return None;
+        }
+        if config.api_key.is_empty() && config.auth_type != "codex" {
+            return None;
+        }
+        Some(config)
+    }
+
+    /// 每帧推进 AI 助手任务：失败命令 → 修复建议；`#` → 命令生成。
+    ///
+    /// - 触发源：窗格的 shell 集成标记（`133;D;<code>`，非 0 时）与
+    ///   `# ` 拦截请求；两者都由窗格侧消费（`take_*` 语义天然去重）；
+    /// - 网络调用在后台线程（ureq 阻塞），结果经通道回 UI；
+    /// - 未配置/未启用助手时静默跳过（不打扰未启用的用户）。
+    fn poll_ai_tasks(&mut self, ctx: &egui::Context) {
+        // 1. 失败命令：取结果 → 起修复任务（单飞；未配置则只消费不请求）。
+        if self.ai_fix_rx.is_none() {
+            let config = self.assistant_config();
+            let mut pending: Option<(u64, u64, String, i32, String, String)> = None;
+            'tabs: for tab in &mut self.tabs {
+                let tab_id = tab.id;
+                for pane in &mut tab.panes {
+                    let Some((exit_code, command)) = pane.view.take_command_result() else {
+                        continue;
+                    };
+                    // 退出码 0 / 130（Ctrl+C）不触发；无命令行快照（裸回车等）也跳过。
+                    if exit_code == 0 || exit_code == 130 {
+                        continue;
+                    }
+                    let Some(command) = command.filter(|c| !c.is_empty()) else {
+                        continue;
+                    };
+                    if config.is_some() {
+                        let cwd = pane
+                            .view
+                            .current_directory()
+                            .unwrap_or_else(|| "~".to_string());
+                        let tail = pane.view.visible_rows_snapshot().join("\n");
+                        pending = Some((tab_id, pane.id, command, exit_code, cwd, tail));
+                    }
+                    break 'tabs;
+                }
+            }
+            if let (Some(config), Some((tab_id, pane_id, command, exit_code, cwd, tail))) =
+                (config, pending)
+            {
+                let codex_home = codex_home_path();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let notify = ctx.clone();
+                std::thread::spawn(move || {
+                    let result =
+                        ai_fix_worker(&config, &command, exit_code, &cwd, &tail, &codex_home);
+                    let _ = tx.send(result.map(|suggestion| AiFixOutcome {
+                        tab_id,
+                        pane_id,
+                        suggestion,
+                    }));
+                    notify.request_repaint();
+                });
+                self.ai_fix_rx = Some(rx);
+            }
+        }
+        // 2. `#` 生成：取请求 → 起生成任务（单飞）。
+        if self.ai_generate_rx.is_none() {
+            let config = self.assistant_config();
+            let mut pending: Option<(u64, u64, String, String, String)> = None;
+            'gen: for tab in &mut self.tabs {
+                let tab_id = tab.id;
+                for pane in &mut tab.panes {
+                    let Some(query) = pane.view.take_ai_generate_request() else {
+                        continue;
+                    };
+                    if config.is_some() {
+                        let cwd = pane
+                            .view
+                            .current_directory()
+                            .unwrap_or_else(|| "~".to_string());
+                        let tail = pane.view.visible_rows_snapshot().join("\n");
+                        pending = Some((tab_id, pane.id, query, cwd, tail));
+                    } else {
+                        self.show_toast("AI 助手未配置（设置 → AI 助手）", true);
+                    }
+                    break 'gen;
+                }
+            }
+            if let (Some(config), Some((tab_id, pane_id, query, cwd, tail))) = (config, pending) {
+                let codex_home = codex_home_path();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let notify = ctx.clone();
+                std::thread::spawn(move || {
+                    let result = ai_generate_worker(&config, &query, &cwd, &tail, &codex_home);
+                    let _ = tx.send(Some(AiGenerateOutcome {
+                        tab_id,
+                        pane_id,
+                        result,
+                    }));
+                    notify.request_repaint();
+                });
+                self.ai_generate_rx = Some(rx);
+            }
+        }
+        // 3. 收取修复结果。
+        if let Some(rx) = &self.ai_fix_rx {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.ai_fix_rx = None;
+                    if let Some(outcome) = result {
+                        let message = if !outcome.suggestion.command.is_empty() {
+                            format!(
+                                "AI 建议（⌘⇧E 填入提示符）：{}",
+                                truncate_for_toast(&outcome.suggestion.command)
+                            )
+                        } else if !outcome.suggestion.explanation.is_empty() {
+                            format!(
+                                "AI：{}",
+                                truncate_for_toast(&outcome.suggestion.explanation)
+                            )
+                        } else {
+                            String::new()
+                        };
+                        if !message.is_empty() {
+                            self.show_toast(message, false);
+                        }
+                        self.ai_fix_suggestion = Some(outcome);
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.ai_fix_rx = None;
+                }
+            }
+        }
+        // 4. 收取生成结果并回填提示符。
+        if let Some(rx) = &self.ai_generate_rx {
+            match rx.try_recv() {
+                Ok(Some(outcome)) => {
+                    self.ai_generate_rx = None;
+                    match outcome.result {
+                        Ok(command) => {
+                            let applied = self
+                                .tabs
+                                .iter_mut()
+                                .find(|tab| tab.id == outcome.tab_id)
+                                .and_then(|tab| {
+                                    tab.panes.iter_mut().find(|pane| pane.id == outcome.pane_id)
+                                })
+                                .map(|pane| pane.view.inject_command(&command))
+                                .is_some();
+                            if applied {
+                                self.show_toast(
+                                    format!("已生成（回车执行）：{}", truncate_for_toast(&command)),
+                                    false,
+                                );
+                            }
+                        }
+                        Err(e) => self.show_toast(format!("AI 生成失败：{e}"), true),
+                    }
+                }
+                Ok(None) => self.ai_generate_rx = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.ai_generate_rx = None;
+                }
+            }
+        }
+    }
+
+    /// ⌘⇧E：把最近的 AI 修复建议填到对应窗格的提示符（不自动执行）。
+    fn apply_ai_suggestion(&mut self) {
+        let Some(outcome) = self.ai_fix_suggestion.take() else {
+            self.show_toast("暂无 AI 建议", false);
+            return;
+        };
+        let command = outcome.suggestion.command.clone();
+        if command.is_empty() {
+            let explanation = outcome.suggestion.explanation.clone();
+            if !explanation.is_empty() {
+                self.show_toast(format!("AI：{}", truncate_for_toast(&explanation)), false);
+            }
+            return;
+        }
+        let applied = self
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.id == outcome.tab_id)
+            .and_then(|tab| tab.panes.iter_mut().find(|pane| pane.id == outcome.pane_id))
+            .map(|pane| {
+                pane.view.inject_command(&command);
+            })
+            .is_some();
+        if applied {
+            self.show_toast("已填入建议命令（回车执行）", false);
+        } else {
+            self.show_toast("原窗格已关闭，建议未应用", true);
+        }
+    }
+
+    /// Shell 集成的配置目录（宿主 `~/.config/mino`；测试为隔离路径）。
+    fn shell_config_dir(&self) -> PathBuf {
+        self.config_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// 安装/修复 Shell 集成（受管块 + 脚本落盘），随后补下载插件。
+    fn install_shell_integration(&mut self, ctx: &egui::Context) {
+        let config_dir = self.shell_config_dir();
+        match mino_core::shell_integration::install(&self.zshrc_path, &config_dir) {
+            Ok(outcome) => {
+                let message = if outcome.installed {
+                    "Shell 集成已安装：重启终端后生效"
+                } else {
+                    "Shell 集成已是最新"
+                };
+                self.show_toast(message, false);
+                // 插件缺失则后台补齐（联网；失败逐个提示）。
+                if !mino_core::shell_integration::missing_plugins(&config_dir).is_empty() {
+                    self.start_vendor_bootstrap(ctx);
+                }
+            }
+            Err(e) => {
+                log::warn!("Shell 集成安装失败：{e}");
+                self.show_toast(format!("Shell 集成安装失败：{e}"), true);
+            }
+        }
+    }
+
+    /// 卸载 Shell 集成（移除受管块；脚本与插件保留，便于重装）。
+    fn uninstall_shell_integration(&mut self) {
+        match mino_core::shell_integration::uninstall(&self.zshrc_path) {
+            Ok(true) => self.show_toast("Shell 集成已卸载", false),
+            Ok(false) => self.show_toast("Shell 集成未安装", false),
+            Err(e) => {
+                log::warn!("Shell 集成卸载失败：{e}");
+                self.show_toast(format!("卸载失败：{e}"), true);
+            }
+        }
+    }
+
+    /// 后台下载缺失的 Shell 插件（git clone；结果经 `vendor_rx` 回传）。
+    fn start_vendor_bootstrap(&mut self, ctx: &egui::Context) {
+        if self.vendor_running {
+            return;
+        }
+        let config_dir = self.shell_config_dir();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let notify_ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let results = mino_core::shell_integration::bootstrap_vendor(&config_dir);
+            let _ = tx.send(results);
+            notify_ctx.request_repaint();
+        });
+        self.vendor_rx = Some(rx);
+        self.vendor_running = true;
+        self.show_toast("正在下载 Shell 插件…", false);
+    }
+
+    /// 每帧轮询插件下载结果。
+    fn poll_vendor_bootstrap(&mut self) {
+        let Some(rx) = &self.vendor_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(results) => {
+                self.vendor_rx = None;
+                self.vendor_running = false;
+                let failed: Vec<String> = results
+                    .iter()
+                    .filter_map(|result| result.as_ref().err().cloned())
+                    .collect();
+                if failed.is_empty() {
+                    self.show_toast("Shell 插件已就绪", false);
+                } else {
+                    self.show_toast(
+                        format!("部分插件下载失败（可稍后重试）：{}", failed.join("；")),
+                        true,
+                    );
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.vendor_rx = None;
+                self.vendor_running = false;
+                self.show_toast("插件下载线程异常退出", true);
+            }
+        }
     }
 
     /// 处理进行中的连接结果。
@@ -1441,15 +2876,58 @@ impl MinoApp {
                     let mut view = TerminalView::new(session);
                     view.set_gpu(self.terminal_gpu.clone());
                     view.set_font_size(self.config.font_size);
-                    self.tabs.push(Box::new(TerminalTab::new(
-                        connection_id,
-                        self.pending_label.clone(),
-                        view,
-                    )));
-                    self.active_tab = self.tabs.len() - 1;
-                    self.pending_tab = Some(connection_id);
-                    self.mount_ready_sftp();
-                    self.show_toast(format!("已连接到 {}", self.pending_label), false);
+                    let origin = self
+                        .pending_profile
+                        .take()
+                        .map(SessionOrigin::Remote)
+                        .unwrap_or(SessionOrigin::Local);
+                    let label = self.pending_label.clone();
+                    let split_target = self.pending_split.take();
+                    if let Some(target) = split_target {
+                        // 分屏挂载：不新建标签、不挂 SFTP（SFTP 属于标签）。
+                        let pane_id = self.allocate_id();
+                        let mut view_slot = Some(view);
+                        let mounted = match self.tabs.iter_mut().find(|tab| tab.id == target.tab_id)
+                        {
+                            Some(tab) => {
+                                let view = view_slot.take().expect("view 仅在挂载时被取走");
+                                tab.add_pane(pane_id, view, target.pane_id, target.axis)
+                            }
+                            None => false,
+                        };
+                        if mounted {
+                            if let Some(tab) = self.tabs.iter().find(|tab| tab.id == target.tab_id)
+                            {
+                                Self::request_pane_focus(tab, ctx, pane_id);
+                            }
+                        }
+                        if !mounted {
+                            // 目标标签已关闭：退化为新标签，不丢会话。
+                            let view = view_slot.take().expect("未挂载时 view 必须仍在");
+                            let tab_id = self.allocate_id();
+                            self.tabs.push(Box::new(TerminalTab::new(
+                                tab_id,
+                                label.clone(),
+                                view,
+                                pane_id,
+                                origin,
+                            )));
+                            self.active_tab = self.tabs.len() - 1;
+                        }
+                    } else {
+                        let pane_id = self.allocate_id();
+                        self.tabs.push(Box::new(TerminalTab::new(
+                            connection_id,
+                            label.clone(),
+                            view,
+                            pane_id,
+                            origin,
+                        )));
+                        self.active_tab = self.tabs.len() - 1;
+                        self.pending_tab = Some(connection_id);
+                        self.mount_ready_sftp();
+                    }
+                    self.show_toast(format!("已连接到 {label}"), false);
                     ctx.request_repaint();
                 }
                 ConnectResult::Failed(e) => {
@@ -1468,24 +2946,30 @@ impl MinoApp {
         }
     }
 
-    /// 发起远程连接（同时启动 SFTP 连接）。
-    fn start_connect(&mut self, ctx: &egui::Context, profile: HostProfile) {
-        self.last_row_click = None;
-        if let Some(connection) = self.pending_sftp.take() {
-            connection.handle.close();
-        }
-        if let Some(connection) = self.ready_sftp.take() {
-            connection.handle.close();
-        }
+    /// 发起远程连接：`target` 为 None 时挂新标签（并启动 SFTP），
+    /// 为 Some 时在目标窗格旁分屏（不新建 SFTP——SFTP 按标签挂载）。
+    fn start_connect_into(
+        &mut self,
+        ctx: &egui::Context,
+        profile: HostProfile,
+        target: Option<SplitTarget>,
+    ) {
         if let Some(cancel) = self.pending_connect_cancel.take() {
             cancel.cancel();
         }
-        self.pending = None;
-        self.pending_tab = None;
-        let connection_id = self.allocate_id();
-        self.pending_connection_id = Some(connection_id);
         // 标签展示新建连接时填写的名称，不把用户名和远程当前路径带进来。
         let label = profile.name.clone();
+        let connection_id = self.allocate_id();
+        self.pending_connection_id = Some(connection_id);
+        if target.is_none() {
+            if let Some(connection) = self.pending_sftp.take() {
+                connection.handle.close();
+            }
+            if let Some(connection) = self.ready_sftp.take() {
+                connection.handle.close();
+            }
+            self.pending_tab = None;
+        }
         let terminal_ctx = ctx.clone();
         let on_event = Arc::new(move |_ev: &SessionEvent| {
             terminal_ctx.request_repaint();
@@ -1494,22 +2978,26 @@ impl MinoApp {
         self.pending = Some(rx);
         self.pending_connect_cancel = Some(connect_cancel);
         self.pending_label = label.clone();
+        self.pending_profile = Some(profile.clone());
+        self.pending_split = target;
 
-        let sftp_ctx = ctx.clone();
-        let on_sftp_event = Arc::new(move || {
-            sftp_ctx.request_repaint();
-        });
-        let (_sftp_thread, sftp_handle, sftp_rx) =
-            connect_sftp_with_handler(&profile, on_sftp_event);
-        // 主机名随本连接绑定，避免与并发连接串台。
-        self.pending_sftp = Some(SftpConnection {
-            connection_id,
-            handle: sftp_handle,
-            rx: sftp_rx,
-            host: label,
-            home: None,
-        });
-        self.sftp_error = None;
+        if target.is_none() {
+            let sftp_ctx = ctx.clone();
+            let on_sftp_event = Arc::new(move || {
+                sftp_ctx.request_repaint();
+            });
+            let (_sftp_thread, sftp_handle, sftp_rx) =
+                connect_sftp_with_handler(&profile, on_sftp_event);
+            // 主机名随本连接绑定，避免与并发连接串台。
+            self.pending_sftp = Some(SftpConnection {
+                connection_id,
+                handle: sftp_handle,
+                rx: sftp_rx,
+                host: label,
+                home: None,
+            });
+            self.sftp_error = None;
+        }
     }
 
     /// 将已就绪的 SFTP 会话挂载到 SSH 标签页。
@@ -1531,7 +3019,7 @@ impl MinoApp {
         };
         {
             let home = connection.home.unwrap_or_else(|| "/".to_string());
-            tab.terminal.set_remote_current_directory(&home);
+            tab.active_view_mut().set_remote_current_directory(&home);
             tab.sftp = Some(SftpView::new_at_path(
                 &connection.host,
                 connection.handle,
@@ -1552,25 +3040,27 @@ impl MinoApp {
     /// shell 子进程的内核 cwd（无注入、无等待）；远程仍在空闲提示符下
     /// 注入一条 `pwd`，用 shell 真正的输出校正后再导航。
     fn begin_locate_terminal(tab: &mut TerminalTab, ctx: &egui::Context) {
-        let Some(sftp) = tab.sftp.as_mut() else {
+        if tab.sftp.is_none() {
             return;
-        };
-        // SFTP 面板要求终端上下文才显示定位入口；本地 tab 同样支持
-        // （current_directory 本地恒为 Some）。
-        if tab.terminal.current_directory().is_none() {
+        }
+        // 注意借用拆分：`active_view()` 借整个 tab，不能与 `tab.sftp.as_mut()`
+        // 并存——先取终端侧信息/做终端侧变更，sftp 可变借用每次都短命。
+        if tab.active_view().current_directory().is_none() {
             return;
         }
         // 本地会话直接读 shell 子进程的内核 cwd（source/别名/函数等场景下
         // 输入跟踪早已失效，`pwd` 探测还要往用户终端里注命令；内核值无
         // 注入、无延迟，直接导航）。
-        if !tab.terminal.session().is_remote() {
-            if let Some(dir) = tab.terminal.session().child_current_dir() {
-                sftp.locate_terminal_directory(&dir.to_string_lossy());
+        if !tab.active_view().session().is_remote() {
+            if let Some(dir) = tab.active_view().session().child_current_dir() {
+                if let Some(sftp) = tab.sftp.as_mut() {
+                    sftp.locate_terminal_directory(&dir.to_string_lossy());
+                }
                 ctx.request_repaint();
                 return;
             }
         }
-        if tab.terminal.request_fresh_pwd() {
+        if tab.active_view_mut().request_fresh_pwd() {
             // 探测已注入：等待终端输出（见 `poll_locate_pending`），
             // 这几帧内保持重绘，pwd 回显/输出到达后第一时间导航。
             tab.locate_pending = Some(LocatePending {
@@ -1580,8 +3070,10 @@ impl MinoApp {
         } else {
             // 不适合探测（全屏应用/有未执行输入/已有探测在途）：直接用
             // 已知目录回退，行为与此前一致，不让用户觉得“点了没反应”。
-            if let Some(path) = tab.terminal.current_directory() {
-                sftp.locate_terminal_directory(&path);
+            if let Some(path) = tab.active_view().current_directory() {
+                if let Some(sftp) = tab.sftp.as_mut() {
+                    sftp.locate_terminal_directory(&path);
+                }
                 ctx.request_repaint();
             }
         }
@@ -1598,22 +3090,25 @@ impl MinoApp {
             let Some(pending) = tab.locate_pending.as_ref() else {
                 continue;
             };
-            let Some(sftp) = tab.sftp.as_mut() else {
+            if tab.sftp.is_none() {
                 tab.locate_pending = None;
-                tab.terminal.cancel_fresh_pwd();
+                tab.active_view_mut().cancel_fresh_pwd();
                 continue;
-            };
-            if tab.terminal.auto_pwd_ready() {
-                tab.locate_pending = None;
-                if let Some(path) = tab.terminal.current_directory() {
-                    sftp.locate_terminal_directory(&path);
+            }
+            let ready = tab.active_view().auto_pwd_ready();
+            // 借用拆分同 `begin_locate_terminal`：先算终端侧结论、
+            // sftp 可变借用保持短命。
+            let timed_out = now - pending.started_at >= LOCATE_TIMEOUT_SECS;
+            if ready || timed_out {
+                let path = tab.active_view().current_directory();
+                if timed_out {
+                    tab.active_view_mut().cancel_fresh_pwd();
                 }
-                ctx.request_repaint();
-            } else if now - pending.started_at >= LOCATE_TIMEOUT_SECS {
                 tab.locate_pending = None;
-                tab.terminal.cancel_fresh_pwd();
-                if let Some(path) = tab.terminal.current_directory() {
-                    sftp.locate_terminal_directory(&path);
+                if let Some(path) = path {
+                    if let Some(sftp) = tab.sftp.as_mut() {
+                        sftp.locate_terminal_directory(&path);
+                    }
                 }
                 ctx.request_repaint();
             } else {
@@ -1642,23 +3137,26 @@ impl MinoApp {
         let mut closed_sftp_tabs: Vec<u64> = Vec::new();
         let mut paste_errors: Vec<String> = Vec::new();
         for tab in &mut self.tabs {
-            if let Some(local) = tab.terminal.take_pending_image() {
-                // 本地会话已在 `TerminalView::handle_image_paste` 内直接写入，
-                // 能到这里的一定是远程（`take_pending_image` 本地恒为 `None`）。
-                match tab.sftp.as_ref() {
-                    None => no_sftp_tabs.push(tab.id),
-                    Some(sftp) if sftp.is_closed() => closed_sftp_tabs.push(tab.id),
-                    Some(_) => new_uploads.push(NewUpload {
-                        tab_id: tab.id,
-                        local,
-                    }),
+            // 逐窗格收取（粘贴可能发生在任一聚焦窗格；SFTP 按标签挂载）。
+            for pane in &mut tab.panes {
+                if let Some(local) = pane.view.take_pending_image() {
+                    // 本地会话已在 `TerminalView::handle_image_paste` 内直接写入，
+                    // 能到这里的一定是远程（`take_pending_image` 本地恒为 `None`）。
+                    match tab.sftp.as_ref() {
+                        None => no_sftp_tabs.push(tab.id),
+                        Some(sftp) if sftp.is_closed() => closed_sftp_tabs.push(tab.id),
+                        Some(_) => new_uploads.push(NewUpload {
+                            tab_id: tab.id,
+                            local,
+                        }),
+                    }
                 }
-            }
-            if let Some(message) = tab.terminal.take_image_paste_error() {
-                paste_errors.push(message);
-            }
-            if let Some(message) = tab.terminal.take_clipboard_write_error() {
-                paste_errors.push(message);
+                if let Some(message) = pane.view.take_image_paste_error() {
+                    paste_errors.push(message);
+                }
+                if let Some(message) = pane.view.take_clipboard_write_error() {
+                    paste_errors.push(message);
+                }
             }
         }
         for tab_id in no_sftp_tabs {
@@ -1713,8 +3211,8 @@ impl MinoApp {
                     "@{}",
                     crate::clip_image::shell_escape_for_token(&pending.remote_path)
                 );
-                tab.terminal.session().write(token.as_bytes());
-                tab.terminal.push_pasted_text(&token);
+                tab.active_view().session().write(token.as_bytes());
+                tab.active_view_mut().push_pasted_text(&token);
                 ctx.request_repaint();
             }
             Some(false) => {
@@ -1876,24 +3374,22 @@ impl MinoApp {
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
                                 ui.spacing_mut().item_spacing.y = 0.0;
-                                // ============ 主机管理 ============
-                                let host_count = format!("{} 台", self.config.hosts.len());
-                                Self::settings_card(ui, "主机管理", Some(&host_count), |ui| {
-                                    self.host_sidebar(ui);
-                                });
-
-                                // ============ 项目管理 ============
-                                let project_count = format!("{} 个", self.config.projects.len());
+                                // ============ 工作区（SSH 与项目收藏的融合） ============
+                                let workspace_count =
+                                    format!("{} 个", self.config.workspaces.len());
                                 Self::settings_card(
                                     ui,
-                                    "项目管理",
-                                    Some(&project_count),
+                                    "工作区",
+                                    Some(&workspace_count),
                                     |ui| {
-                                        self.project_manager(ui);
+                                        self.workspace_manager(ui);
                                     },
                                 );
 
                                 // ============ 外观 ============
+                                // 全盘 Kaku 化：不再有可切换的多套主题，外观
+                                // 只有「跟随系统 / 深色 / 浅色」三种偏好
+                                // （Kaku Dark / Kaku Light 两套配色自动跟随）。
                                 Self::settings_card(ui, "外观", None, |ui| {
                                     ui.horizontal(|ui| {
                                         ui.label(
@@ -1902,21 +3398,27 @@ impl MinoApp {
                                                 .color(theme.text_muted),
                                         );
                                         ui.add_space(8.0);
-                                        let current = crate::theme::current_theme().name;
-                                        egui::ComboBox::from_id_salt("settings_theme_switcher")
+                                        let current = self.config.appearance.trim().to_string();
+                                        let label = |pref: &str| match pref {
+                                            "dark" => "深色（Kaku Dark）",
+                                            "light" => "浅色（Kaku Light）",
+                                            _ => "跟随系统",
+                                        };
+                                        let selected_text =
+                                            label(if current.is_empty() { "auto" } else { current.as_str() });
+                                        egui::ComboBox::from_id_salt("settings_appearance_switcher")
                                             .selected_text(
-                                                egui::RichText::new(current)
+                                                egui::RichText::new(selected_text)
                                                     .color(theme.text_primary),
                                             )
                                             .show_ui(ui, |ui| {
-                                                for (i, t) in
-                                                    crate::theme::THEMES.iter().enumerate()
-                                                {
-                                                    let selected = current == t.name;
+                                                for pref in ["auto", "dark", "light"] {
+                                                    let selected =
+                                                        current == pref || (pref == "auto" && current.is_empty());
                                                     if ui
                                                         .selectable_label(
                                                             selected,
-                                                            egui::RichText::new(t.name).color(
+                                                            egui::RichText::new(label(pref)).color(
                                                                 if selected {
                                                                     theme.accent
                                                                 } else {
@@ -1927,17 +3429,20 @@ impl MinoApp {
                                                         .clicked()
                                                     {
                                                         let theme_ctx = ui.ctx().clone();
-                                                        self.apply_theme_and_persist(&theme_ctx, i);
+                                                        self.apply_appearance_and_persist(
+                                                            &theme_ctx, pref,
+                                                        );
                                                     }
                                                 }
                                             });
                                     });
                                     ui.add_space(4.0);
                                     ui.label(
-                                        egui::RichText::new("⌥1 — ⌥3 快速切换主题")
-                                            .monospace()
-                                            .size(10.0)
-                                            .color(theme.text_muted),
+                                        egui::RichText::new(
+                                            "Kaku Dark / Kaku Light 两套配色，跟随 macOS 外观自动切换",
+                                        )
+                                        .size(10.0)
+                                        .color(theme.text_muted),
                                     );
                                     ui.add_space(10.0);
                                     // 终端字号：滑杆 10-24pt（步进 0.5）+ −/＋
@@ -2022,7 +3527,7 @@ impl MinoApp {
                                                     .size(11.5)
                                                     .color(theme.text_secondary),
                                             )
-                                            .on_hover_text("恢复默认 13pt（⌘0）")
+                                            .on_hover_text("恢复默认字号（⌘0）")
                                             .clicked()
                                         {
                                             let font_ctx = ui.ctx().clone();
@@ -2039,6 +3544,196 @@ impl MinoApp {
                                                 .color(theme.text_muted),
                                         );
                                     });
+                                });
+                                ui.add_space(10.0);
+
+                                // ============ AI 助手 ============
+                                // 对照 Kaku 的 ai 配置：OpenAI 兼容连接 +
+                                // 模型名；`# 描述` 生成命令与失败命令修复都
+                                // 用它（⌘L 聊天面板见 AiPanel）。
+                                Self::settings_card(ui, "AI 助手", None, |ui| {
+                                    let path = mino_core::ai::default_assistant_path();
+                                    let mut config =
+                                        mino_core::ai::AssistantConfig::load(&path)
+                                            .unwrap_or_default();
+                                    let mut changed = false;
+                                    ui.horizontal(|ui| {
+                                        changed |= ui
+                                            .checkbox(&mut config.enabled, "启用")
+                                            .changed();
+                                        ui.add_space(8.0);
+                                        ui.label(
+                                            egui::RichText::new(if config.enabled {
+                                                "命令生成（# 描述）与失败修复已开启"
+                                            } else {
+                                                "未启用"
+                                            })
+                                            .size(11.0)
+                                            .color(theme.text_muted),
+                                        );
+                                    });
+                                    ui.add_space(4.0);
+                                    egui::Grid::new("ai_assistant_grid")
+                                        .num_columns(2)
+                                        .spacing([8.0, 6.0])
+                                        .show(ui, |ui| {
+                                            let mut field = |ui: &mut egui::Ui,
+                                                             label: &str,
+                                                             value: &mut String,
+                                                             hint: &str,
+                                                             password: bool| {
+                                                ui.label(
+                                                    egui::RichText::new(label)
+                                                        .size(11.5)
+                                                        .color(theme.text_muted),
+                                                );
+                                                let edit = egui::TextEdit::singleline(value)
+                                                    .desired_width(260.0)
+                                                    .hint_text(hint)
+                                                    .password(password);
+                                                let resp = ui.add(edit);
+                                                ui.end_row();
+                                                if resp.changed() {
+                                                    changed = true;
+                                                }
+                                            };
+                                            field(ui, "模型", &mut config.model, "如 gpt-4o-mini", false);
+                                            field(ui, "聊天模型", &mut config.chat_model, "留空回退模型", false);
+                                            field(ui, "Base URL", &mut config.base_url, mino_core::ai::DEFAULT_BASE_URL, false);
+                                            field(ui, "API Key", &mut config.api_key, "sk-…", true);
+                                            ui.label(
+                                                egui::RichText::new("认证")
+                                                    .size(11.5)
+                                                    .color(theme.text_muted),
+                                            );
+                                            egui::ComboBox::from_id_salt("ai_auth_type")
+                                                .selected_text(if config.auth_type == "codex" {
+                                                    "codex（跟随 Codex 登录）"
+                                                } else {
+                                                    "api_key"
+                                                })
+                                                .show_ui(ui, |ui| {
+                                                    for option in ["api_key", "codex"] {
+                                                        if ui
+                                                            .selectable_label(
+                                                                config.auth_type == option,
+                                                                option,
+                                                            )
+                                                            .clicked()
+                                                            && config.auth_type != option
+                                                        {
+                                                            config.auth_type = option.to_string();
+                                                            changed = true;
+                                                        }
+                                                    }
+                                                });
+                                            ui.end_row();
+                                        });
+                                    if changed {
+                                        let save_path = mino_core::ai::default_assistant_path();
+                                        match config.save(&save_path) {
+                                            Ok(()) => {
+                                                // 打开中的 AI 面板立刻采用新配置。
+                                                self.ai_panel.reload_config();
+                                            }
+                                            Err(e) => {
+                                                log::warn!("保存 AI 助手配置失败：{e}");
+                                                self.show_toast(
+                                                    format!("保存 AI 配置失败：{e}"),
+                                                    true,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "配置存储：{}（0600）",
+                                            mino_core::ai::default_assistant_path().display()
+                                        ))
+                                        .size(10.0)
+                                        .color(theme.text_muted),
+                                    );
+                                });
+                                ui.add_space(10.0);
+
+                                // ============ Shell 集成 ============
+                                // Kaku 的 shell suite（z / syntax-highlighting /
+                                // autosuggestions / Smart Tab）：受管块安装进
+                                // `~/.zshrc`，插件按需下载；一键可卸载。
+                                Self::settings_card(ui, "Shell 集成", None, |ui| {
+                                    let config_dir = self.shell_config_dir();
+                                    let installed = mino_core::shell_integration::is_installed(
+                                        &self.zshrc_path,
+                                    );
+                                    let plugin_total =
+                                        mino_core::shell_integration::Plugin::ALL.len();
+                                    let missing = mino_core::shell_integration::missing_plugins(
+                                        &config_dir,
+                                    )
+                                    .len();
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 8.0;
+                                        status_dot(
+                                            ui,
+                                            if installed {
+                                                theme.success
+                                            } else {
+                                                theme.text_muted
+                                            },
+                                            false,
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(if installed {
+                                                "已安装"
+                                            } else {
+                                                "未安装"
+                                            })
+                                            .size(12.0)
+                                            .color(theme.text_primary),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "· 插件 {}/{}",
+                                                plugin_total.saturating_sub(missing),
+                                                plugin_total
+                                            ))
+                                            .size(11.0)
+                                            .color(theme.text_muted),
+                                        );
+                                        if self.vendor_running {
+                                            loading_hint(ui, "插件下载中…");
+                                        }
+                                    });
+                                    ui.add_space(6.0);
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 8.0;
+                                        if ui.small_button("安装 / 修复").clicked() {
+                                            let card_ctx = ui.ctx().clone();
+                                            self.install_shell_integration(&card_ctx);
+                                        }
+                                        if ui.small_button("卸载").clicked() {
+                                            self.uninstall_shell_integration();
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                !self.vendor_running && missing > 0,
+                                                egui::Button::new("下载插件").small(),
+                                            )
+                                            .clicked()
+                                        {
+                                            let card_ctx = ui.ctx().clone();
+                                            self.start_vendor_bootstrap(&card_ctx);
+                                        }
+                                    });
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "向 ~/.zshrc 写入受管片段（可一键卸载）：z 目录跳转 / 语法高亮 / 自动补全 / Smart Tab。",
+                                        )
+                                        .size(10.0)
+                                        .color(theme.text_muted),
+                                    );
                                 });
                                 ui.add_space(10.0);
 
@@ -2172,367 +3867,149 @@ impl MinoApp {
         ui.add_space(10.0);
     }
 
-    /// 标签栏 ">_" 快捷按钮弹出的主机菜单：单击主机行直接发起连接
-    /// （与设置弹窗主机行的双击不同——快捷入口单击即连，无需二次确认）。
-    /// 无已保存主机时提示并可一键打开新建连接对话框。
-    fn host_quick_menu(&mut self, ui: &mut egui::Ui) {
+    // ===== workspace_quick_menu（替换旧 host_quick_menu） =====
+    /// 标签栏「工作区」快捷菜单：单击条目直接打开（本地建标签 / SSH 连接）。
+    ///
+    /// 行样式与 ⌘O 面板共用 `paint_workspace_row`；空态给「新增工作区」入口。
+    fn workspace_quick_menu(&mut self, ui: &mut egui::Ui) {
         let theme = crate::theme::current_theme();
-        const MENU_W: f32 = 256.0;
-        const ROW_H: f32 = 40.0;
+        let ctx = ui.ctx().clone();
+        const MENU_W: f32 = 300.0;
+        const ROW_H: f32 = 44.0;
         const AVATAR: f32 = 22.0;
-        const ROW_PAD_X: f32 = 10.0;
-        const TEXT_GAP: f32 = 8.0;
         ui.set_min_width(MENU_W);
         ui.set_max_width(MENU_W);
-        ui.spacing_mut().item_spacing.y = 2.0;
-
-        if self.config.hosts.is_empty() {
-            ui.add_space(8.0);
-            ui.vertical_centered(|ui| {
-                ui.label(
-                    egui::RichText::new("暂无已保存主机")
-                        .size(12.0)
-                        .color(theme.text_muted),
-                );
-                ui.add_space(6.0);
-                if ui
-                    .button(
-                        egui::RichText::new("新建连接")
-                            .size(12.0)
-                            .color(theme.text_primary),
-                    )
-                    .clicked()
-                {
-                    self.open_new_connection();
-                    ui.close();
-                }
-            });
-            ui.add_space(8.0);
+        ui.add_space(2.0);
+        if self.config.workspaces.is_empty() {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("暂无工作区")
+                    .size(11.5)
+                    .color(theme.text_muted),
+            );
+            ui.add_space(6.0);
+            if ui
+                .add(egui::Button::new(
+                    egui::RichText::new("新增工作区…")
+                        .size(11.5)
+                        .color(theme.text_primary),
+                ))
+                .clicked()
+            {
+                ui.close();
+                self.open_workspace_editor(1);
+            }
+            ui.add_space(4.0);
             return;
         }
-
-        ui.add_space(2.0);
-        let mut connect: Option<HostProfile> = None;
-        for (i, host) in self.config.hosts.iter().enumerate() {
-            let row_id = egui::Id::new(("quick_host", i));
-            // 先占满菜单宽度，hover 高亮才能贴齐左右内边距（曾按内容包围盒
-            // expand，短名称行高亮左右留白、像一块浮岛）。
-            let (row_rect, _) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width(), ROW_H),
-                egui::Sense::hover(),
-            );
-            let highlight = row_rect.shrink2(egui::vec2(4.0, 1.0));
-            let hovered = ui.rect_contains_pointer(highlight);
-            if hovered {
-                ui.painter().rect_filled(
-                    highlight,
-                    crate::theme::tokens::RADIUS_ITEM,
-                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16),
-                );
-            }
-
-            // 行内容：头像垂直居中 + 名称/地址左对齐截断。
-            // 不用 add_sized——其内部 Layout::centered_and_justified 会把短
-            // 名称水平居中，和长地址错位（回归：ssh快捷菜单行左对齐）。
-            let mut inner = ui.new_child(
-                egui::UiBuilder::new()
-                    .id_salt(row_id)
-                    .max_rect(row_rect)
-                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
-            );
-            inner.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-            inner.add_space(ROW_PAD_X);
-            let (avatar_rect, _) =
-                inner.allocate_exact_size(egui::vec2(AVATAR, AVATAR), egui::Sense::hover());
-            let initial = host.name.chars().next().unwrap_or('?');
-            dialog::paint_avatar(inner.painter(), avatar_rect, initial, theme, false);
-            inner.add_space(TEXT_GAP);
-            let text_rect = inner
-                .allocate_exact_size(
-                    egui::vec2(
-                        (row_rect.width() - ROW_PAD_X * 2.0 - AVATAR - TEXT_GAP).max(80.0),
-                        28.0,
-                    ),
-                    egui::Sense::hover(),
-                )
-                .0;
-            let mut text = inner.new_child(
-                egui::UiBuilder::new()
-                    .id_salt(row_id.with("text"))
-                    .max_rect(text_rect)
-                    .layout(egui::Layout::top_down(egui::Align::Min)),
-            );
-            text.spacing_mut().item_spacing.y = 1.0;
-            text.add_space(1.0);
-            text.add(
-                egui::Label::new(
-                    egui::RichText::new(&host.name)
-                        .size(12.5)
-                        .color(theme.text_primary),
-                )
-                .truncate(),
-            );
-            text.add(
-                egui::Label::new(
-                    egui::RichText::new(format!("{}@{}", host.user, host.host))
-                        .size(10.5)
-                        .color(theme.text_secondary),
-                )
-                .truncate(),
-            );
-
-            // 整行点击区（显式 interact + 稳定 Id，注册在内容之后）。
-            let resp = ui
-                .interact(row_rect, row_id.with("click"), egui::Sense::click())
-                .on_hover_cursor(egui::CursorIcon::PointingHand);
-            if resp.clicked() {
-                connect = Some(host.clone());
-                ui.close();
-            }
+        let mut open: Option<Workspace> = None;
+        egui::ScrollArea::vertical()
+            .id_salt("workspace_quick_scroll")
+            .max_height(320.0)
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                for (i, workspace) in self.config.workspaces.iter().enumerate() {
+                    let row_id = egui::Id::new(("workspace_quick_row", i));
+                    let resp = paint_workspace_row(ui, workspace, false, row_id, ROW_H, AVATAR);
+                    if resp.clicked() {
+                        open = Some(workspace.clone());
+                    }
+                }
+            });
+        ui.add_space(4.0);
+        if ui
+            .add(egui::Button::new(
+                egui::RichText::new("管理工作区…")
+                    .size(11.0)
+                    .color(theme.text_secondary),
+            ))
+            .clicked()
+        {
+            ui.close();
+            self.show_settings = true;
         }
-        ui.add_space(2.0);
-        if let Some(profile) = connect {
-            self.start_connect(ui.ctx(), profile);
+        if let Some(workspace) = open {
+            ui.close();
+            self.open_workspace(&ctx, &workspace);
         }
     }
 
-    /// 按搜索词过滤项目（名称/路径子串，大小写不敏感），返回原下标。
+    // ===== filtered_workspace_indices（替换 filtered_project_indices） =====
+    /// 按搜索词过滤工作区（名称/详情子串，大小写不敏感），返回原下标。
     ///
     /// 快捷菜单与 ⌘O 面板共用，保证两处过滤语义一致。
-    fn filtered_project_indices(&self) -> Vec<usize> {
-        let query = self.project_filter.trim().to_lowercase();
-        if query.is_empty() {
-            return (0..self.config.projects.len()).collect();
+    fn filtered_workspace_indices(&self) -> Vec<usize> {
+        let keyword = self.workspace_filter.trim().to_lowercase();
+        if keyword.is_empty() {
+            return (0..self.config.workspaces.len()).collect();
         }
         self.config
-            .projects
+            .workspaces
             .iter()
             .enumerate()
-            .filter(|(_, p)| {
-                p.name.to_lowercase().contains(&query)
-                    || p.path.to_string_lossy().to_lowercase().contains(&query)
+            .filter(|(_, workspace)| {
+                workspace.name().to_lowercase().contains(&keyword)
+                    || workspace.detail().to_lowercase().contains(&keyword)
             })
             .map(|(i, _)| i)
             .collect()
     }
 
-    /// 标签栏项目按钮弹出的收藏菜单：首行搜索 + 项目列表，单击即打开为新终端标签。
-    ///
-    /// 行结构复制 `host_quick_menu`（MENU_W 256、ROW_H 40、先 allocate 满宽再绘内容、
-    /// 显式 `interact` + 稳定 Id、内容之后注册点击）。
-    fn project_quick_menu(&mut self, ui: &mut egui::Ui) {
-        let theme = crate::theme::current_theme();
-        const MENU_W: f32 = 256.0;
-        const ROW_H: f32 = 40.0;
-        const AVATAR: f32 = 22.0;
-        const ROW_PAD_X: f32 = 10.0;
-        const TEXT_GAP: f32 = 8.0;
-        ui.set_min_width(MENU_W);
-        ui.set_max_width(MENU_W);
-        ui.spacing_mut().item_spacing.y = 2.0;
-
-        if self.config.projects.is_empty() {
-            ui.add_space(8.0);
-            ui.vertical_centered(|ui| {
-                ui.label(
-                    egui::RichText::new("暂无收藏项目")
-                        .size(12.0)
-                        .color(theme.text_muted),
-                );
-                ui.add_space(6.0);
-                if ui
-                    .button(
-                        egui::RichText::new("收藏当前目录（⌘D）")
-                            .size(12.0)
-                            .color(theme.text_primary),
-                    )
-                    .clicked()
-                {
-                    self.bookmark_current_directory();
-                    ui.close();
-                }
-                if ui
-                    .button(
-                        egui::RichText::new("管理项目…")
-                            .size(12.0)
-                            .color(theme.text_primary),
-                    )
-                    .clicked()
-                {
-                    self.show_settings = true;
-                    ui.close();
-                }
-            });
-            ui.add_space(8.0);
+    /// 切换工作区面板（⌘O；工作区编辑模态时不响应，防弹窗叠加）。
+    fn toggle_workspaces(&mut self) {
+        if self.workspace_edit.is_some() {
             return;
         }
-
-        ui.add_space(2.0);
-        let search_id = egui::Id::new("project_quick_search");
-        let search_resp = dialog::form_input(
-            ui,
-            search_id,
-            &mut self.project_filter,
-            "搜索项目",
-            ui.available_width(),
-            false,
-            false,
-        );
-        if search_resp.changed() {
-            self.project_selected = 0;
-        }
-        ui.memory_mut(|m| m.request_focus(search_id));
-
-        let matched = self.filtered_project_indices();
-        if matched.is_empty() {
-            ui.add_space(4.0);
-            ui.vertical_centered(|ui| {
-                ui.label(
-                    egui::RichText::new("无匹配项目")
-                        .size(12.0)
-                        .color(theme.text_muted),
-                );
-            });
-            ui.add_space(4.0);
-            return;
-        }
-
-        let mut open: Option<ProjectProfile> = None;
-        egui::ScrollArea::vertical()
-            .id_salt("project_quick_scroll")
-            .max_height(320.0)
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
-                for idx in matched {
-                    let project = self.config.projects[idx].clone();
-                    let row_id = egui::Id::new(("quick_project", idx));
-                    let (row_rect, _) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), ROW_H),
-                        egui::Sense::hover(),
-                    );
-                    let highlight = row_rect.shrink2(egui::vec2(4.0, 1.0));
-                    if ui.rect_contains_pointer(highlight) {
-                        ui.painter().rect_filled(
-                            highlight,
-                            crate::theme::tokens::RADIUS_ITEM,
-                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16),
-                        );
-                    }
-                    let mut inner = ui.new_child(
-                        egui::UiBuilder::new()
-                            .id_salt(row_id)
-                            .max_rect(row_rect)
-                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                    );
-                    inner.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-                    inner.add_space(ROW_PAD_X);
-                    let (avatar_rect, _) =
-                        inner.allocate_exact_size(egui::vec2(AVATAR, AVATAR), egui::Sense::hover());
-                    let initial = project.name.chars().next().unwrap_or('?');
-                    dialog::paint_avatar(inner.painter(), avatar_rect, initial, theme, false);
-                    inner.add_space(TEXT_GAP);
-                    let text_rect = inner
-                        .allocate_exact_size(
-                            egui::vec2(
-                                (row_rect.width() - ROW_PAD_X * 2.0 - AVATAR - TEXT_GAP).max(80.0),
-                                28.0,
-                            ),
-                            egui::Sense::hover(),
-                        )
-                        .0;
-                    let mut text = inner.new_child(
-                        egui::UiBuilder::new()
-                            .id_salt(row_id.with("text"))
-                            .max_rect(text_rect)
-                            .layout(egui::Layout::top_down(egui::Align::Min)),
-                    );
-                    text.spacing_mut().item_spacing.y = 1.0;
-                    text.add_space(1.0);
-                    text.add(
-                        egui::Label::new(
-                            egui::RichText::new(&project.name)
-                                .size(12.5)
-                                .color(theme.text_primary),
-                        )
-                        .truncate(),
-                    );
-                    let path_text = project.path.to_string_lossy().into_owned();
-                    text.add(
-                        egui::Label::new(
-                            egui::RichText::new(&path_text)
-                                .size(10.5)
-                                .color(theme.text_secondary),
-                        )
-                        .truncate(),
-                    );
-                    let resp = ui
-                        .interact(row_rect, row_id.with("click"), egui::Sense::click())
-                        .on_hover_cursor(egui::CursorIcon::PointingHand);
-                    if resp.clicked() {
-                        open = Some(project);
-                        ui.close();
-                    }
-                }
-            });
-        ui.add_space(2.0);
-        if let Some(project) = open {
-            self.open_project(ui.ctx(), &project);
+        self.show_workspaces = !self.show_workspaces;
+        if self.show_workspaces {
+            self.workspace_filter.clear();
+            self.workspace_selected = 0;
         }
     }
 
-    /// 切换项目打开面板（⌘O；新建连接模态时不响应，防弹窗叠加）。
-    fn toggle_projects(&mut self) {
-        if self.show_new_conn {
-            return;
-        }
-        self.show_projects = !self.show_projects;
-        if self.show_projects {
-            self.project_filter.clear();
-            self.project_selected = 0;
-        }
-    }
-
-    /// ⌘O 项目打开面板：可搜索的项目列表，回车/单击即打开为新终端标签。
+    // ===== workspaces_panel（替换 projects_panel） =====
+    /// 工作区打开面板（⌘O）：搜索 + 列表（本地目录与 SSH 主机同列）。
     ///
-    /// 居中无标题栏弹窗（`dialog::shell_frame` 外壳，头部为设置弹窗的
-    /// logo+标题+ESC 胶囊简化版）。行样式与快捷菜单一致（头像+名称+路径），
-    /// 键盘选中的行 accent 软底。
-    fn projects_panel(&mut self, ctx: &egui::Context) {
+    /// 键盘 ↑↓ 选择、回车/单击打开；SSH 条目发起连接，本地条目新建标签。
+    fn workspaces_panel(&mut self, ctx: &egui::Context) {
         let theme = crate::theme::current_theme();
         // ==================== 键盘导航（每帧先处理） ====================
-        let matched = self.filtered_project_indices();
+        let matched = self.filtered_workspace_indices();
         if !matched.is_empty() {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
-                self.project_selected = (self.project_selected + 1) % matched.len();
+                self.workspace_selected = (self.workspace_selected + 1) % matched.len();
             }
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
-                self.project_selected = (self.project_selected + matched.len() - 1) % matched.len();
+                self.workspace_selected =
+                    (self.workspace_selected + matched.len() - 1) % matched.len();
             }
         }
         let mut open_idx: Option<usize> = None;
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
             && !matched.is_empty()
         {
-            open_idx = Some(matched[self.project_selected.min(matched.len() - 1)]);
+            open_idx = Some(matched[self.workspace_selected.min(matched.len() - 1)]);
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-            self.show_projects = false;
+            self.show_workspaces = false;
         }
         if let Some(idx) = open_idx {
-            let project = self.config.projects[idx].clone();
-            self.show_projects = false;
-            self.project_filter.clear();
-            self.project_selected = 0;
-            self.open_project(ctx, &project);
+            let workspace = self.config.workspaces[idx].clone();
+            self.show_workspaces = false;
+            self.workspace_filter.clear();
+            self.workspace_selected = 0;
+            self.open_workspace(ctx, &workspace);
             return;
         }
-        if !self.show_projects {
+        if !self.show_workspaces {
             return;
         }
 
         let mut close_requested = false;
-        let mut open_clicked: Option<ProjectProfile> = None;
-        egui::Window::new("projects_panel")
+        let mut open_clicked: Option<Workspace> = None;
+        let mut create_local = false;
+        let mut create_ssh = false;
+        egui::Window::new("workspaces_panel")
             .anchor(egui::Align2::CENTER_CENTER, [0.0, -20.0])
             .default_size([480.0, 320.0])
             .max_size([480.0, 420.0])
@@ -2570,9 +4047,9 @@ impl MinoApp {
                 header.add_space(10.0);
                 dialog::header_title(
                     &mut header,
-                    "projects_header_title",
-                    "打开项目",
-                    "名称 · 路径",
+                    "workspaces_header_title",
+                    "工作区",
+                    "本地目录 · SSH 主机",
                 );
                 header.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(12.0);
@@ -2592,7 +4069,7 @@ impl MinoApp {
                     );
                     let mut esc = ui.new_child(
                         egui::UiBuilder::new()
-                            .id_salt("projects_header_esc")
+                            .id_salt("workspaces_header_esc")
                             .max_rect(esc_rect)
                             .layout(egui::Layout::centered_and_justified(
                                 egui::Direction::TopDown,
@@ -2610,39 +4087,54 @@ impl MinoApp {
                 egui::Frame::new()
                     .inner_margin(egui::Margin::symmetric(14, 0))
                     .show(ui, |ui| {
-                        // 搜索框（与快捷菜单共用 filter，输入变化时选中归零）。
-                        let search_id = egui::Id::new("projects_panel_search");
+                        let search_id = egui::Id::new("workspaces_panel_search");
                         let search_resp = dialog::form_input(
                             ui,
                             search_id,
-                            &mut self.project_filter,
-                            "搜索项目",
+                            &mut self.workspace_filter,
+                            "搜索工作区（名称 / 路径 / 主机）",
                             ui.available_width(),
                             false,
                             false,
                         );
                         if search_resp.changed() {
-                            self.project_selected = 0;
+                            self.workspace_selected = 0;
                         }
                         ui.memory_mut(|m| m.request_focus(search_id));
                         ui.add_space(8.0);
 
-                        let matched = self.filtered_project_indices();
-                        if self.config.projects.is_empty() {
+                        let matched = self.filtered_workspace_indices();
+                        if self.config.workspaces.is_empty() {
                             ui.vertical_centered(|ui| {
                                 ui.add_space(12.0);
                                 ui.label(
-                                    egui::RichText::new("暂无收藏项目")
+                                    egui::RichText::new("暂无工作区")
                                         .size(12.0)
                                         .color(theme.text_muted),
                                 );
                                 ui.add_space(4.0);
                                 ui.label(
-                                    egui::RichText::new("⌘D 收藏当前终端目录")
+                                    egui::RichText::new("⌘B 收藏当前会话 · 或新增一个")
                                         .monospace()
                                         .size(10.5)
                                         .color(theme.text_secondary),
                                 );
+                                ui.add_space(10.0);
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 8.0;
+                                    if ui
+                                        .add(dialog::primary_button(theme, "新增本地目录"))
+                                        .clicked()
+                                    {
+                                        create_local = true;
+                                    }
+                                    if ui
+                                        .add(dialog::secondary_button(theme, "新增 SSH 主机"))
+                                        .clicked()
+                                    {
+                                        create_ssh = true;
+                                    }
+                                });
                                 ui.add_space(12.0);
                             });
                             return;
@@ -2651,7 +4143,7 @@ impl MinoApp {
                             ui.vertical_centered(|ui| {
                                 ui.add_space(12.0);
                                 ui.label(
-                                    egui::RichText::new("无匹配项目")
+                                    egui::RichText::new("无匹配工作区")
                                         .size(12.0)
                                         .color(theme.text_muted),
                                 );
@@ -2660,103 +4152,25 @@ impl MinoApp {
                             return;
                         }
                         egui::ScrollArea::vertical()
-                            .id_salt("projects_panel_scroll")
+                            .id_salt("workspaces_panel_scroll")
                             .max_height(280.0)
                             .show(ui, |ui| {
                                 ui.spacing_mut().item_spacing.y = 2.0;
-                                const ROW_H: f32 = 40.0;
+                                const ROW_H: f32 = 44.0;
                                 const AVATAR: f32 = 22.0;
                                 for (pos, idx) in matched.iter().enumerate() {
-                                    let project = self.config.projects[*idx].clone();
-                                    let row_id = egui::Id::new(("projects_panel_row", *idx));
-                                    let (row_rect, _) = ui.allocate_exact_size(
-                                        egui::vec2(ui.available_width(), ROW_H),
-                                        egui::Sense::hover(),
+                                    let workspace = self.config.workspaces[*idx].clone();
+                                    let row_id = egui::Id::new(("workspaces_panel_row", *idx));
+                                    let resp = paint_workspace_row(
+                                        ui,
+                                        &workspace,
+                                        pos == self.workspace_selected,
+                                        row_id,
+                                        ROW_H,
+                                        AVATAR,
                                     );
-                                    let highlight = row_rect.shrink2(egui::vec2(4.0, 1.0));
-                                    let selected = pos == self.project_selected;
-                                    if selected {
-                                        ui.painter().rect_filled(
-                                            highlight,
-                                            crate::theme::tokens::RADIUS_ITEM,
-                                            theme.accent_soft,
-                                        );
-                                    } else if ui.rect_contains_pointer(highlight) {
-                                        ui.painter().rect_filled(
-                                            highlight,
-                                            crate::theme::tokens::RADIUS_ITEM,
-                                            egui::Color32::from_rgba_unmultiplied(
-                                                255, 255, 255, 16,
-                                            ),
-                                        );
-                                    }
-                                    let mut inner = ui.new_child(
-                                        egui::UiBuilder::new()
-                                            .id_salt(row_id)
-                                            .max_rect(row_rect)
-                                            .layout(egui::Layout::left_to_right(
-                                                egui::Align::Center,
-                                            )),
-                                    );
-                                    inner.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-                                    inner.add_space(10.0);
-                                    let (avatar_rect, _) = inner.allocate_exact_size(
-                                        egui::vec2(AVATAR, AVATAR),
-                                        egui::Sense::hover(),
-                                    );
-                                    let initial = project.name.chars().next().unwrap_or('?');
-                                    dialog::paint_avatar(
-                                        inner.painter(),
-                                        avatar_rect,
-                                        initial,
-                                        theme,
-                                        selected,
-                                    );
-                                    inner.add_space(8.0);
-                                    let text_rect = inner
-                                        .allocate_exact_size(
-                                            egui::vec2(
-                                                (row_rect.width() - 10.0 * 2.0 - AVATAR - 8.0)
-                                                    .max(80.0),
-                                                28.0,
-                                            ),
-                                            egui::Sense::hover(),
-                                        )
-                                        .0;
-                                    let mut text = inner.new_child(
-                                        egui::UiBuilder::new()
-                                            .id_salt(row_id.with("text"))
-                                            .max_rect(text_rect)
-                                            .layout(egui::Layout::top_down(egui::Align::Min)),
-                                    );
-                                    text.spacing_mut().item_spacing.y = 1.0;
-                                    text.add_space(1.0);
-                                    text.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(&project.name)
-                                                .size(12.5)
-                                                .color(theme.text_primary),
-                                        )
-                                        .truncate(),
-                                    );
-                                    let path_text = project.path.to_string_lossy().into_owned();
-                                    text.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(&path_text)
-                                                .size(10.5)
-                                                .color(theme.text_secondary),
-                                        )
-                                        .truncate(),
-                                    );
-                                    let resp = ui
-                                        .interact(
-                                            row_rect,
-                                            row_id.with("click"),
-                                            egui::Sense::click(),
-                                        )
-                                        .on_hover_cursor(egui::CursorIcon::PointingHand);
                                     if resp.clicked() {
-                                        open_clicked = Some(project);
+                                        open_clicked = Some(workspace);
                                     }
                                 }
                             });
@@ -2764,750 +4178,185 @@ impl MinoApp {
                 ui.add_space(10.0);
             });
         if close_requested {
-            self.show_projects = false;
+            self.show_workspaces = false;
         }
-        if let Some(project) = open_clicked {
-            self.show_projects = false;
-            self.project_filter.clear();
-            self.project_selected = 0;
-            self.open_project(ctx, &project);
+        if create_local {
+            self.show_workspaces = false;
+            self.open_workspace_editor(0);
         }
-    }
-
-    /// 渲染设置里的主机管理区。
-    ///
-    /// 仪器列表风：平时无线无底、行间发丝分隔，认证降级为次要文本；
-    /// 选中行 accent 软底 + 左侧竖条。点击区域覆盖整行。
-    fn host_sidebar(&mut self, ui: &mut egui::Ui) {
-        let theme = crate::theme::current_theme();
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            dialog::section_title(ui, "已保存主机");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_sized(
-                        egui::vec2(76.0, 26.0),
-                        dialog::primary_button(theme, "新建连接"),
-                    )
-                    .clicked()
-                {
-                    self.open_new_connection();
-                }
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new(format!("{} 台", self.config.hosts.len()))
-                        .monospace()
-                        .size(10.0)
-                        .color(theme.text_muted),
-                );
-            });
-        });
-        ui.add_space(10.0);
-
-        if self.config.hosts.is_empty() {
-            let (empty_rect, _) = ui
-                .allocate_exact_size(egui::vec2(ui.available_width(), 92.0), egui::Sense::hover());
-            dialog::dashed_rounded_rect(
-                ui,
-                empty_rect,
-                crate::theme::tokens::RADIUS_ITEM,
-                theme.border,
-            );
-            let mut empty = ui.new_child(
-                egui::UiBuilder::new()
-                    .id_salt("empty_hosts")
-                    .max_rect(empty_rect)
-                    .layout(egui::Layout::top_down(egui::Align::Center)),
-            );
-            empty.add_space(22.0);
-            empty.label(
-                egui::RichText::new("暂无已保存主机")
-                    .color(theme.text_secondary)
-                    .size(12.5),
-            );
-            empty.add_space(2.0);
-            empty.label(
-                egui::RichText::new("⌘N 添加第一台主机")
-                    .monospace()
-                    .size(10.0)
-                    .color(theme.text_muted),
-            );
-            return;
+        if create_ssh {
+            self.show_workspaces = false;
+            self.open_workspace_editor(1);
         }
-
-        let mut remove_idx: Option<usize> = None;
-        let mut connect_idx: Option<usize> = None;
-        // 右侧操作列固定：认证文本 + 删除按钮永远在同一条竖线上，
-        // 名称列只占用中间剩余空间，过长截断不挤乱布局。
-        const ROW_H: f32 = 56.0;
-        const AVATAR: f32 = 30.0;
-        const AUTH_W: f32 = 72.0;
-        const DELETE_SIZE: f32 = 24.0;
-        const GAP: f32 = 10.0;
-
-        let host_count = self.config.hosts.len();
-        for (i, host) in self.config.hosts.iter().enumerate() {
-            let row_id = egui::Id::new(("host_row", i));
-            let (row_rect, _) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width(), ROW_H),
-                egui::Sense::hover(),
-            );
-            // 行背景在内容之前绘制；点击区域延后到内容之后注册，避免内部
-            // 名称/地址控件抢走整行点击，删除按钮随后再覆盖行点击区。
-            let hover = ui.input(|input| {
-                input
-                    .pointer
-                    .hover_pos()
-                    .is_some_and(|pointer| row_rect.contains(pointer))
-            });
-            let selected = self.selected_host == Some(i);
-            // 平时无线无底；选中 accent 软底，hover 白 6% 提亮。
-            if selected {
-                ui.painter().rect_filled(
-                    row_rect,
-                    crate::theme::tokens::RADIUS_ITEM,
-                    theme.accent_soft,
-                );
-                ui.painter().rect_filled(
-                    egui::Rect::from_min_max(
-                        egui::pos2(row_rect.left() + 2.0, row_rect.top() + 10.0),
-                        egui::pos2(row_rect.left() + 4.0, row_rect.bottom() - 10.0),
-                    ),
-                    1.0,
-                    theme.accent,
-                );
-            } else if hover {
-                ui.painter().rect_filled(
-                    row_rect,
-                    crate::theme::tokens::RADIUS_ITEM,
-                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14),
-                );
-            }
-            // 行间发丝线（末行不画），左右与内容对齐。
-            if i + 1 < host_count {
-                let y = row_rect.bottom();
-                ui.painter().line_segment(
-                    [
-                        egui::pos2(row_rect.left() + 12.0, y),
-                        egui::pos2(row_rect.right() - 12.0, y),
-                    ],
-                    egui::Stroke::new(1.0, theme.border.gamma_multiply(0.5)),
-                );
-            }
-
-            let content_rect = row_rect.shrink2(egui::vec2(12.0, 6.0));
-            let right_w = AUTH_W + GAP + DELETE_SIZE;
-            let identity_width = (content_rect.width() - AVATAR - GAP - right_w - GAP).max(72.0);
-            let mut inner = ui.new_child(
-                egui::UiBuilder::new()
-                    .id_salt(row_id.with("content"))
-                    .max_rect(content_rect)
-                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
-            );
-            inner.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-            let (avatar_rect, _) =
-                inner.allocate_exact_size(egui::vec2(AVATAR, AVATAR), egui::Sense::hover());
-            let initial = host.name.chars().next().unwrap_or('?');
-            dialog::paint_avatar(inner.painter(), avatar_rect, initial, theme, selected);
-            inner.add_space(GAP);
-
-            let identity_rect = inner
-                .allocate_exact_size(egui::vec2(identity_width, AVATAR), egui::Sense::hover())
-                .0;
-            let mut identity = inner.new_child(
-                egui::UiBuilder::new()
-                    .id_salt(row_id.with("identity"))
-                    .max_rect(identity_rect)
-                    .layout(egui::Layout::top_down(egui::Align::Min)),
-            );
-            identity.spacing_mut().item_spacing.y = 2.0;
-            identity.add_space(1.0);
-            identity.add(
-                egui::Label::new(
-                    egui::RichText::new(&host.name)
-                        .strong()
-                        .size(13.0)
-                        .color(theme.text_primary),
-                )
-                .truncate(),
-            );
-            identity.add(
-                egui::Label::new(
-                    egui::RichText::new(format!("{}@{}:{}", host.user, host.host, host.port))
-                        .monospace()
-                        .size(10.5)
-                        .color(theme.text_muted),
-                )
-                .truncate(),
-            );
-
-            // 认证方式降级为次要文本（无胶囊），右对齐固定列。
-            let auth_label = if matches!(host.auth, Auth::Key { .. }) {
-                "SSH KEY"
-            } else {
-                "PASSWORD"
-            };
-            let auth_rect = egui::Rect::from_min_size(
-                egui::pos2(
-                    content_rect.right() - DELETE_SIZE - GAP - AUTH_W,
-                    row_rect.center().y - 8.0,
-                ),
-                egui::vec2(AUTH_W, 16.0),
-            );
-            let mut auth = ui.new_child(
-                egui::UiBuilder::new()
-                    .id_salt(row_id.with("auth"))
-                    .max_rect(auth_rect)
-                    .layout(egui::Layout::right_to_left(egui::Align::Center)),
-            );
-            auth.label(
-                egui::RichText::new(auth_label)
-                    .monospace()
-                    .size(9.0)
-                    .color(theme.text_muted),
-            );
-
-            let row_response = ui
-                .interact(row_rect, row_id, egui::Sense::click())
-                .on_hover_cursor(egui::CursorIcon::PointingHand);
-
-            // 删除按钮最后注册，覆盖整行点击区，避免点击删除时先触发连接。
-            let del_rect = egui::Rect::from_min_size(
-                egui::pos2(
-                    content_rect.right() - DELETE_SIZE,
-                    row_rect.center().y - DELETE_SIZE * 0.5,
-                ),
-                egui::vec2(DELETE_SIZE, DELETE_SIZE),
-            );
-            let del_resp = ui
-                .interact(del_rect, row_id.with("del"), egui::Sense::click())
-                .on_hover_cursor(egui::CursorIcon::PointingHand);
-            if del_resp.hovered() {
-                ui.painter()
-                    .rect_filled(del_rect, 6.0, theme.danger.gamma_multiply(0.18));
-            }
-            let icon_color = if del_resp.hovered() {
-                theme.danger
-            } else {
-                theme.text_muted
-            };
-            let icon = del_rect.shrink(8.0);
-            ui.painter().line_segment(
-                [icon.left_top(), icon.right_bottom()],
-                egui::Stroke::new(1.4, icon_color),
-            );
-            ui.painter().line_segment(
-                [icon.right_top(), icon.left_bottom()],
-                egui::Stroke::new(1.4, icon_color),
-            );
-            if del_resp.clicked() {
-                remove_idx = Some(i);
-            }
-            if row_response.clicked() {
-                self.selected_host = Some(i);
-                let now = ui.input(|i| i.time);
-                if let Some((t, idx)) = self.last_row_click {
-                    if idx == i && now - t < 0.3 {
-                        connect_idx = Some(i);
-                    }
-                }
-                self.last_row_click = Some((now, i));
-            }
-        }
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.add_space(2.0);
-            ui.label(
-                egui::RichText::new("单击选中 · 双击连接")
-                    .size(10.5)
-                    .color(theme.text_muted),
-            );
-        });
-        if let Some(i) = connect_idx {
-            let profile = self.config.hosts[i].clone();
-            // 从设置弹窗双击连接成功后关闭弹窗，直接进入终端。
-            self.show_settings = false;
-            self.last_row_click = None;
-            self.start_connect(ui.ctx(), profile);
-        }
-        if let Some(i) = remove_idx {
-            let removed = self.config.hosts.remove(i);
-            self.selected_host = None;
-            self.last_row_click = None;
-            if !self.save_config() {
-                self.config.hosts.insert(i, removed);
-            }
+        if let Some(workspace) = open_clicked {
+            self.show_workspaces = false;
+            self.workspace_filter.clear();
+            self.workspace_selected = 0;
+            self.open_workspace(ctx, &workspace);
         }
     }
-    /// 渲染设置里的项目管理区（主机管理与外观之间）。
+
+    // ===== workspace_manager（设置卡片：主机管理 + 项目管理 融合为一张卡） =====
+    /// 渲染设置里的工作区管理卡片（本地目录与 SSH 主机统一列表）。
     ///
-    /// 行布局复用 `host_sidebar` 模式（56px 行、头像+名称/路径两行、hover 提亮，
-    /// 无选中竖条）；右侧 ↑ ↓ 改 删四个 24px 操作按钮（改/删为单字 + 悬浮说明）；
-    /// 删除直接生效（与主机行 🗑 一致，不弹确认）；底部展开新增/编辑表单
-    /// （表单包 `inset_frame` 内嵌底，与上方列表分出层级，见 `project_edit_form`）。
-    fn project_manager(&mut self, ui: &mut egui::Ui) {
+    /// 行样式与快捷菜单/⌘O 面板共用 `paint_workspace_row`；行右侧
+    /// ↑ ↓ 改 删四个紧凑按钮（改进入表单、删直接生效，与旧主机行一致）；
+    /// 底部两个新增入口（本地目录 / SSH 主机）与展开的编辑表单。
+    fn workspace_manager(&mut self, ui: &mut egui::Ui) {
         let theme = crate::theme::current_theme();
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            dialog::section_title(ui, "已收藏项目");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_sized(
-                        egui::vec2(76.0, 26.0),
-                        dialog::primary_button(theme, "新增项目"),
-                    )
-                    .clicked()
-                {
-                    self.project_edit = Some(ProjectEdit {
-                        index: None,
-                        name: String::new(),
-                        path: String::new(),
-                        command: String::new(),
-                        name_error: false,
-                        path_error: false,
-                    });
-                }
-            });
-        });
-        ui.add_space(10.0);
-
-        if self.config.projects.is_empty() && self.project_edit.is_none() {
-            let (empty_rect, _) = ui
-                .allocate_exact_size(egui::vec2(ui.available_width(), 92.0), egui::Sense::hover());
-            dialog::dashed_rounded_rect(
-                ui,
-                empty_rect,
-                crate::theme::tokens::RADIUS_ITEM,
-                theme.border,
-            );
-            let mut empty = ui.new_child(
-                egui::UiBuilder::new()
-                    .id_salt("empty_projects")
-                    .max_rect(empty_rect)
-                    .layout(egui::Layout::top_down(egui::Align::Center)),
-            );
-            empty.add_space(22.0);
-            empty.label(
-                egui::RichText::new("暂无收藏项目")
-                    .color(theme.text_secondary)
-                    .size(12.5),
-            );
-            empty.add_space(2.0);
-            empty.label(
-                egui::RichText::new("⌘D 收藏当前终端目录")
-                    .monospace()
-                    .size(10.0)
-                    .color(theme.text_muted),
-            );
-            return;
-        }
-
-        let mut remove_idx: Option<usize> = None;
         let mut move_up: Option<usize> = None;
         let mut move_down: Option<usize> = None;
-        let mut edit_idx: Option<usize> = None;
-        const ROW_H: f32 = 56.0;
-        const AVATAR: f32 = 30.0;
-        const ACT_SIZE: f32 = 24.0;
-        const ACT_GAP: f32 = 6.0;
-        const GAP: f32 = 10.0;
+        let mut edit_index: Option<usize> = None;
+        let mut delete_index: Option<usize> = None;
+        let mut open_index: Option<usize> = None;
+        let mut start_local_form = false;
+        let mut start_ssh_form = false;
 
-        let project_count = self.config.projects.len();
-        for (i, project) in self.config.projects.iter().enumerate() {
-            let row_id = egui::Id::new(("project_row", i));
-            let (row_rect, _) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width(), ROW_H),
-                egui::Sense::hover(),
+        if self.config.workspaces.is_empty() && self.workspace_edit.is_none() {
+            ui.label(
+                egui::RichText::new("暂无工作区：收藏当前会话（⌘B）或新增一个")
+                    .size(11.5)
+                    .color(theme.text_muted),
             );
-            let hover = ui.input(|input| {
-                input
-                    .pointer
-                    .hover_pos()
-                    .is_some_and(|pointer| row_rect.contains(pointer))
-            });
-            if hover {
-                ui.painter().rect_filled(
-                    row_rect,
-                    crate::theme::tokens::RADIUS_ITEM,
-                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14),
-                );
-            }
-            if i + 1 < project_count {
-                let y = row_rect.bottom();
-                ui.painter().line_segment(
-                    [
-                        egui::pos2(row_rect.left() + 12.0, y),
-                        egui::pos2(row_rect.right() - 12.0, y),
-                    ],
-                    egui::Stroke::new(1.0, theme.border.gamma_multiply(0.5)),
-                );
-            }
-
-            let content_rect = row_rect.shrink2(egui::vec2(12.0, 6.0));
-            let actions_w = ACT_SIZE * 4.0 + ACT_GAP * 3.0;
-            let identity_width = (content_rect.width() - AVATAR - GAP - actions_w - GAP).max(72.0);
-            let mut inner = ui.new_child(
-                egui::UiBuilder::new()
-                    .id_salt(row_id.with("content"))
-                    .max_rect(content_rect)
-                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
-            );
-            inner.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-            let (avatar_rect, _) =
-                inner.allocate_exact_size(egui::vec2(AVATAR, AVATAR), egui::Sense::hover());
-            let initial = project.name.chars().next().unwrap_or('?');
-            dialog::paint_avatar(inner.painter(), avatar_rect, initial, theme, false);
-            inner.add_space(GAP);
-
-            let identity_rect = inner
-                .allocate_exact_size(egui::vec2(identity_width, AVATAR), egui::Sense::hover())
-                .0;
-            let mut identity = inner.new_child(
-                egui::UiBuilder::new()
-                    .id_salt(row_id.with("identity"))
-                    .max_rect(identity_rect)
-                    .layout(egui::Layout::top_down(egui::Align::Min)),
-            );
-            identity.spacing_mut().item_spacing.y = 2.0;
-            identity.add_space(1.0);
-            identity.add(
-                egui::Label::new(
-                    egui::RichText::new(&project.name)
-                        .strong()
-                        .size(13.0)
-                        .color(theme.text_primary),
-                )
-                .truncate(),
-            );
-            let path_text = project.path.to_string_lossy().into_owned();
-            identity.add(
-                egui::Label::new(
-                    egui::RichText::new(&path_text)
-                        .monospace()
-                        .size(10.5)
-                        .color(theme.text_muted),
-                )
-                .truncate(),
-            );
-
-            // 右侧操作列：↑ 上移 / ↓ 下移 / 改 编辑 / 删 删除（24px，悬浮说明）。
-            let acts = [("↑", "上移"), ("↓", "下移"), ("改", "编辑"), ("删", "删除")];
-            for (k, (label, tip)) in acts.iter().enumerate() {
-                let act_rect = egui::Rect::from_min_size(
-                    egui::pos2(
-                        content_rect.right() - actions_w + k as f32 * (ACT_SIZE + ACT_GAP),
-                        row_rect.center().y - ACT_SIZE * 0.5,
-                    ),
-                    egui::vec2(ACT_SIZE, ACT_SIZE),
-                );
-                let act_resp = ui
-                    .interact(
-                        act_rect,
-                        row_id.with(("project_act", k)),
-                        egui::Sense::click(),
-                    )
-                    .on_hover_text(*tip)
-                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-                let danger = k == 3;
-                if act_resp.hovered() {
-                    ui.painter().rect_filled(
-                        act_rect,
-                        6.0,
-                        if danger {
-                            theme.danger.gamma_multiply(0.18)
-                        } else {
-                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18)
-                        },
-                    );
-                }
-                let icon_color = if act_resp.hovered() {
-                    if danger {
-                        theme.danger
-                    } else {
-                        theme.accent
-                    }
-                } else {
-                    theme.text_muted
-                };
-                ui.painter().text(
-                    act_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    *label,
-                    egui::FontId::proportional(12.0),
-                    icon_color,
-                );
-                if act_resp.clicked() {
-                    match k {
-                        0 => move_up = Some(i),
-                        1 => move_down = Some(i),
-                        2 => edit_idx = Some(i),
-                        _ => remove_idx = Some(i),
-                    }
-                }
-            }
-        }
-        if let Some(i) = edit_idx {
-            let (name, path, command) = {
-                let p = &self.config.projects[i];
-                (
-                    p.name.clone(),
-                    p.path.to_string_lossy().into_owned(),
-                    p.command.clone(),
-                )
-            };
-            self.project_edit = Some(ProjectEdit {
-                index: Some(i),
-                name,
-                path,
-                command,
-                name_error: false,
-                path_error: false,
-            });
-        }
-        if let Some(i) = move_up {
-            if i > 0 {
-                self.config.projects.swap(i - 1, i);
-                if !self.save_config() {
-                    self.config.projects.swap(i - 1, i);
-                }
-            }
-        }
-        if let Some(i) = move_down {
-            if i + 1 < self.config.projects.len() {
-                self.config.projects.swap(i, i + 1);
-                if !self.save_config() {
-                    self.config.projects.swap(i, i + 1);
-                }
-            }
-        }
-        if let Some(i) = remove_idx {
-            let removed = self.config.projects.remove(i);
-            if !self.save_config() {
-                self.config.projects.insert(i, removed);
-            }
-            // 正在编辑的行被删 → 关闭表单。
-            if self
-                .project_edit
-                .as_ref()
-                .is_some_and(|e| e.index == Some(i))
-            {
-                self.project_edit = None;
-            }
+            ui.add_space(6.0);
         }
 
-        // 新增/编辑表单（take 出来渲染，避免与 save/toast 的 &mut self 冲突）。
-        //
-        // 渲染约定（新建连接弹窗的嵌入版，与 `connect_dialog` 同语义）：
-        // - 表单包 `inset_frame` 内嵌底，与上方 project 行列表分出层级；
-        // - 路径组："使用当前终端目录"缩成行内小操作、贴"路径"字段名同行右端；
-        // - 页脚右对齐：保存（主按钮）→ 取消（次按钮），不再左排三按钮。
-        let mut edit = self.project_edit.take();
-        let mut close_form = false;
-        if let Some(e) = edit.as_mut() {
-            ui.add_space(8.0);
-            dialog::hairline(ui);
-            ui.add_space(10.0);
-            self.project_edit_form(ui, e, &mut close_form);
-        }
-        if close_form {
-            edit = None;
-        }
-        self.project_edit = edit;
-    }
-
-    /// 项目新增/编辑表单主体（`inset_frame` 嵌入版）。
-    ///
-    /// 与 `connect_dialog` 共用同一套表单语言：11px `field_label` + 4px 间隙 +
-    /// `form_input` 输入框 + 右对齐页脚。嵌入式没有独立窗口标题栏，所以标题
-    /// 直接走卡片分组字 `section_title`（"新增项目/编辑项目"），不再另起头部。
-    ///
-    /// 布局三处与旧实现不同（都是对截图里"散"的原因的回应）：
-    /// 1. **分组容器**：整个表单包一层 `inset_frame`（浮层底 + 8px 圆角），
-    ///    与上方 project 行列表分出层级——截图里表单直接裸贴在列表下，
-    ///    hairline 把它和列表划成同一平面，所以看起来像临时补丁。
-    /// 2. **行内操作**："使用当前终端目录"缩成 `field_action_button` 行内
-    ///    小操作、贴在"路径"字段名同行右端，不再与保存/取消同排等权——
-    ///    那是字段的附属填充动作，不是表单级动作。
-    /// 3. **右对齐页脚**：`Layout::right_to_left`，保存（主按钮）→ 取消
-    ///    （次按钮），与新建连接弹窗"连接/取消"右对齐一致。
-    #[allow(clippy::too_many_lines)]
-    fn project_edit_form(&mut self, ui: &mut egui::Ui, e: &mut ProjectEdit, close_form: &mut bool) {
-        let theme = crate::theme::current_theme();
-        dialog::inset_frame(theme).show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            ui.spacing_mut().item_spacing.y = 0.0;
-            dialog::section_title(
-                ui,
-                if e.index.is_some() {
-                    "编辑项目"
-                } else {
-                    "新增项目"
-                },
-            );
-            // === 基本信息组 ===
-            ui.add_space(8.0);
-            dialog::field_label(ui, "名称");
-            ui.add_space(4.0);
-            let name_resp = dialog::form_input(
-                ui,
-                egui::Id::new("project_edit_name"),
-                &mut e.name,
-                "如：mino",
-                ui.available_width(),
-                false,
-                e.name_error,
-            );
-            if name_resp.changed() {
-                e.name_error = false;
-            }
-            // 错误文案贴在问题输入框正下方（与 `connect_dialog` 端口错误同约定；
-            // 此前只有 toast + 红边框，切走输入框都不知道错在哪）。
-            if e.name_error {
-                ui.add_space(3.0);
-                ui.label(
-                    egui::RichText::new("请填写项目名称")
-                        .size(11.0)
-                        .color(theme.danger),
-                );
-            }
-            // === 目录组（发丝线分组，与新建连接弹窗"连接身份/网络地址"同语义）===
-            ui.add_space(10.0);
-            dialog::hairline(ui);
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                dialog::field_label(ui, "路径");
-                // 同行右端：字段的附属填充动作（贴字段名基线，不抢焦点感）。
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add(dialog::field_action_button(theme, "使用当前终端目录"))
-                        .on_hover_text("把当前本地终端所在目录填入路径")
-                        .clicked()
-                    {
-                        match self
-                            .tabs
-                            .get(self.active_tab)
-                            .filter(|t| !t.terminal.session().is_remote())
-                            .and_then(|t| t.terminal.effective_local_directory())
-                        {
-                            Some(dir) => e.path = dir,
-                            None => self.show_toast("当前无本地终端目录", true),
+        let count = self.config.workspaces.len();
+        if count > 0 {
+            let mut sorted: Vec<usize> = (0..count).collect();
+            sorted.sort_by_key(|&i| i); // 保持原顺序（可直接切片遍历）
+            egui::ScrollArea::vertical()
+                .id_salt("workspace_manager_scroll")
+                .max_height(200.0)
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    for (pos, &idx) in sorted.iter().enumerate() {
+                        let workspace = self.config.workspaces[idx].clone();
+                        let row_id = egui::Id::new(("workspace_manager_row", idx));
+                        let edit_mode = self
+                            .workspace_edit
+                            .as_ref()
+                            .is_some_and(|e| e.index == Some(idx));
+                        let resp =
+                            paint_workspace_row(ui, &workspace, edit_mode, row_id, 44.0, 22.0);
+                        if resp.clicked() {
+                            open_index = Some(idx);
+                        }
+                        // 操作按钮叠在行右缘（后注册在上层，命中优先）。
+                        let row_rect = resp.rect;
+                        let buttons: [(&str, &str); 4] =
+                            [("↑", "上移"), ("↓", "下移"), ("改", "编辑"), ("删", "删除")];
+                        let mut x = row_rect.right() - 6.0;
+                        for (label, hover) in buttons {
+                            let rect = egui::Rect::from_center_size(
+                                egui::pos2(x - 12.0, row_rect.center().y),
+                                egui::vec2(24.0, 24.0),
+                            );
+                            x -= 26.0;
+                            let btn = egui::Button::new(
+                                egui::RichText::new(label)
+                                    .size(11.0)
+                                    .color(theme.text_secondary),
+                            )
+                            .fill(egui::Color32::TRANSPARENT)
+                            .stroke(egui::Stroke::NONE)
+                            .corner_radius(crate::theme::tokens::RADIUS_ITEM)
+                            .min_size(egui::vec2(24.0, 24.0));
+                            if ui.put(rect, btn).on_hover_text(hover).clicked() {
+                                match label {
+                                    "↑" => move_up = Some(pos),
+                                    "↓" => move_down = Some(pos),
+                                    "改" => edit_index = Some(idx),
+                                    _ => delete_index = Some(idx),
+                                }
+                            }
                         }
                     }
                 });
-            });
-            ui.add_space(4.0);
-            let path_resp = dialog::form_input(
-                ui,
-                egui::Id::new("project_edit_path"),
-                &mut e.path,
-                "/Users/me/proj",
-                ui.available_width(),
-                false,
-                e.path_error,
-            );
-            if path_resp.changed() {
-                e.path_error = false;
+        }
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            if ui
+                .add(dialog::secondary_button(theme, "新增本地目录"))
+                .clicked()
+            {
+                start_local_form = true;
             }
-            if e.path_error {
-                ui.add_space(3.0);
-                ui.label(
-                    egui::RichText::new("目录不存在，请检查路径")
-                        .size(11.0)
-                        .color(theme.danger),
-                );
-            }
-            // === 启动命令组（可选）===
-            ui.add_space(10.0);
-            dialog::hairline(ui);
-            ui.add_space(10.0);
-            dialog::field_label(ui, "启动命令（可选）");
-            ui.add_space(4.0);
-            dialog::form_input(
-                ui,
-                egui::Id::new("project_edit_command"),
-                &mut e.command,
-                "打开后自动执行，如：npm run dev",
-                ui.available_width(),
-                false,
-                false,
-            );
-            // === 页脚（右对齐：保存 → 取消，与新建连接弹窗一致）===
-            ui.add_space(12.0);
-            dialog::hairline(ui);
-            ui.add_space(10.0);
-            let mut save = false;
-            let mut cancel = false;
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                if ui
-                    .add_sized(
-                        egui::vec2(76.0, 28.0),
-                        dialog::primary_button(theme, "保存"),
-                    )
-                    .clicked()
-                {
-                    save = true;
-                }
-                if ui
-                    .add_sized(
-                        egui::vec2(76.0, 28.0),
-                        dialog::secondary_button(theme, "取消"),
-                    )
-                    .clicked()
-                {
-                    cancel = true;
-                }
-            });
-            if cancel {
-                *close_form = true;
-            } else if save {
-                e.name_error = e.name.trim().is_empty();
-                e.path_error = !std::path::Path::new(e.path.trim()).is_dir();
-                if !(e.name_error || e.path_error) {
-                    let profile = ProjectProfile {
-                        name: e.name.trim().to_owned(),
-                        path: PathBuf::from(e.path.trim()),
-                        command: e.command.trim().to_owned(),
-                    };
-                    match e.index {
-                        Some(idx) if idx < self.config.projects.len() => {
-                            let old = std::mem::replace(&mut self.config.projects[idx], profile);
-                            if !self.save_config() {
-                                self.config.projects[idx] = old;
-                            } else {
-                                *close_form = true;
-                            }
-                        }
-                        _ => {
-                            self.config.projects.push(profile);
-                            if !self.save_config() {
-                                self.config.projects.pop();
-                            } else {
-                                *close_form = true;
-                            }
-                        }
-                    }
-                }
+            if ui
+                .add(dialog::secondary_button(theme, "新增 SSH 主机"))
+                .clicked()
+            {
+                start_ssh_form = true;
             }
         });
+
+        // ---- 应用动作（借用结束后统一做） ----
+        if let Some(pos) = move_up {
+            if pos > 0 {
+                self.config.workspaces.swap(pos, pos - 1);
+                self.save_config();
+            }
+        }
+        if let Some(pos) = move_down {
+            if pos + 1 < self.config.workspaces.len() {
+                self.config.workspaces.swap(pos, pos + 1);
+                self.save_config();
+            }
+        }
+        if let Some(pos) = delete_index {
+            let removed = self.config.workspaces.remove(pos);
+            if !self.save_config() {
+                self.config.workspaces.insert(pos, removed);
+            } else if self
+                .workspace_edit
+                .as_ref()
+                .is_some_and(|e| e.index == Some(pos))
+            {
+                self.workspace_edit = None;
+            }
+        }
+        if let Some(idx) = edit_index {
+            let mut edit = WorkspaceEdit::from_workspace(&self.config.workspaces[idx]);
+            edit.index = Some(idx);
+            self.workspace_edit = Some(edit);
+        }
+        if start_local_form {
+            self.open_workspace_editor(0);
+        }
+        if start_ssh_form {
+            self.open_workspace_editor(1);
+        }
+        if let Some(idx) = open_index {
+            let workspace = self.config.workspaces[idx].clone();
+            let ctx = ui.ctx().clone();
+            // 打开即离开设置：用户意图是"去这个工作区"，设置窗口不该继续
+            // 盖着新标签（与旧版双击主机行连接即关设置一致）。
+            self.show_settings = false;
+            self.open_workspace(&ctx, &workspace);
+        }
     }
 
-    /// 渲染新建连接对话框。
-    fn connect_dialog(&mut self, ctx: &egui::Context) {
+    /// 工作区编辑对话框（居中模态；⌘N / 快捷菜单 / 设置管理共用同一表单）。
+    ///
+    /// 类型分段（本地目录 / SSH 主机）切换字段组；保存时校验并落盘，
+    /// 失败保留表单内容（用户改了半截不该被清空）。
+    fn workspace_edit_dialog(&mut self, ctx: &egui::Context) {
         let theme = crate::theme::current_theme();
-        let field_width = 308.0;
-        let mut port_error = false;
-        let mut open = self.show_new_conn;
-        let mut to_connect: Option<HostProfile> = None;
-        let mut canceled = false;
-        if !self.show_new_conn {
+        // 「使用当前终端目录」的数据源：活动本地会话的即时目录（无本地标签则禁用）。
+        let current_terminal_dir = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|tab| tab.active_view().fresh_local_directory());
+        let Some(mut edit) = self.workspace_edit.take() else {
             return;
-        }
-        // 端口错误态：输入框描红（比 toast 更贴近问题位置）。
-        let port_invalid =
-            !self.form.port.trim().is_empty() && self.form.port.trim().parse::<u16>().is_err();
-        egui::Window::new("connect_dialog")
+        };
+        let field_width = 320.0;
+        let mut open = true;
+        let mut close = false;
+        let mut save = false;
+        egui::Window::new("workspace_edit_dialog")
             .open(&mut open)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, -20.0])
             .resizable(false)
@@ -3544,14 +4393,18 @@ impl MinoApp {
                 header.add_space(10.0);
                 dialog::header_title(
                     &mut header,
-                    "connect_header_title",
-                    "新建连接",
-                    "保存后可在主机列表中一键连接",
+                    "workspace_edit_header",
+                    if edit.index.is_some() {
+                        "编辑工作区"
+                    } else {
+                        "新增工作区"
+                    },
+                    "本地目录与 SSH 主机统一管理",
                 );
                 header.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(12.0);
                     if dialog::close_icon_button(ui, "关闭（Esc）") {
-                        canceled = true;
+                        close = true;
                     }
                 });
 
@@ -3559,216 +4412,291 @@ impl MinoApp {
                     .inner_margin(egui::Margin::symmetric(18, 14))
                     .show(ui, |ui| {
                         ui.set_min_width(field_width);
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        dialog::section_title(ui, "连接身份");
+                        // 类型分段（本地 / SSH）。
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            for (kind, label) in [(0usize, "本地目录"), (1, "SSH 主机")] {
+                                let selected = edit.kind == kind;
+                                let btn = egui::Button::new(
+                                    egui::RichText::new(label).size(12.0).color(if selected {
+                                        theme.accent
+                                    } else {
+                                        theme.text_secondary
+                                    }),
+                                )
+                                .fill(if selected {
+                                    theme.accent_soft
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                })
+                                .stroke(egui::Stroke::NONE)
+                                .corner_radius(crate::theme::tokens::RADIUS_ITEM)
+                                .min_size(egui::vec2(88.0, 26.0));
+                                if ui.add(btn).clicked() {
+                                    edit.kind = kind;
+                                }
+                            }
+                        });
+                        ui.add_space(12.0);
+                        dialog::section_title(
+                            ui,
+                            if edit.kind == 0 {
+                                "目录"
+                            } else {
+                                "连接身份"
+                            },
+                        );
                         ui.add_space(8.0);
-                        let name_id = egui::Id::new("conn_form_name");
-                        if !self.form.name_focused {
+                        let name_id = egui::Id::new("workspace_edit_name");
+                        if !edit.name_focused {
                             ui.memory_mut(|m| m.request_focus(name_id));
-                            self.form.name_focused = true;
+                            edit.name_focused = true;
                         }
                         dialog::field_label(ui, "名称");
                         ui.add_space(4.0);
                         dialog::form_input(
                             ui,
                             name_id,
-                            &mut self.form.name,
-                            "连接名称（可选）",
+                            &mut edit.name,
+                            "名称（可选）",
                             field_width,
                             false,
                             false,
                         );
-                        ui.add_space(10.0);
-                        dialog::field_label(ui, "用户名");
-                        ui.add_space(4.0);
-                        dialog::form_input(
-                            ui,
-                            egui::Id::new("conn_form_user"),
-                            &mut self.form.user,
-                            "用户名，例如 root",
-                            field_width,
-                            false,
-                            false,
-                        );
-                        ui.add_space(14.0);
-                        dialog::hairline(ui);
-                        ui.add_space(14.0);
-                        dialog::section_title(ui, "网络地址");
                         ui.add_space(8.0);
-                        dialog::field_label(ui, "主机");
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 8.0;
-                            dialog::form_input(
-                                ui,
-                                egui::Id::new("conn_form_host"),
-                                &mut self.form.host,
-                                "主机名或 IP",
-                                218.0,
-                                false,
-                                false,
-                            );
-                            dialog::form_input(
-                                ui,
-                                egui::Id::new("conn_form_port"),
-                                &mut self.form.port,
-                                "22",
-                                82.0,
-                                false,
-                                port_error || port_invalid,
-                            );
-                        });
-                        if port_error || port_invalid {
-                            ui.add_space(3.0);
-                            ui.label(
-                                egui::RichText::new("端口必须是 1–65535 的数字")
-                                    .size(11.0)
-                                    .color(theme.danger),
-                            );
-                        }
-                        ui.add_space(14.0);
-                        dialog::hairline(ui);
-                        ui.add_space(14.0);
-                        dialog::section_title(ui, "认证方式");
-                        ui.add_space(8.0);
-                        dialog::auth_segmented(ui, &mut self.form.auth_kind);
-                        ui.add_space(10.0);
-                        if self.form.auth_kind == 0 {
-                            dialog::field_label(ui, "密码");
+                        if edit.kind == 0 {
+                            dialog::field_label(ui, "目录");
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                dialog::form_input(
+                                    ui,
+                                    egui::Id::new("workspace_edit_path"),
+                                    &mut edit.path,
+                                    "本地目录路径",
+                                    176.0,
+                                    false,
+                                    false,
+                                );
+                                if ui
+                                    .add(dialog::field_action_button(theme, "浏览…"))
+                                    .clicked()
+                                {
+                                    if let Some(dir) = rfd::FileDialog::new()
+                                        .set_directory(&edit.path)
+                                        .pick_folder()
+                                    {
+                                        edit.path = dir.display().to_string();
+                                    }
+                                }
+                                // 一键取当前终端目录（旧项目表单的同款入口）。
+                                if ui
+                                    .add(dialog::field_action_button(theme, "使用当前终端目录"))
+                                    .clicked()
+                                {
+                                    if let Some(dir) = current_terminal_dir.as_deref() {
+                                        edit.path = dir.to_string();
+                                    }
+                                }
+                            });
+                            ui.add_space(10.0);
+                            dialog::field_label(ui, "启动命令（可选）");
                             ui.add_space(4.0);
                             dialog::form_input(
                                 ui,
-                                egui::Id::new("conn_form_password"),
-                                &mut self.form.password,
-                                "密码",
+                                egui::Id::new("workspace_edit_command"),
+                                &mut edit.command,
+                                "打开后自动执行一行命令",
                                 field_width,
-                                true,
+                                false,
                                 false,
                             );
                         } else {
-                            dialog::field_label(ui, "私钥文件");
+                            dialog::field_label(ui, "用户名");
                             ui.add_space(4.0);
                             dialog::form_input(
                                 ui,
-                                egui::Id::new("conn_form_key"),
-                                &mut self.form.key_path,
-                                "私钥文件路径",
+                                egui::Id::new("workspace_edit_user"),
+                                &mut edit.user,
+                                "用户名，例如 root",
                                 field_width,
                                 false,
                                 false,
                             );
                             ui.add_space(10.0);
-                            dialog::field_label(ui, "私钥口令（可选）");
+                            dialog::field_label(ui, "主机与端口");
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                let port_invalid = !edit.port.trim().is_empty()
+                                    && edit.port.trim().parse::<u16>().is_err();
+                                dialog::form_input(
+                                    ui,
+                                    egui::Id::new("workspace_edit_host"),
+                                    &mut edit.host,
+                                    "主机名或 IP",
+                                    230.0,
+                                    false,
+                                    false,
+                                );
+                                dialog::form_input(
+                                    ui,
+                                    egui::Id::new("workspace_edit_port"),
+                                    &mut edit.port,
+                                    "22",
+                                    82.0,
+                                    false,
+                                    port_invalid,
+                                );
+                            });
+                            ui.add_space(10.0);
+                            dialog::field_label(ui, "认证");
+                            ui.add_space(4.0);
+                            dialog::auth_segmented(ui, &mut edit.auth_kind);
+                            ui.add_space(6.0);
+                            if edit.auth_kind == 0 {
+                                dialog::form_input(
+                                    ui,
+                                    egui::Id::new("workspace_edit_password"),
+                                    &mut edit.password,
+                                    "密码",
+                                    field_width,
+                                    true,
+                                    false,
+                                );
+                            } else {
+                                dialog::form_input(
+                                    ui,
+                                    egui::Id::new("workspace_edit_key"),
+                                    &mut edit.key_path,
+                                    "私钥路径（如 ~/.ssh/id_ed25519）",
+                                    field_width,
+                                    false,
+                                    false,
+                                );
+                                ui.add_space(6.0);
+                                dialog::form_input(
+                                    ui,
+                                    egui::Id::new("workspace_edit_passphrase"),
+                                    &mut edit.passphrase,
+                                    "私钥口令（可选）",
+                                    field_width,
+                                    true,
+                                    false,
+                                );
+                            }
+                            ui.add_space(10.0);
+                            dialog::field_label(ui, "远端目录与启动命令（可选）");
                             ui.add_space(4.0);
                             dialog::form_input(
                                 ui,
-                                egui::Id::new("conn_form_pass"),
-                                &mut self.form.passphrase,
-                                "私钥口令（可选）",
+                                egui::Id::new("workspace_edit_rpath"),
+                                &mut edit.path,
+                                "远端起始目录（可空）",
                                 field_width,
-                                true,
+                                false,
+                                false,
+                            );
+                            ui.add_space(6.0);
+                            dialog::form_input(
+                                ui,
+                                egui::Id::new("workspace_edit_rcommand"),
+                                &mut edit.command,
+                                "连接后自动执行一行命令",
+                                field_width,
+                                false,
                                 false,
                             );
                         }
-                        ui.add_space(16.0);
-                        dialog::hairline(ui);
-                        ui.add_space(12.0);
+                        ui.add_space(14.0);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.spacing_mut().item_spacing.x = 8.0;
-                            if ui.add(dialog::primary_button(theme, "连接")).clicked() {
-                                let port: u16 = match self.form.port.trim().parse() {
-                                    Ok(port @ 1..=65535) => port,
-                                    _ => {
-                                        port_error = true;
-                                        22
-                                    }
-                                };
-                                if port_error {
-                                    self.show_toast("端口必须是 1-65535 的数字", true);
-                                    return;
-                                }
-                                if self.form.auth_kind == 1 && self.form.key_path.trim().is_empty()
-                                {
-                                    self.show_toast("请填写私钥文件路径", true);
-                                    return;
-                                }
-                                let host = self.form.host.trim().to_string();
-                                let user = self.form.user.trim().to_string();
-                                let auth = if self.form.auth_kind == 0 {
-                                    Auth::Password(self.form.password.clone())
-                                } else {
-                                    Auth::Key {
-                                        path: PathBuf::from(self.form.key_path.trim()),
-                                        passphrase: if self.form.passphrase.is_empty() {
-                                            None
-                                        } else {
-                                            Some(self.form.passphrase.clone())
-                                        },
-                                    }
-                                };
-                                let profile = HostProfile {
-                                    name: if self.form.name.trim().is_empty() {
-                                        host.clone()
-                                    } else {
-                                        self.form.name.trim().to_string()
-                                    },
-                                    host,
-                                    port,
-                                    user,
-                                    auth,
-                                };
-                                if !profile.host.is_empty() && !profile.user.is_empty() {
-                                    to_connect = Some(profile);
-                                } else {
-                                    self.show_toast("请填写主机与用户名", true);
-                                }
+                            if ui.add(dialog::primary_button(theme, "保存")).clicked() {
+                                save = true;
                             }
                             if ui.add(dialog::secondary_button(theme, "取消")).clicked() {
-                                canceled = true;
+                                close = true;
                             }
                         });
                     });
             });
-        if let Some(profile) = to_connect {
-            self.config.hosts.push(profile.clone());
-            let saved = self.save_config();
-            if !saved {
-                self.config.hosts.pop();
-            }
-            self.show_new_conn = false;
-            self.show_settings = false;
-            self.settings_before_new_conn = false;
-            self.form.name_focused = false;
-            self.start_connect(ctx, profile);
-        } else if canceled || !open {
-            self.show_new_conn = false;
-            if self.settings_before_new_conn {
-                self.show_settings = true;
-            }
-            self.settings_before_new_conn = false;
-            self.form.name_focused = false;
-        } else {
-            self.show_new_conn = true;
+        if close || !open {
+            // 用户主动关闭：丢弃表单（下次打开回到默认值），并从设置打开的
+            // 场景里把设置窗口还回来。
+            self.close_workspace_editor();
+            return;
         }
+        if save {
+            // 校验/保存失败时不丢用户输入：先算结果，失败则原样放回表单。
+            match edit.to_workspace() {
+                Ok(workspace) => {
+                    if let Err(message) = self.commit_workspace_value(edit.index, workspace) {
+                        self.show_toast(message, true);
+                        self.workspace_edit = Some(edit);
+                    } else {
+                        self.close_workspace_editor();
+                    }
+                }
+                Err(message) => {
+                    self.show_toast(message, true);
+                    self.workspace_edit = Some(edit);
+                }
+            }
+            return;
+        }
+        self.workspace_edit = Some(edit);
     }
 
-    /// 渲染标签页栏（Tabby 风圆角标签 + 底部指示条）。
-    fn tab_bar(&mut self, ui: &mut egui::Ui) {
-        let theme = crate::theme::current_theme();
-        // 标签栏即窗口拖拽区：整行注册底层 click_and_drag 背景（先注册，
-        // 被后注册的控件覆盖）。
-        // egui 命中规则：后注册 widget 在顶层，控件上点击/拖拽优先命中控件，
-        // 标签栏空白处的操作则命中此背景：
-        // - 拖动 → 发 StartDrag 让系统接管窗口移动；
-        // - 双击 → 切换窗口 zoom（最大化/恢复，macOS 标题栏双击标准行为）。
-        // Sense 必须带 CLICK（click_and_drag）：纯 Sense::drag 在按下瞬间就
-        // 被判为 drag_started，必须等指针移动；双击是两次"按下即抬起"的点击，
-        // 指针几乎不动，纯 drag 下第二次按下仍是 drag 状态，double_clicked
-        // 永不为真（官方 custom_window_frame 示例同样用 click_and_drag）。
+    /// 关闭工作区编辑对话框（取消 / 关闭按钮 / 保存成功后统一走这里）。
+    ///
+    /// 从设置里打开的编辑器（`settings_before_workspace_edit`）关闭后把
+    /// 设置弹窗还回来——Esc 与取消按钮行为一致，不能让用户"弹窗一关全没了"。
+    fn close_workspace_editor(&mut self) {
+        self.workspace_edit = None;
+        if self.settings_before_workspace_edit {
+            self.show_settings = true;
+        }
+        self.settings_before_workspace_edit = false;
+    }
+
+    /// 保存工作区（`index` 为 Some 时覆盖既有条目，否则追加）。
+    fn commit_workspace_value(
+        &mut self,
+        index: Option<usize>,
+        workspace: Workspace,
+    ) -> Result<(), String> {
+        match index {
+            Some(index) if index < self.config.workspaces.len() => {
+                let previous = std::mem::replace(&mut self.config.workspaces[index], workspace);
+                if !self.save_config() {
+                    self.config.workspaces[index] = previous;
+                    return Err("保存工作区失败".into());
+                }
+            }
+            _ => {
+                self.config.workspaces.push(workspace);
+                if !self.save_config() {
+                    self.config.workspaces.pop();
+                    return Err("保存工作区失败".into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 渲染标题条（顶部拖拽区，Kaku/WezTerm 集成标题栏风格）。
+    ///
+    /// 整条为窗口拖拽区（原生红绿灯悬浮在其上、不参与 egui 布局）：
+    /// - 拖动（左键）→ `StartDrag` 交系统接管窗口移动；
+    /// - 双击 → 切换窗口 zoom（macOS 标题栏标准行为）。
+    ///
+    /// Sense 必须带 CLICK（click_and_drag）：纯 drag 在按下瞬间即判为
+    /// drag_started，第二次按下时指针几乎不动，`double_clicked` 永假。
+    fn title_bar(&mut self, ui: &mut egui::Ui) {
         let drag_rect = ui.max_rect();
         let drag_resp = ui.interact(
             drag_rect,
-            egui::Id::new("tab_bar_drag"),
+            egui::Id::new("titlebar_drag"),
             egui::Sense::click_and_drag(),
         );
         if drag_resp.drag_started_by(egui::PointerButton::Primary) {
@@ -3779,210 +4707,223 @@ impl MinoApp {
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
         }
-        ui.horizontal(|ui| {
-            // macOS 原生红绿灯位于内容视图之上，不参与 egui 布局；
-            // 预留同等宽度，避免第一个标签被系统按钮遮住。
-            #[cfg(target_os = "macos")]
-            ui.add_space(80.0);
+    }
+
+    /// 渲染底部标签栏（Kaku 风：方角标签、激活面块、右端承载入口与状态）。
+    ///
+    /// 与 Kaku `tab_bar_at_bottom = true` 同构：标签栏在最底部、与终端同
+    /// 底色；激活标签用 surface_active（`bg_elevated`）凸起、非激活灰字
+    /// （`text_muted`），hover 用 surface（`bg_panel`）提亮文字转主色；
+    /// 无圆角、无描边（WezTerm 非 fancy 标签）。
+    /// 与 Kaku 的差异（有意保留）：单标签时本栏仍显示——Mino 没有 macOS
+    /// 菜单栏，入口按钮（工作区/设置）与会话状态都在这里承载；「×」在
+    /// hover/选中时可见（Kaku 同款 hover 提示），否则透明但仍可被辅助功能
+    /// 定位（既有测试以 × 数量判定标签数）。
+    fn tab_bar(&mut self, ui: &mut egui::Ui) {
+        let theme = crate::theme::current_theme();
+        ui.set_min_height(TAB_BAR_HEIGHT);
+        ui.horizontal_centered(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
             let mut switch_to: Option<usize> = None;
             let mut close_idx: Option<usize> = None;
+            // 重命名的提交/取消在循环外统一应用（循环借 `self.tabs`，
+            // 循环内不能对同一字段取可变借用）。
+            let mut rename_commit: Option<(u64, String)> = None;
+            let mut rename_cancel = false;
             for (i, tab) in self.tabs.iter().enumerate() {
                 // 本地标签显示当前目录的末级名，全路径作悬浮提示。
                 let (title, title_tooltip) = tab.title();
                 let selected = i == self.active_tab;
-                // 数字索引前缀：与终端主流 Tab 习惯一致（1, 2, ...）。
-                let prefix = format!("{} ", i + 1);
-                // 选中底必须画在内容之前（Frame 先铺底再放内容）：曾把不透明
-                // 面板色画在内容之后，激活 tab 的文字被整块盖住、完全不可见。
-                let sel_alpha = anim::smooth_bool(
-                    ui.ctx(),
-                    egui::Id::new(("tab_sel", i)),
-                    selected,
-                    anim::SPEED_FAST,
-                );
-                let active_fill = egui::Color32::from_rgba_unmultiplied(
-                    theme.accent.r(),
-                    theme.accent.g(),
-                    theme.accent.b(),
-                    (26.0 * sel_alpha) as u8,
-                );
-                let active_stroke = egui::Stroke::new(
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(
-                        theme.accent.r(),
-                        theme.accent.g(),
-                        theme.accent.b(),
-                        (96.0 * sel_alpha) as u8,
+                // 标签宽度 = 标题实际宽度 + 内边距 + 关闭位，夹到 [MIN, MAX]。
+                let text_font = egui::FontId::proportional(TAB_TITLE_SIZE);
+                let text_w = ui
+                    .fonts_mut(|f| {
+                        f.layout_no_wrap(title.clone(), text_font.clone(), egui::Color32::WHITE)
+                    })
+                    .size()
+                    .x;
+                let width = (text_w + TAB_PADDING_L + TAB_PADDING_R + TAB_CLOSE_WIDTH)
+                    .clamp(TAB_MIN_WIDTH, TAB_MAX_WIDTH);
+                let (rect, resp) =
+                    ui.allocate_exact_size(egui::vec2(width, TAB_BAR_HEIGHT), egui::Sense::click());
+                let hovered = resp.hovered();
+                // 激活底必须画在内容之前（painter 顺序：先画的在下层）。
+                let bg = if selected {
+                    theme.bg_elevated
+                } else if hovered {
+                    theme.bg_panel
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                ui.painter().rect_filled(rect, 0.0, bg);
+                // 注意力点（Bell 或失败命令；Kaku `bell_tab_indicator` 同款）：
+                // 非激活标签在关闭位画橙点（该状态 × 本就透明不可见）。
+                let has_attention = tab.panes.iter().any(|pane| pane.view.attention());
+                if has_attention && !selected && !hovered {
+                    ui.painter().circle_filled(
+                        egui::pos2(
+                            rect.right() - TAB_PADDING_R - TAB_CLOSE_WIDTH / 2.0,
+                            rect.center().y,
+                        ),
+                        3.5,
+                        theme.attention,
+                    );
+                }
+
+                // 标题（真 Label：可被辅助功能/kittest 找到、可 hover）。
+                let text_color = if selected || hovered {
+                    theme.text_primary
+                } else {
+                    theme.text_muted
+                };
+                let text_area = egui::Rect::from_min_max(
+                    egui::pos2(rect.left() + TAB_PADDING_L, rect.top()),
+                    egui::pos2(
+                        rect.right() - TAB_PADDING_R - TAB_CLOSE_WIDTH,
+                        rect.bottom(),
                     ),
                 );
-                let row = ui
-                    .scope_builder(egui::UiBuilder::new().id_salt(("tab", i)), |ui| {
-                        egui::Frame::new()
-                            .fill(active_fill)
-                            .stroke(active_stroke)
-                            .corner_radius(crate::theme::tokens::RADIUS_ITEM)
-                            .inner_margin(egui::Margin::symmetric(2, 3))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.add_space(4.0);
-                                    // 数字索引（muted 色，提示序号）。
-                                    ui.label(
-                                        egui::RichText::new(&prefix)
-                                            .size(11.5)
-                                            .color(if selected {
-                                                theme.accent2
-                                            } else {
-                                                theme.text_muted.gamma_multiply(0.7)
-                                            })
-                                            .monospace(),
-                                    );
-                                    // 无边框透明按钮（selectable_label 选中自带边框，
-                                    // 与手绘高亮叠加会形成"双重框"）。
-                                    let title_resp = ui.add(
-                                        egui::Button::new(
-                                            egui::RichText::new(title).size(12.5).color(
-                                                if selected {
-                                                    theme.accent
-                                                } else {
-                                                    theme.text_muted
-                                                },
-                                            ),
-                                        )
-                                        .fill(egui::Color32::TRANSPARENT)
-                                        .stroke(egui::Stroke::NONE)
-                                        .corner_radius(crate::theme::tokens::RADIUS_ITEM),
-                                    );
-                                    // 悬浮展示终端当前目录的全路径。
-                                    let title_resp = match &title_tooltip {
-                                        Some(full) => title_resp.on_hover_text(full),
-                                        None => title_resp,
-                                    };
-                                    if title_resp.clicked() {
-                                        switch_to = Some(i);
-                                    }
-                                    ui.add_space(1.0);
-                                    if ui
-                                        .add(
-                                            egui::Button::new(egui::RichText::new("×").color(
-                                                if selected {
-                                                    theme.accent.gamma_multiply(0.85)
-                                                } else {
-                                                    theme.text_muted
-                                                },
-                                            ))
-                                            .fill(egui::Color32::TRANSPARENT)
-                                            .stroke(egui::Stroke::NONE)
-                                            .min_size(egui::vec2(18.0, 18.0))
-                                            .corner_radius(4.0),
-                                        )
-                                        .on_hover_text("关闭标签页")
-                                        .clicked()
-                                    {
-                                        close_idx = Some(i);
-                                    }
-                                    ui.add_space(2.0);
-                                });
-                            });
-                    })
-                    .response;
-
-                // hover 底（动画过渡）：使用主题 accent 的低透明度叠加，保持终端
-                // 控制台的色彩语气；激活 tab 的底色和描边已由上方 Frame 先铺好。
-                let hover = row.hovered() && !selected;
-                let hover_alpha = anim::smooth_bool(
-                    ui.ctx(),
-                    egui::Id::new(("tab_hover", i)),
-                    hover,
-                    anim::SPEED_FAST,
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(text_area)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
                 );
-                if hover_alpha > 0.01 {
-                    ui.painter().rect_filled(
-                        row.rect.expand2(egui::vec2(1.0, 2.0)),
-                        crate::theme::tokens::RADIUS_ITEM,
-                        egui::Color32::from_rgba_unmultiplied(
-                            theme.accent.r(),
-                            theme.accent.g(),
-                            theme.accent.b(),
-                            (18.0 * hover_alpha) as u8,
-                        ),
+                // 双击标题进入重命名（Kaku：双击标签标题改名）。编辑态下
+                // 用 TextEdit 取代标题；Enter/失焦提交，Esc 取消。
+                let renaming = self
+                    .renaming_tab
+                    .as_ref()
+                    .is_some_and(|(id, _)| *id == tab.id);
+                if renaming {
+                    let buffer = &mut self.renaming_tab.as_mut().expect("重命名态已判定存在").1;
+                    let edit = child.add(
+                        egui::TextEdit::singleline(buffer)
+                            .id(egui::Id::new(("tab_rename", tab.id)))
+                            .desired_width(f32::INFINITY),
                     );
+                    child.memory_mut(|m| {
+                        if !m.has_focus(edit.id) {
+                            m.request_focus(edit.id);
+                        }
+                    });
+                    let committed =
+                        edit.lost_focus() || child.input(|i| i.key_pressed(egui::Key::Enter));
+                    let cancelled = child.input(|i| i.key_pressed(egui::Key::Escape));
+                    if cancelled {
+                        rename_cancel = true;
+                    } else if committed {
+                        rename_commit = Some((tab.id, buffer.clone()));
+                    }
+                } else {
+                    let label = child.add(
+                        egui::Label::new(
+                            egui::RichText::new(&title)
+                                .size(TAB_TITLE_SIZE)
+                                .color(text_color),
+                        )
+                        .truncate()
+                        // Label 默认 `Sense::hover`，不感知点击；双击重命名
+                        // 需要它可交互（单击仍要切换标签，见下）。
+                        .sense(egui::Sense::click()),
+                    );
+                    // 悬浮展示终端当前目录的全路径。
+                    let label = match &title_tooltip {
+                        Some(full) => label.on_hover_text(full),
+                        None => label,
+                    };
+                    // 单击标签（标题区域）切换；双击进入重命名。
+                    if label.clicked() {
+                        switch_to = Some(i);
+                    }
+                    if label.double_clicked() {
+                        self.renaming_tab = Some((tab.id, title.clone()));
+                    }
+                    // 点击标签空白处也切换（关闭按钮在更上层、命中优先级更高）。
+                    if resp.clicked() {
+                        switch_to = Some(i);
+                    }
                 }
-                // 底部指示条（宽度随选中状态动画）：用 accent 色和短距离辉光
-                // 表示当前焦点，避免白色线条破坏终端配色。
-                let bar_w = anim::smooth(
-                    ui.ctx(),
-                    egui::Id::new(("tab_bar_w", i)),
-                    if selected {
-                        row.rect.width() * 0.58
-                    } else {
-                        0.0
-                    },
-                    anim::SPEED_NORMAL,
+                // 关闭「×」：Kaku 同款 hover/选中时可见；隐藏时保持透明但
+                // 仍在辅助功能树里（测试以 × 数量判定标签数）。
+                let close_alpha = if selected || hovered { 200 } else { 0 };
+                let close_rect = egui::Rect::from_center_size(
+                    egui::pos2(
+                        rect.right() - TAB_PADDING_R - TAB_CLOSE_WIDTH / 2.0,
+                        rect.center().y,
+                    ),
+                    egui::vec2(TAB_CLOSE_WIDTH, TAB_BAR_HEIGHT),
                 );
-                if bar_w > 0.5 {
-                    let bar = egui::Rect::from_center_size(
-                        egui::pos2(row.rect.center().x, row.rect.bottom() - 1.0),
-                        egui::vec2(bar_w, 2.0),
-                    );
-                    let glow = egui::Rect::from_center_size(
-                        egui::pos2(bar.center().x, bar.center().y),
-                        egui::vec2(bar_w + 8.0, 5.0),
-                    );
-                    ui.painter().rect_filled(
-                        glow,
-                        2.0,
-                        egui::Color32::from_rgba_unmultiplied(
-                            theme.accent.r(),
-                            theme.accent.g(),
-                            theme.accent.b(),
-                            (42.0 * sel_alpha) as u8,
-                        ),
-                    );
-                    ui.painter().rect_filled(
-                        bar,
-                        1.0,
-                        egui::Color32::from_rgba_unmultiplied(
-                            theme.accent.r(),
-                            theme.accent.g(),
-                            theme.accent.b(),
-                            (220.0 * sel_alpha.max(0.25)) as u8,
-                        ),
-                    );
+                let close_btn = egui::Button::new(
+                    egui::RichText::new("×")
+                        .size(13.0)
+                        .color(theme.text_muted.gamma_multiply(close_alpha as f32 / 255.0)),
+                )
+                .fill(egui::Color32::TRANSPARENT)
+                .stroke(egui::Stroke::NONE)
+                .corner_radius(0.0)
+                .min_size(egui::vec2(TAB_CLOSE_WIDTH, TAB_BAR_HEIGHT));
+                if ui
+                    .put(close_rect, close_btn)
+                    .on_hover_text("关闭标签页")
+                    .clicked()
+                {
+                    close_idx = Some(i);
                 }
             }
-            // 新建本地终端标签（＋）。
+
+            // 新建本地终端（＋，Kaku `show_new_tab_button_in_tab_bar`）。
+            let (plus_rect, _) = ui.allocate_exact_size(
+                egui::vec2(NEW_TAB_WIDTH, TAB_BAR_HEIGHT),
+                egui::Sense::hover(),
+            );
+            let plus_hovered = ui.rect_contains_pointer(plus_rect);
+            if plus_hovered {
+                ui.painter().rect_filled(plus_rect, 0.0, theme.bg_panel);
+            }
+            let plus_btn =
+                egui::Button::new(egui::RichText::new("＋").size(13.0).color(if plus_hovered {
+                    theme.text_primary
+                } else {
+                    theme.text_muted
+                }))
+                .fill(egui::Color32::TRANSPARENT)
+                .stroke(egui::Stroke::NONE)
+                .corner_radius(0.0)
+                .min_size(egui::vec2(NEW_TAB_WIDTH, TAB_BAR_HEIGHT));
             if ui
-                .add(
-                    egui::Button::new(egui::RichText::new("＋").color(theme.text_muted))
-                        .fill(egui::Color32::TRANSPARENT)
-                        .stroke(egui::Stroke::NONE)
-                        .corner_radius(crate::theme::tokens::RADIUS_ITEM),
-                )
+                .put(plus_rect, plus_btn)
                 .on_hover_text("新建本地终端（⌘T）")
                 .clicked()
             {
                 self.new_local_tab(ui.ctx());
             }
 
-            // 项目收藏（文件夹图标）：点击弹出收藏菜单，单击项目行即打开为新终端标签。
-            // push_id 固定按钮 Id——Popup::menu 的开关状态按 Id 记忆，
-            // 自动 Id 帧间漂移会让菜单闪断（与 ssh_quick 同理）。
-            let project_btn_resp = ui.push_id("project_quick", project_quick_button).inner;
-            egui::Popup::menu(&project_btn_resp).show(|ui| self.project_quick_menu(ui));
-
-            // 快速 SSH 连接（">_" 图标）：点击弹出已保存主机列表，单击主机行
-            // 直接发起连接（不需要进设置弹窗双击）。push_id 固定按钮 Id——
-            // Popup::menu 的开关状态按 Id 记忆，自动 Id 帧间漂移会让菜单闪断。
-            let ssh_btn_resp = ui.push_id("ssh_quick", ssh_quick_button).inner;
-            egui::Popup::menu(&ssh_btn_resp).show(|ui| self.host_quick_menu(ui));
-
-            // 顶到右侧：设置齿轮（设置弹窗入口）。
+            // 顶到右侧：齿轮（设置）→ 状态指示 → 快速 SSH → 项目收藏。
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if settings_gear_button(ui) && !self.show_new_conn {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.add_space(6.0);
+                if settings_gear_button(ui) && self.workspace_edit.is_none() {
                     self.show_settings = true;
                 }
+                self.session_status(ui);
+                // 工作区（SSH 与项目收藏的融合入口）：点击弹出统一列表，
+                // 单击条目直接打开（本地建标签 / SSH 连接）。push_id 固定
+                // 按钮 Id——Popup::menu 的开关状态按 Id 记忆，自动 Id 帧间
+                // 漂移会让菜单闪断。
+                let ws_btn_resp = ui.push_id("workspace_quick", workspace_quick_button).inner;
+                egui::Popup::menu(&ws_btn_resp).show(|ui| self.workspace_quick_menu(ui));
             });
 
+            if rename_cancel {
+                self.renaming_tab = None;
+            }
+            if let Some((id, text)) = rename_commit {
+                self.renaming_tab = None;
+                if let Some(target) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+                    let trimmed = text.trim().to_string();
+                    target.title_override = (!trimmed.is_empty()).then_some(trimmed);
+                }
+            }
             if let Some(i) = switch_to {
                 self.active_tab = i;
             }
@@ -3994,63 +4935,48 @@ impl MinoApp {
 
     /// 切换设置弹窗开关状态。
     fn toggle_settings(&mut self) {
-        // 新建连接是前台模态窗口，不能让快捷键把设置窗口叠到它上面。
-        if self.show_new_conn {
+        // 工作区编辑是前台模态窗口，不能让快捷键把设置窗口叠到它上面。
+        if self.workspace_edit.is_some() {
             return;
         }
         self.show_settings = !self.show_settings;
     }
 
-    /// 渲染状态栏。
-    fn status_bar(&mut self, ui: &mut egui::Ui) {
+    /// 会话/SFTP 状态指示（底部标签栏右端；原独立状态栏的替代）。
+    ///
+    /// Kaku 没有状态栏——连接状态/传输错误以 toast 与标签状态点表达；
+    /// Mino 保留这一小块**持久**指示（toast 一闪而过易忽略，SFTP 连接
+    /// 错误需要持续可见），只显示必要信息、无独立背景。
+    fn session_status(&mut self, ui: &mut egui::Ui) {
         let theme = crate::theme::current_theme();
-        ui.horizontal(|ui| {
-            ui.add_space(6.0);
-            if let Some(tab) = self.tabs.get(self.active_tab) {
-                let session = tab.terminal.session();
-                // 与标签栏同一标题（本地为当前目录末级名，远程为主机名）。
-                let (title, title_tooltip) = tab.title();
-                let exited = session.has_exited();
-                status_dot(ui, if exited { theme.danger } else { theme.success }, false);
-                let title_label = ui.label(
-                    egui::RichText::new(title)
-                        .size(11.5)
-                        .color(theme.text_secondary),
-                );
-                if let Some(full) = title_tooltip {
-                    title_label.on_hover_text(full);
-                }
-                if exited {
-                    ui.colored_label(theme.danger, "会话已退出");
-                }
-                // SFTP 主机名从标签页的 SFTP 视图读取（每个标签绑定自己的连接，
-                // 多远程标签共存时不会显示成最后一次连接的主机名）。
-                if let Some(sftp) = &tab.sftp {
-                    ui.separator();
-                    status_dot(ui, theme.accent2, false);
-                    ui.colored_label(theme.accent2, format!("SFTP · {}", sftp.host_name()));
-                }
-            }
-            if self.pending_sftp.is_some() {
-                ui.separator();
-                loading_hint(ui, "SFTP 连接中…");
-            }
-            if self.pending_local.is_some() {
-                // ⌘T 新建终端时当前标签仍在显示：状态栏给出明确等待反馈。
-                ui.separator();
-                loading_hint(ui, "终端启动中…");
-            }
-            if let Some(e) = &self.sftp_error {
-                ui.separator();
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            let session = tab.active_view().session();
+            if session.has_exited() {
                 status_dot(ui, theme.danger, false);
-                // 截断显示，避免长错误把状态栏撑满；hover 看全文。
-                ui.add(
-                    egui::Label::new(egui::RichText::new(e).size(11.5).color(theme.danger))
-                        .truncate(),
-                )
-                .on_hover_text(format!("{e}\n\n重新连接主机可再次尝试"));
+                ui.colored_label(theme.danger, "会话已退出");
             }
-        });
+            // SFTP 主机名从标签页的 SFTP 视图读取（每个标签绑定自己的连接，
+            // 多远程标签共存时不会显示成最后一次连接的主机名）。
+            if let Some(sftp) = &tab.sftp {
+                status_dot(ui, theme.accent2, false);
+                ui.colored_label(theme.accent2, format!("SFTP · {}", sftp.host_name()));
+            }
+        }
+        if self.pending_sftp.is_some() {
+            loading_hint(ui, "SFTP 连接中…");
+        }
+        if self.pending_local.is_some() {
+            // ⌘T 新建终端时当前标签仍在显示：给出明确等待反馈。
+            loading_hint(ui, "终端启动中…");
+        }
+        if let Some(e) = &self.sftp_error {
+            status_dot(ui, theme.danger, false);
+            // 截断显示，避免长错误把标签栏撑满；hover 看全文。
+            ui.add(
+                egui::Label::new(egui::RichText::new(e).size(11.0).color(theme.danger)).truncate(),
+            )
+            .on_hover_text(format!("{e}\n\n重新连接主机可再次尝试"));
+        }
     }
 
     /// 更新弹窗（下载进度 / 安装 / 错误统一入口）。
@@ -4531,14 +5457,17 @@ fn shortcut_hint(ui: &mut egui::Ui, theme: &crate::theme::Theme) {
         |key: &str| measure(key, egui::FontId::monospace(10.5)) + KEY_HORIZONTAL_PADDING;
     let label_width = |label: &str| measure(label, egui::FontId::proportional(11.5));
     let row_width = key_width("⌘T")
-        + label_width("新建本地终端")
+        + label_width("新建标签")
         + label_width("·")
-        + key_width("⌘N")
-        + label_width("新建连接")
+        + key_width("⌘D")
+        + label_width("分屏")
         + label_width("·")
         + key_width("⌘O")
-        + label_width("打开项目")
-        + ITEM_SPACING * 6.0;
+        + label_width("工作区")
+        + label_width("·")
+        + key_width("⌘F")
+        + label_width("搜索")
+        + ITEM_SPACING * 10.0;
     // `ui.horizontal` 会占满父布局宽度且默认从左侧排布；根据当前 UI 的
     // 真实中心坐标补前导空间，避免嵌套布局的 available_width 造成偏移。
     let leading_space = (ui.max_rect().center().x - ui.cursor().left() - row_width * 0.5).max(0.0);
@@ -4547,21 +5476,28 @@ fn shortcut_hint(ui: &mut egui::Ui, theme: &crate::theme::Theme) {
         ui.add_space(leading_space);
         shortcut_key(ui, theme, "⌘T");
         ui.label(
-            egui::RichText::new("新建本地终端")
+            egui::RichText::new("新建标签")
                 .size(11.5)
                 .color(theme.text_muted),
         );
         ui.label(egui::RichText::new("·").size(11.5).color(theme.text_muted));
-        shortcut_key(ui, theme, "⌘N");
+        shortcut_key(ui, theme, "⌘D");
         ui.label(
-            egui::RichText::new("新建连接")
+            egui::RichText::new("分屏")
                 .size(11.5)
                 .color(theme.text_muted),
         );
         ui.label(egui::RichText::new("·").size(11.5).color(theme.text_muted));
         shortcut_key(ui, theme, "⌘O");
         ui.label(
-            egui::RichText::new("打开项目")
+            egui::RichText::new("工作区")
+                .size(11.5)
+                .color(theme.text_muted),
+        );
+        ui.label(egui::RichText::new("·").size(11.5).color(theme.text_muted));
+        shortcut_key(ui, theme, "⌘F");
+        ui.label(
+            egui::RichText::new("搜索")
                 .size(11.5)
                 .color(theme.text_muted),
         );
@@ -4818,6 +5754,11 @@ impl Drop for MinoApp {
 }
 
 impl eframe::App for MinoApp {
+    /// 退出时保存窗口快照（Kaku：关闭/隐藏窗口时自动保存布局）。
+    fn on_exit(&mut self) {
+        self.save_window_snapshot();
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         // 缓存 ctx 供非 UI 回调使用（如复制 tab 时构造 Session）。
@@ -4825,9 +5766,84 @@ impl eframe::App for MinoApp {
 
         // ==================== 快捷键 ====================
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::N))
-            && !self.show_new_conn
+            && self.workspace_edit.is_none()
         {
-            self.open_new_connection();
+            self.open_workspace_editor(1);
+        }
+        // ⌘⌥⇧T：恢复上次窗口快照（Kaku Restore Previous Window）。
+        if ctx.input_mut(|i| {
+            i.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::ALT | egui::Modifiers::SHIFT,
+                egui::Key::T,
+            )
+        }) {
+            self.restore_window_snapshot(&ctx);
+        }
+        // ⌘L：AI 聊天面板开关（Kaku Open AI Chat）。
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::L)) {
+            if self.ai_panel.is_open() {
+                self.ai_panel.close();
+            } else {
+                // 打开时带上终端上下文（目录 + 最近可见输出）。
+                let context = self.active_terminal_context();
+                self.ai_panel.set_context(context);
+                self.ai_panel.open();
+            }
+        }
+        // ⌘⇧A：AI 助手设置（Kaku Open AI settings：Mino 里就是设置弹窗的
+        // AI 卡片；已配置与否都直接打开设置）。
+        if ctx.input_mut(|i| {
+            i.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::A,
+            )
+        }) {
+            self.show_settings = true;
+        }
+        // ⌘⇧O：标签导航器（Kaku Tab Navigator）。
+        if ctx.input_mut(|i| {
+            i.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::O,
+            )
+        }) {
+            let items = self.tab_navigator_items();
+            self.launcher = Some((
+                LauncherMode::Tabs,
+                crate::views::launcher::Launcher::tab_navigator(items),
+            ));
+        }
+        // ⌘⇧P：命令面板（Kaku Command Palette）。
+        if ctx.input_mut(|i| {
+            i.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::P,
+            )
+        }) {
+            let items = Self::command_palette_items();
+            self.launcher = Some((
+                LauncherMode::Palette,
+                crate::views::launcher::Launcher::command_palette(items),
+            ));
+        }
+        // ⌘⇧E：把最近的 AI 修复建议填入提示符（Kaku Apply suggestion）。
+        if ctx.input_mut(|i| {
+            i.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::E,
+            )
+        }) {
+            self.apply_ai_suggestion();
+        }
+        // ⌘⇧T：重开最近关闭的标签（Kaku Reopen closed tab；必须在 ⌘T
+        // 之前消费——`consume_key` 是子集匹配，⌘T 会把 ⌘⇧T 一并吃掉）。
+        if ctx.input_mut(|i| {
+            i.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::T,
+            )
+        }) {
+            self.reopen_closed_tab(&ctx);
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::T)) {
             self.new_local_tab(&ctx);
@@ -4836,18 +5852,138 @@ impl eframe::App for MinoApp {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
             self.toggle_settings();
         }
-        // ⌘O：切换项目打开面板（新建连接模态时不响应，见 `toggle_projects`）。
+        // ⌘O：切换项目打开面板（新建连接模态时不响应，见 `toggle_workspaces`）。
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) {
-            self.toggle_projects();
+            self.toggle_workspaces();
         }
-        // ⌘D：收藏当前本地终端目录为项目。
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::D)) {
-            self.bookmark_current_directory();
+        // ⌘B：收藏当前本地终端目录/远程主机为工作区（原 ⌘D；⌘D 让位给
+        // Kaku 的分屏语义）。
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::B)) {
+            self.bookmark_current_workspace();
         }
+        // ⌘⇧W：关闭整个标签（含全部窗格；Kaku CloseCurrentTab）。
+        // 必须在 ⌘W 之前消费（子集匹配：⌘W 会吃掉 ⌘⇧W）。
+        if ctx.input_mut(|i| {
+            i.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::W,
+            )
+        }) && !self.tabs.is_empty()
+        {
+            self.close_tab(self.active_tab);
+        }
+        // ⌘W：智能关闭（Kaku 语义）——多窗格关窗格、多标签关标签、
+        // 最后一个标签最小化窗口（见 `smart_close`）。
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::W))
             && !self.tabs.is_empty()
         {
-            self.close_tab(self.active_tab);
+            self.smart_close(&ctx);
+        }
+        // ⌘D / ⌘⇧D：分屏（Kaku：Cmd+D 左右并排、Cmd+Shift+D 上下堆叠）。
+        // 必须先消费带 Shift 的组合：egui 的 `consume_key` 走
+        // `matches_logically`（子集匹配、允许多余修饰），先匹配 ⌘D 会把
+        // ⌘⇧D 一并吃掉。
+        if ctx.input_mut(|i| {
+            i.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::D,
+            )
+        }) {
+            self.split_active_pane(&ctx, SplitAxis::Vertical);
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::D)) {
+            self.split_active_pane(&ctx, SplitAxis::Horizontal);
+        }
+        // ⌘⇧[ / ⌘⇧]：上一个/下一个标签（Kaku ActivateTabRelative）。
+        if ctx.input_mut(|i| {
+            i.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::OpenBracket,
+            )
+        }) && self.tabs.len() > 1
+        {
+            let count = self.tabs.len();
+            self.active_tab = (self.active_tab + count - 1) % count;
+        }
+        if ctx.input_mut(|i| {
+            i.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::CloseBracket,
+            )
+        }) && self.tabs.len() > 1
+        {
+            self.active_tab = (self.active_tab + 1) % self.tabs.len();
+        }
+        // ⌘F：搜索浮层（Kaku 搜索，作用于当前窗格）。
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                tab.active_view_mut().toggle_search();
+            }
+        }
+        // ⌘K：清屏并清空回滚（Kaku：Ctrl+L + ClearScrollback）。
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) {
+            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                tab.active_view_mut().clear_scrollback_and_screen();
+            }
+        }
+        // ⌘M：最小化窗口（Kaku Minimize）。
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::M)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+        // ⌘⌃F：切换全屏（Kaku ToggleFullScreen；macOS 原生全屏空间）。
+        if ctx.input_mut(|i| {
+            i.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::CTRL,
+                egui::Key::F,
+            )
+        }) {
+            let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
+        }
+        // ⌘⇧S：切换拆分方向（Kaku TogglePaneSplitDirection）。
+        if ctx.input_mut(|i| {
+            i.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::S,
+            )
+        }) {
+            self.toggle_split_direction(&ctx);
+        }
+        // ⌘⇧Enter：放大/还原活动窗格（Kaku TogglePaneZoomState）。
+        if ctx.input_mut(|i| {
+            i.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::Enter,
+            )
+        }) {
+            self.toggle_pane_zoom(&ctx);
+        }
+        // ⌘⌥方向键：焦点在窗格间移动（必须排在普通 ⌘←/→ 之前消费：
+        // 子集匹配下 ⌘← 的模式也会命中 ⌘⌥←）。
+        for (key, dx, dy) in [
+            (egui::Key::ArrowLeft, -1, 0),
+            (egui::Key::ArrowRight, 1, 0),
+            (egui::Key::ArrowUp, 0, -1),
+            (egui::Key::ArrowDown, 0, 1),
+        ] {
+            if ctx
+                .input_mut(|i| i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::ALT, key))
+            {
+                self.focus_pane_neighbor(&ctx, dx, dy);
+            }
+        }
+        // ⌘⌃方向键：调整分割比例（Kaku AdjustPaneSize，每次 5 列）。
+        for (key, axis, delta) in [
+            (egui::Key::ArrowLeft, SplitAxis::Horizontal, -1.0),
+            (egui::Key::ArrowRight, SplitAxis::Horizontal, 1.0),
+            (egui::Key::ArrowUp, SplitAxis::Vertical, -1.0),
+            (egui::Key::ArrowDown, SplitAxis::Vertical, 1.0),
+        ] {
+            if ctx
+                .input_mut(|i| i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::CTRL, key))
+            {
+                self.adjust_pane_size(&ctx, axis, delta);
+            }
         }
         // 终端字号：⌘+ 放大 / ⌘- 缩小 / ⌘0 重置（macOS 终端通用约定）。
         //
@@ -4873,15 +6009,6 @@ impl eframe::App for MinoApp {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num0)) {
             self.apply_font_size_and_persist(&ctx, TerminalView::DEFAULT_FONT_SIZE, false);
         }
-        for (key, theme_idx) in [
-            (egui::Key::Num1, 0),
-            (egui::Key::Num2, 1),
-            (egui::Key::Num3, 2),
-        ] {
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, key)) {
-                self.apply_theme_and_persist(&ctx, theme_idx);
-            }
-        }
         for (key, idx) in [
             (egui::Key::Num1, 0usize),
             (egui::Key::Num2, 1),
@@ -4901,20 +6028,15 @@ impl eframe::App for MinoApp {
         }
 
         // Esc 只关闭前台弹窗。无弹窗时必须保留事件给终端（例如 Vim 退出插入模式）。
-        if (self.show_new_conn || self.show_settings || self.show_projects)
+        if (self.workspace_edit.is_some() || self.show_settings || self.show_workspaces)
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
-            if self.show_new_conn {
-                self.show_new_conn = false;
-                self.form.name_focused = false;
-                if self.settings_before_new_conn {
-                    self.show_settings = true;
-                }
-                self.settings_before_new_conn = false;
+            if self.workspace_edit.is_some() {
+                self.close_workspace_editor();
             } else if self.show_settings {
                 self.show_settings = false;
-            } else if self.show_projects {
-                self.show_projects = false;
+            } else if self.show_workspaces {
+                self.show_workspaces = false;
             }
         }
 
@@ -4934,7 +6056,9 @@ impl eframe::App for MinoApp {
         }
         self.poll_local_spawn(&ctx);
         for tab in &mut self.tabs {
-            tab.terminal.drain_background_events();
+            for pane in &mut tab.panes {
+                pane.view.drain_background_events();
+            }
         }
         let mut sftp_event_received = false;
         for tab in &mut self.tabs {
@@ -4952,36 +6076,45 @@ impl eframe::App for MinoApp {
         self.poll_update();
         self.poll_download(&ctx);
         self.poll_install(&ctx);
+        self.poll_vendor_bootstrap();
+        self.poll_ai_tasks(&ctx);
 
-        // ==================== 顶部标签页栏（合并了原 toolbar：齿轮入口在最右） ====================
+        // ==================== 标题条（顶部拖拽区） ====================
+        // Kaku 的窗口样板（WezTerm `INTEGRATED_BUTTONS|RESIZE`）：标题条与
+        // 终端同底色（深色 #15141b / 浅色 #FFFCF0），只有原生红绿灯与
+        // 空白拖拽区（无标题文字，见 main.rs 的 viewport 设置）。
+        // 外观跟随系统：auto 偏好下系统深浅色切换时在这里重套主题。
+        let want_theme = crate::theme::resolve_appearance(
+            self.config.appearance.trim(),
+            ctx.system_theme() != Some(egui::Theme::Light),
+        );
+        if want_theme != crate::theme::current_theme_index() {
+            crate::theme::set_theme(&ctx, want_theme);
+        }
         let theme = crate::theme::current_theme();
-        // ==================== 标签页栏 ====================
-        let tab_frame = egui::Frame::new()
-            .fill(theme.bg_header)
-            .inner_margin(egui::Margin {
-                left: 8,
-                right: 8,
-                top: 2,
-                bottom: 2,
-            });
-        egui::Panel::top("tabs").frame(tab_frame).show(ui, |ui| {
-            self.tab_bar(ui);
-        });
-
-        // ==================== 状态栏 ====================
-        let status_frame = egui::Frame::new()
-            .fill(theme.bg_panel)
-            .inner_margin(egui::Margin {
-                left: 4,
-                right: 10,
-                top: 4,
-                bottom: 4,
-            });
-        egui::Panel::bottom("status")
-            .frame(status_frame)
+        let titlebar_frame = egui::Frame::new().fill(theme.bg_app);
+        egui::Panel::top("titlebar")
+            .exact_size(TITLEBAR_HEIGHT)
+            .frame(titlebar_frame)
             .show(ui, |ui| {
-                self.status_bar(ui);
+                self.title_bar(ui);
             });
+
+        // ==================== 底部标签栏（Kaku `tab_bar_at_bottom = true`） ====================
+        // Kaku 的标签栏在窗口最底部、与终端同底色；标签栏右侧承载 Mino 的
+        // 入口按钮（工作区 / 设置）与会话状态指示（不再有独立状态栏）。
+        let tab_frame = egui::Frame::new().fill(theme.bg_header);
+        egui::Panel::bottom("tab_bar")
+            .frame(tab_frame)
+            .show(ui, |ui| {
+                self.tab_bar(ui);
+            });
+        // 活动标签被查看后清除注意力点（Kaku：标签激活即消）。
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            for pane in &mut tab.panes {
+                pane.view.clear_attention();
+            }
+        }
 
         // ==================== 中央区：当前标签页 ====================
         // SFTP 面板必须是顶层面板（先于 CentralPanel 注册）：
@@ -4998,8 +6131,9 @@ impl eframe::App for MinoApp {
         // 小于 260，导致面板虽然“有最小宽度”却仍被布局压窄。
         let max_sftp_w = (viewport_w * 0.50).max(260.0);
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            // 先取终端侧上下文，再对 sftp 取可变借用（借用拆分同定位逻辑）。
+            let terminal_cwd = tab.active_view().current_directory();
             if let Some(sftp) = &mut tab.sftp {
-                let terminal_cwd = tab.terminal.current_directory();
                 let sftp_frame = egui::Frame::new()
                     .fill(theme.bg_panel)
                     .inner_margin(egui::Margin::symmetric(12, 10));
@@ -5026,9 +6160,15 @@ impl eframe::App for MinoApp {
                 }
             }
         }
-        // 设置弹窗是前台模态内容；终端仍渲染后台输出，
+        // 设置/工作区/AI 面板/Launcher 都是前台内容；终端仍渲染后台输出，
         // 但禁止它消费键盘、鼠标和滚轮事件，避免输入穿透。
-        let terminal_input_enabled = !self.show_settings && !self.show_projects;
+        let terminal_input_enabled = !self.show_settings
+            && !self.show_workspaces
+            && !self.ai_panel.is_open()
+            && self
+                .launcher
+                .as_ref()
+                .is_none_or(|(_, launcher)| !launcher.is_open());
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(_pending) = &self.pending {
                 ui.centered_and_justified(|ui| {
@@ -5044,11 +6184,54 @@ impl eframe::App for MinoApp {
                 } else {
                     self.empty_state(ui, &ctx);
                 }
-            } else if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                tab.terminal.show_with_input(ui, terminal_input_enabled);
+            } else {
+                self.render_tab_panes(ui, terminal_input_enabled);
+                // 右键菜单里的跨窗格动作（分屏/标签/字号）由这里统一执行
+                //（`TerminalView` 只记录意图，聚焦同步已让目标窗格成为活动窗格）。
+                let mctx = ctx.clone();
+                let mut menu_actions: Vec<crate::views::terminal_view::MenuChoice> = Vec::new();
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    for pane in &mut tab.panes {
+                        menu_actions.extend(pane.view.take_menu_choices());
+                    }
+                }
+                for choice in menu_actions {
+                    use crate::views::terminal_view::MenuChoice;
+                    match choice {
+                        MenuChoice::ResetFontSize => {
+                            self.apply_font_size_and_persist(
+                                &ctx,
+                                TerminalView::DEFAULT_FONT_SIZE,
+                                false,
+                            );
+                        }
+                        MenuChoice::SplitRight => {
+                            self.split_active_pane(&ctx, SplitAxis::Horizontal);
+                        }
+                        MenuChoice::SplitDown => {
+                            self.split_active_pane(&ctx, SplitAxis::Vertical);
+                        }
+                        MenuChoice::ClosePane => {
+                            let pane = self
+                                .tabs
+                                .get(self.active_tab)
+                                .map(|tab| tab.active_pane)
+                                .unwrap_or_default();
+                            self.close_pane(&mctx, self.active_tab, pane);
+                        }
+                        MenuChoice::NewTab => self.new_local_tab(&ctx),
+                        MenuChoice::CloseTab if !self.tabs.is_empty() => {
+                            self.close_tab(self.active_tab);
+                        }
+                        // 本地动作已在 `TerminalView` 内执行，不会到这里。
+                        _ => {}
+                    }
+                }
                 // tabby 风格：远程标签页终端右上角悬浮 SFTP 开关按钮。
-                if tab.sftp.is_some() && sftp_floating_button(ui, tab.sftp_open) {
-                    tab.sftp_open = !tab.sftp_open;
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    if tab.sftp.is_some() && sftp_floating_button(ui, tab.sftp_open) {
+                        tab.sftp_open = !tab.sftp_open;
+                    }
                 }
             }
         });
@@ -5059,13 +6242,70 @@ impl eframe::App for MinoApp {
                 sftp.show_dialog(&ctx);
             }
         }
-        self.connect_dialog(&ctx);
+        self.workspace_edit_dialog(&ctx);
         if self.show_settings {
             self.settings_panel(&ctx);
         }
-        if self.show_projects {
-            self.projects_panel(&ctx);
+        if self.show_workspaces {
+            self.workspaces_panel(&ctx);
         }
+        // ==================== AI 面板与 Launcher ====================
+        // ⌘L 聊天面板：事件回填提示符（不自动执行）或引导去设置。
+        for event in self.ai_panel.show(&ctx) {
+            match event {
+                crate::views::ai_panel::AiPanelEvent::InsertCommand(command) => {
+                    if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                        tab.active_view_mut().inject_command(&command);
+                    }
+                }
+                crate::views::ai_panel::AiPanelEvent::OpenSettings => {
+                    self.show_settings = true;
+                }
+            }
+        }
+        // Launcher（标签导航 / 命令面板）：选中即执行；打开期间每帧同步
+        // 标签列表（标签增减时导航器数据不陈旧）。
+        let mut launcher_choice: Option<String> = None;
+        let mut launcher_close = false;
+        // 先把标签导航器的新条目算出来（借用分离：set_items 期间不能同时
+        // 借 self 的其余字段）。
+        let navigator_items = self
+            .launcher
+            .as_ref()
+            .filter(|(mode, _)| matches!(mode, LauncherMode::Tabs))
+            .map(|_| self.tab_navigator_items());
+        if let Some((mode, launcher)) = &mut self.launcher {
+            if !launcher.is_open() {
+                launcher_close = true;
+            } else {
+                // 标签导航器每帧刷新条目（标签增减/改名）；命令面板是静态表。
+                if matches!(mode, LauncherMode::Tabs) {
+                    if let Some(items) = navigator_items {
+                        launcher.set_items(items);
+                    }
+                }
+                launcher_choice = launcher.show(&ctx);
+            }
+        }
+        if launcher_close {
+            if let Some((_, launcher)) = &mut self.launcher {
+                launcher.close();
+            }
+            self.launcher = None;
+        }
+        if let Some(key) = launcher_choice {
+            self.launcher = None;
+            if let Some(index) = key.strip_prefix("tab:") {
+                if let Ok(index) = index.parse::<usize>() {
+                    if index < self.tabs.len() {
+                        self.active_tab = index;
+                    }
+                }
+            } else {
+                self.run_palette_action(&ctx, &key);
+            }
+        }
+
         // 手动检查发现新版本时设置保持打开，更新弹窗后渲染
         // 以保证它位于设置窗口之上。
         self.update_dialog(&ctx);
@@ -5117,6 +6357,7 @@ mod tests {
         harness.state_mut().pending_local = Some(PendingLocalSpawn {
             rx,
             command: String::new(),
+            target: None,
         });
         harness.run_steps(3);
         assert!(
@@ -5192,87 +6433,53 @@ mod backup_tests {
 mod dialog_tests {
     use super::*;
 
-    /// 完整渲染"新建连接"对话框（含密码/私钥切换、自动聚焦），不应崩溃。
+    /// 完整渲染工作区编辑对话框（SSH 分支字段 + 类型切换），不应崩溃。
     #[test]
-    fn 新建连接对话框完整渲染() {
+    fn 工作区编辑对话框完整渲染() {
         use kittest::Queryable;
-        let mut form = ConnectForm {
-            name: "测试".into(),
-            host: "127.0.0.1".into(),
-            port: "22".into(),
-            user: "root".into(),
-            auth_kind: 0,
-            password: String::new(),
-            key_path: String::new(),
-            passphrase: String::new(),
-            name_focused: false,
-        };
-        let mut show = true;
-        let mut harness = egui_kittest::Harness::new_ui(|ui| {
-            let mut open = show;
-            egui::Window::new("新建连接")
-                .open(&mut open)
-                .resizable(false)
-                .collapsible(false)
-                .show(ui, |ui| {
-                    egui::Grid::new("conn_form")
-                        .num_columns(2)
-                        .spacing([8.0, 6.0])
-                        .show(ui, |ui| {
-                            ui.label("名称");
-                            let name_id = egui::Id::new("conn_form_name");
-                            ui.add(egui::TextEdit::singleline(&mut form.name).id(name_id));
-                            if !form.name_focused {
-                                ui.memory_mut(|m| m.request_focus(name_id));
-                                form.name_focused = true;
-                            }
-                            ui.end_row();
-                            ui.label("主机");
-                            ui.text_edit_singleline(&mut form.host);
-                            ui.end_row();
-                            ui.label("端口");
-                            ui.text_edit_singleline(&mut form.port);
-                            ui.end_row();
-                            ui.label("用户名");
-                            ui.text_edit_singleline(&mut form.user);
-                            ui.end_row();
-                            ui.label("认证方式");
-                            ui.horizontal(|ui| {
-                                ui.selectable_value(&mut form.auth_kind, 0, "密码");
-                                ui.selectable_value(&mut form.auth_kind, 1, "私钥");
-                            });
-                            ui.end_row();
-                            if form.auth_kind == 0 {
-                                ui.label("密码");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut form.password).password(true),
-                                );
-                                ui.end_row();
-                            } else {
-                                ui.label("私钥路径");
-                                ui.text_edit_singleline(&mut form.key_path);
-                                ui.end_row();
-                                ui.label("口令（可选）");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut form.passphrase).password(true),
-                                );
-                                ui.end_row();
-                            }
-                        });
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        let _ = ui.button("连接");
-                        let _ = ui.button("取消");
-                    });
-                });
-            show = open;
+
+        let config_path = test_config_path("workspace-dialog-render");
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            MinoApp::new_with_config(cc, config_path.clone())
         });
         harness.run_steps(6);
-
-        // 渲染完成，切换到私钥模式再渲染一帧。
-        harness.get_by_label("私钥").click();
+        harness.state_mut().open_workspace_editor(1);
         harness.run_steps(6);
-        harness.get_by_label("私钥路径");
+
+        for label in ["名称", "用户名", "主机与端口", "认证"] {
+            assert!(
+                harness.query_all_by_label(label).next().is_some(),
+                "{label} 字段缺失"
+            );
+        }
+        // 切到本地目录分支：目录与启动命令字段出现。
+        harness.get_by_label("本地目录").click();
+        harness.run_steps(3);
+        assert!(
+            harness.query_all_by_label("目录").next().is_some(),
+            "目录字段缺失"
+        );
+        assert!(
+            harness
+                .query_all_by_label("启动命令（可选）")
+                .next()
+                .is_some(),
+            "启动命令字段缺失"
+        );
+        // Esc 关闭。
+        harness.event(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run_steps(3);
+        assert!(
+            harness.state().workspace_edit.is_none(),
+            "Esc 应关闭工作区编辑对话框"
+        );
+        std::fs::remove_file(&config_path).ok();
     }
 }
 
@@ -5298,7 +6505,13 @@ mod app_tests {
             )
             .expect("创建本地终端失败");
             let id = app.allocate_id();
-            let mut tab = TerminalTab::new(id, "测试主机".into(), TerminalView::new(session));
+            let mut tab = TerminalTab::new(
+                id,
+                "测试主机".into(),
+                TerminalView::new(session),
+                1,
+                SessionOrigin::Local,
+            );
             let (_tx, rx) = tokio::sync::mpsc::channel(128);
             let (handle_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
             tab.sftp = Some(SftpView::new(
@@ -5377,7 +6590,13 @@ mod app_tests {
                 Arc::new(|_ev: &SessionEvent| {}),
             )
             .expect("创建本地终端失败");
-            let mut tab = TerminalTab::new(1, "定位测试".into(), TerminalView::new(session));
+            let mut tab = TerminalTab::new(
+                1,
+                "定位测试".into(),
+                TerminalView::new(session),
+                1,
+                SessionOrigin::Local,
+            );
             let (_tx, rx) = tokio::sync::mpsc::channel(128);
             let (handle_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
             tab.sftp = Some(SftpView::new(
@@ -5390,7 +6609,7 @@ mod app_tests {
         let ctx = egui::Context::default();
         // 首帧让终端完成布局（request_fresh_pwd 依赖真实尺寸的全屏判断）。
         let mut harness = egui_kittest::Harness::new_ui(|ui| {
-            tab.terminal.show(ui);
+            tab.active_view_mut().show(ui);
         });
         harness.run_steps(6);
         // 借用已结束（harness 只在闭包内借 tab）；后续直接操作 tab。
@@ -5398,7 +6617,7 @@ mod app_tests {
         MinoApp::begin_locate_terminal(&mut tab, &ctx);
         // 本地会话有内核 cwd 可读时直接导航、不注入 `pwd`（macOS 新实现）；
         // 读不到时才回退到 `pwd` 探测（Linux CI 等无 libproc 实现的平台）。
-        if tab.terminal.session().child_current_dir().is_some() {
+        if tab.active_view().session().child_current_dir().is_some() {
             assert!(
                 tab.locate_pending.is_none(),
                 "内核 cwd 可读时应直接导航，不进入 pwd 探测等待"
@@ -5408,19 +6627,22 @@ mod app_tests {
                 tab.locate_pending.is_some(),
                 "空闲提示符下定位应进入 pwd 探测等待"
             );
-            assert!(!tab.terminal.auto_pwd_ready(), "探测注入后应等待终端输出");
+            assert!(
+                !tab.active_view().auto_pwd_ready(),
+                "探测注入后应等待终端输出"
+            );
         }
 
         // 场景二：有未执行输入 → 不注入，直接用已知目录回退。
         tab.locate_pending = None;
-        tab.terminal.cancel_fresh_pwd();
-        tab.terminal.push_workdir_text_for_test("echo hi");
+        tab.active_view_mut().cancel_fresh_pwd();
+        tab.active_view_mut().push_workdir_text_for_test("echo hi");
         MinoApp::begin_locate_terminal(&mut tab, &ctx);
         assert!(
             tab.locate_pending.is_none(),
             "有未执行输入时不应进入探测等待"
         );
-        assert!(tab.terminal.auto_pwd_ready());
+        assert!(tab.active_view().auto_pwd_ready());
     }
 
     #[test]
@@ -5471,7 +6693,7 @@ mod app_tests {
     fn app_grid_text(app: &MinoApp) -> String {
         use alacritty_terminal::term::cell::Flags;
         let tab = app.tabs.get(app.active_tab).expect("无标签页");
-        let term_arc = tab.terminal.session().term();
+        let term_arc = tab.active_view().session().term();
         let guard = term_arc.lock();
         let content = guard.renderable_content();
         let mut lines: Vec<String> = Vec::new();
@@ -5623,25 +6845,33 @@ mod app_tests {
         );
     }
 
-    /// 新建连接表单默认值：用户名 root、端口 22（可修改）。
+    /// 工作区表单默认值：SSH 分支默认 root/22/密码；本地分支默认 HOME。
     #[test]
-    fn 表单默认root与22端口() {
-        let form = ConnectForm::default();
-        assert_eq!(form.user, "root");
-        assert_eq!(form.port, "22");
-        assert!(form.name.is_empty());
-        assert!(form.host.is_empty());
-        assert_eq!(form.port.trim().parse::<u16>().unwrap(), 22);
+    fn 工作区表单默认值() {
+        let edit = WorkspaceEdit::default();
+        assert_eq!(edit.kind, 1, "默认进入 SSH 分支（沿用新建连接的肌肉记忆）");
+        assert_eq!(edit.user, "root");
+        assert_eq!(edit.port, "22");
+        assert!(edit.name.is_empty());
+        assert!(edit.host.is_empty());
+        assert_eq!(edit.port.trim().parse::<u16>().unwrap(), 22);
+        assert_eq!(
+            edit.path,
+            std::env::var("HOME").unwrap_or_else(|_| "~".into()),
+            "本地分支的路径默认 HOME"
+        );
     }
 
-    /// 完整应用：⌘, 打开设置弹窗后点"新建连接"按钮打开对话框，不应崩溃。
+    /// 完整应用：设置里的"新增 SSH 主机"打开工作区编辑器，字段齐备不崩溃。
     #[test]
-    fn 点击新建连接不崩溃() {
+    fn 点击新增工作区不崩溃() {
         use kittest::Queryable;
 
-        let mut harness = egui_kittest::Harness::new_eframe(|cc| MinoApp::new(cc));
+        let config_path = test_config_path("workspace-new-no-crash");
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            MinoApp::new_with_config(cc, config_path.clone())
+        });
         harness.run_steps(6);
-        // ⌘, 打开设置弹窗（含"主机管理"分组与"新建连接"按钮）。
         harness.event(egui::Event::Key {
             key: egui::Key::Comma,
             physical_key: None,
@@ -5653,35 +6883,18 @@ mod app_tests {
             harness.step();
         }
 
-        harness.get_by_label("新建连接").click();
+        harness.get_by_label("新增 SSH 主机").click();
         for _ in 0..8 {
             harness.step();
         }
 
-        assert!(
-            harness.query_all_by_label("名称").next().is_some(),
-            "名称字段缺失"
-        );
-        assert!(
-            harness.query_all_by_label("主机").next().is_some(),
-            "主机字段缺失"
-        );
-        assert!(
-            harness.query_all_by_label("用户名").next().is_some(),
-            "用户名字段缺失"
-        );
-        assert!(
-            harness.query_all_by_label("认证方式").next().is_some(),
-            "认证方式缺失"
-        );
-        assert!(
-            harness.query_all_by_label("连接").next().is_some(),
-            "连接按钮缺失"
-        );
-        assert!(
-            harness.query_all_by_label("取消").next().is_some(),
-            "取消按钮缺失"
-        );
+        for label in ["名称", "用户名", "主机与端口", "认证"] {
+            assert!(
+                harness.query_all_by_label(label).next().is_some(),
+                "{label} 字段缺失"
+            );
+        }
+        std::fs::remove_file(&config_path).ok();
     }
 }
 
@@ -5756,8 +6969,15 @@ mod connect_tests {
         //（曾直接覆盖并删除用户主机列表，运行一次测试丢一次配置）。
         let config_path = test_config_path("connect-e2e");
         let config = HostConfig {
-            hosts: vec![profile],
-            projects: Vec::new(),
+            workspaces: vec![Workspace::Ssh {
+                name: profile.name.clone(),
+                host: profile.host.clone(),
+                port: profile.port,
+                user: profile.user.clone(),
+                auth: profile.auth.clone(),
+                path: String::new(),
+                command: String::new(),
+            }],
             ..Default::default()
         };
         config.save(&config_path).expect("写入测试配置失败");
@@ -5778,16 +6998,12 @@ mod connect_tests {
             harness.step();
         }
 
-        // 双击设置 tab 内的主机行（自实现 0.3s 双击检测）。
+        // 设置里单击工作区行即打开（与快捷菜单/⌘O 面板一致的「单击即开」）。
         {
             let host_row = harness.get_by_label("链路测试");
             host_row.click();
         }
         harness.step();
-        {
-            let host_row = harness.get_by_label("链路测试");
-            host_row.click();
-        }
 
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut connected = false;
@@ -5812,7 +7028,7 @@ mod connect_tests {
         // 连接成功后设置弹窗应自动关闭（回归：曾保持打开遮住终端）。
         assert!(
             !harness.state().show_settings,
-            "双击主机行连接成功后设置弹窗应自动关闭"
+            "单击工作区行连接成功后设置弹窗应自动关闭"
         );
         // SFTP 面板默认收起，需点击终端右上角悬浮按钮展开。
         harness.get_by_label("SFTP").click();
@@ -5831,18 +7047,19 @@ mod connect_tests {
     }
 
     /// 回归：设置弹窗 → 新建连接 → 点"连接"后，新建连接对话框与设置弹窗
-    /// 都应关闭（连接结果不影响关闭行为）。
+    /// 设置里「新增 SSH 主机」打开工作区编辑器（设置自动让位），
+    /// 保存后两个弹窗都关闭、配置落盘。
     #[test]
-    fn 新建连接后关闭设置弹窗() {
+    fn 新增工作区后关闭设置弹窗() {
         use kittest::{NodeT, Queryable};
 
-        let config_path = test_config_path("new-conn-dialog");
+        let config_path = test_config_path("workspace-new-close");
         let mut harness = egui_kittest::Harness::new_eframe(|cc| {
             MinoApp::new_with_config(cc, config_path.clone())
         });
         harness.run_steps(6);
 
-        // ⌘, 打开设置弹窗 → 点"新建连接"。
+        // ⌘, 打开设置弹窗 → 点"新增 SSH 主机"。
         harness.event(egui::Event::Key {
             key: egui::Key::Comma,
             physical_key: None,
@@ -5854,11 +7071,15 @@ mod connect_tests {
             harness.step();
         }
         assert!(harness.state().show_settings, "设置弹窗应打开");
-        harness.get_by_label("新建连接").click();
+        harness.get_by_label("新增 SSH 主机").click();
         for _ in 0..3 {
             harness.step();
         }
-        assert!(harness.state().show_new_conn, "新建连接对话框应打开");
+        assert!(
+            harness.state().workspace_edit.is_some(),
+            "工作区编辑对话框应打开"
+        );
+        assert!(!harness.state().show_settings, "设置应让位给编辑器");
 
         // 填主机（用户名默认 root、端口默认 22，无需改动）。
         // 输入框顺序：名称、用户名、主机、端口、密码。
@@ -5876,23 +7097,25 @@ mod connect_tests {
             harness.step();
         }
 
-        // 点"连接" → 两个弹窗都应关闭（连接发起后失败与否不影响）。
-        // 按钮文字会同时生成 Label 节点，需按 role 过滤出真正的 Button。
-        let connect_btn = harness
+        // 点"保存" → 对话框关闭、配置落盘（保存不发起连接）。
+        let save_btn = harness
             .root()
             .query_all_by_role(accesskit::Role::Button)
-            .find(|n| n.accesskit_node().label() == Some("连接".to_string()))
-            .expect("找不到连接按钮");
-        connect_btn.click();
+            .find(|n| n.accesskit_node().label() == Some("保存".to_string()))
+            .expect("找不到保存按钮");
+        save_btn.click();
         for _ in 0..3 {
             harness.step();
         }
         assert!(
-            !harness.state().show_new_conn,
-            "点连接后新建连接对话框应关闭"
+            harness.state().workspace_edit.is_none(),
+            "点保存后编辑器应关闭"
         );
-        assert!(!harness.state().show_settings, "点连接后设置弹窗应关闭");
-        // 清理测试写入的配置。
+        assert_eq!(harness.state().config.workspaces.len(), 1, "工作区应落盘");
+        let Workspace::Ssh { host, .. } = &harness.state().config.workspaces[0] else {
+            panic!("新增的应是 SSH 工作区");
+        };
+        assert_eq!(host, "127.0.0.1");
         std::fs::remove_file(&config_path).ok();
     }
 }
@@ -5960,8 +7183,15 @@ mod snapshot_tests {
         }
         let config_path = test_config_path("snapshot");
         let config = HostConfig {
-            hosts: vec![profile],
-            projects: Vec::new(),
+            workspaces: vec![Workspace::Ssh {
+                name: profile.name.clone(),
+                host: profile.host.clone(),
+                port: profile.port,
+                user: profile.user.clone(),
+                auth: profile.auth.clone(),
+                path: String::new(),
+                command: String::new(),
+            }],
             ..Default::default()
         };
         config.save(&config_path).expect("写入测试配置失败");
@@ -5981,15 +7211,12 @@ mod snapshot_tests {
         for _ in 0..3 {
             harness.step();
         }
+        // 设置里单击工作区行即打开（统一的「单击即开」交互）。
         {
             let host_row = harness.get_by_label("链路测试");
             host_row.click();
         }
         harness.step();
-        {
-            let host_row = harness.get_by_label("链路测试");
-            host_row.click();
-        }
 
         let mut connected = false;
         for _attempt in 0..3 {
@@ -6029,10 +7256,6 @@ mod snapshot_tests {
                 host_row.click();
             }
             harness.step();
-            {
-                let host_row = harness.get_by_label("链路测试");
-                host_row.click();
-            }
         }
         assert!(connected, "连接失败，无法生成截图");
 
@@ -6155,9 +7378,9 @@ mod theme_tests {
         std::fs::remove_file(&config_path).ok();
     }
 
-    /// 三套主题切换并渲染截图（视觉验证用）。
+    /// Kaku 深/浅两套外观切换并渲染截图（视觉验证用）。
     #[test]
-    fn 三套主题渲染截图() {
+    fn 深浅外观渲染截图() {
         use kittest::Queryable;
 
         let _guard = THEME_TEST_LOCK.lock().unwrap();
@@ -6166,7 +7389,7 @@ mod theme_tests {
             MinoApp::new_with_config(cc, config_path.clone())
         });
         harness.run_steps(6);
-        // 主题下拉现在在设置弹窗里，先用 ⌘, 打开弹窗。
+        // 外观下拉在设置弹窗里，先用 ⌘, 打开弹窗。
         harness.event(egui::Event::Key {
             key: egui::Key::Comma,
             physical_key: None,
@@ -6178,24 +7401,46 @@ mod theme_tests {
             harness.step();
         }
 
-        for theme_name in ["深色", "深蓝", "霓虹"] {
+        for (theme_name, expect_name) in [
+            ("深色（Kaku Dark）", "Kaku Dark"),
+            ("浅色（Kaku Light）", "Kaku Light"),
+        ] {
             // 项目管理卡片加入后设置内容变长，外观卡片可能被挤出可视区：
             // 先滚到下拉框再点，否则点击落在别的控件上、选项菜单弹不出。
             {
+                // 设置里有多个下拉（外观 + AI 认证）：按当前值选外观那个。
+                use kittest::NodeT as _;
                 let combo = harness
                     .root()
-                    .query_by_role(accesskit::Role::ComboBox)
-                    .expect("主题下拉不存在");
+                    .query_all_by_role(accesskit::Role::ComboBox)
+                    .find(|node| {
+                        let value = node.accesskit_node().value().unwrap_or_default();
+                        value.contains("跟随")
+                            || value.contains("Kaku")
+                            || value.contains("深色")
+                            || value.contains("浅色")
+                    })
+                    .expect("外观下拉不存在");
                 combo.scroll_to_me();
             }
             for _ in 0..3 {
                 harness.step();
             }
-            harness
-                .root()
-                .query_by_role(accesskit::Role::ComboBox)
-                .expect("主题下拉不存在")
-                .click();
+            {
+                use kittest::NodeT as _;
+                harness
+                    .root()
+                    .query_all_by_role(accesskit::Role::ComboBox)
+                    .find(|node| {
+                        let value = node.accesskit_node().value().unwrap_or_default();
+                        value.contains("跟随")
+                            || value.contains("Kaku")
+                            || value.contains("深色")
+                            || value.contains("浅色")
+                    })
+                    .expect("外观下拉不存在")
+                    .click();
+            }
             for _ in 0..3 {
                 harness.step();
             }
@@ -6205,21 +7450,22 @@ mod theme_tests {
             for _ in 0..3 {
                 harness.step();
             }
-            // 切换即落盘：hosts.toml 里应记录所选主题名
-            //（回归：曾只改内存，退出重进回到原来的）。
-            let saved = HostConfig::load(&config_path).expect("主题切换后配置应可读");
-            assert_eq!(saved.theme, theme_name, "主题选择应持久化到配置");
+            // 切换即落盘：hosts.toml 里应记录外观偏好（回归：曾只改内存，
+            // 退出重进回到原来的）。
+            let saved = HostConfig::load(&config_path).expect("外观切换后配置应可读");
+            assert_ne!(saved.appearance, "", "外观偏好应持久化到配置");
+            assert_eq!(crate::theme::current_theme().name, expect_name);
             let img = harness.render().expect("渲染失败");
-            let out = format!("/tmp/mino_theme_{theme_name}.png");
+            let out = format!("/tmp/mino_theme_{expect_name}.png");
             img.save(&out).expect("保存截图失败");
             eprintln!("已保存：{out}");
         }
         std::fs::remove_file(&config_path).ok();
     }
 
-    /// 回归：切换皮肤后重启应用，应恢复上次所选主题而非第一套。
+    /// 回归：切换外观偏好后重启应用，应恢复上次所选偏好而非跟随系统默认。
     #[test]
-    fn 主题切换重启后保持() {
+    fn 外观偏好重启后保持() {
         let _guard = THEME_TEST_LOCK.lock().unwrap();
         let config_path = test_config_path("theme-persist");
         HostConfig {
@@ -6230,26 +7476,28 @@ mod theme_tests {
         .save(&config_path)
         .expect("写入测试配置失败");
 
-        // 首次启动 → 切到"霓虹"（经持久化路径写回配置）。
+        // 首次启动 → 强制切到「浅色」（经持久化路径写回配置）。
         let mut harness = egui_kittest::Harness::new_eframe(|cc| {
             MinoApp::new_with_config(cc, config_path.clone())
         });
         harness.run_steps(6);
         let theme_ctx = harness.state().last_ctx.clone();
-        harness.state_mut().apply_theme_and_persist(&theme_ctx, 2);
+        harness
+            .state_mut()
+            .apply_appearance_and_persist(&theme_ctx, "light");
         harness.run_steps(3);
-        assert_eq!(crate::theme::current_theme().name, "霓虹");
+        assert_eq!(crate::theme::current_theme().name, "Kaku Light");
         drop(harness);
 
-        // 第二次启动（模拟退出重进）→ 应仍是"霓虹"。
+        // 第二次启动（模拟退出重进）→ 应仍是「浅色」，不受系统外观影响。
         let mut harness = egui_kittest::Harness::new_eframe(|cc| {
             MinoApp::new_with_config(cc, config_path.clone())
         });
         harness.run_steps(6);
         assert_eq!(
             crate::theme::current_theme().name,
-            "霓虹",
-            "重启后主题应保持上次选择，而非回到默认"
+            "Kaku Light",
+            "重启后外观应保持上次选择，而非回到跟随系统"
         );
 
         std::fs::remove_file(&config_path).ok();
@@ -6286,7 +7534,7 @@ mod theme_tests {
             "⌘+ 应放大一档"
         );
         assert_eq!(
-            harness.state().tabs[0].terminal.font_size(),
+            harness.state().tabs[0].active_view().font_size(),
             base + TerminalView::FONT_SIZE_STEP,
             "存量标签应即时生效"
         );
@@ -6369,7 +7617,7 @@ mod theme_tests {
             .state_mut()
             .apply_font_size_and_persist(&font_ctx, 17.0, true);
         harness.run_steps(3);
-        assert_eq!(harness.state().tabs[0].terminal.font_size(), 17.0);
+        assert_eq!(harness.state().tabs[0].active_view().font_size(), 17.0);
         drop(harness);
 
         // 第二次启动（模拟退出重进）→ 新标签应继承 17pt。
@@ -6383,7 +7631,7 @@ mod theme_tests {
             "重启后字号应保持上次选择，而非回到默认"
         );
         assert_eq!(
-            harness.state().tabs[0].terminal.font_size(),
+            harness.state().tabs[0].active_view().font_size(),
             17.0,
             "重启后新标签应继承已保存字号"
         );
@@ -6427,7 +7675,7 @@ mod theme_tests {
             "滑杆调整应改变全局字号，之前：{before}"
         );
         assert_eq!(
-            harness.state().tabs[0].terminal.font_size(),
+            harness.state().tabs[0].active_view().font_size(),
             16.0,
             "滑杆调整后存量标签应即时生效"
         );
@@ -6555,7 +7803,9 @@ mod tab_tests {
             "⌘W 后应回到 1 个 × 按钮"
         );
 
-        // 再次 ⌘W → [] → 0 个 ×。
+        // 再次 ⌘W（最后一个标签、单窗格）→ 不关标签，最小化窗口
+        // （Kaku 的 Cmd+W 智能关闭语义；Mino 用最小化代替隐藏应用）。
+        let mut saw_minimized = false;
         harness.event(egui::Event::Key {
             key: egui::Key::W,
             physical_key: None,
@@ -6565,12 +7815,18 @@ mod tab_tests {
         });
         for _ in 0..4 {
             harness.step();
+            collect_viewport_cmds(&harness, &mut |cmd| {
+                if matches!(cmd, egui::ViewportCommand::Minimized(true)) {
+                    saw_minimized = true;
+                }
+            });
         }
         assert_eq!(
             harness.query_all_by_label("×").count(),
-            0,
-            "全部关闭后应无 × 按钮"
+            1,
+            "最后一个标签应保留（⌘W 最小化窗口而非关闭）"
         );
+        assert!(saw_minimized, "⌘W 在唯一标签上应发出 Minimized(true)");
     }
 
     /// 目录展示名 = 最末级文件夹名（zsh `%c` 语义）。
@@ -6617,10 +7873,12 @@ mod tab_tests {
             1,
             "本地终端".into(),
             TerminalView::new(session),
+            1,
+            SessionOrigin::Local,
         )));
         let show = tab.clone();
         let mut harness = egui_kittest::Harness::new_ui(move |ui| {
-            show.borrow_mut().terminal.show(ui);
+            show.borrow_mut().active_view_mut().show(ui);
         });
         harness.run_steps(6);
 
@@ -6644,7 +7902,7 @@ mod tab_tests {
         while Instant::now() < deadline {
             harness.step();
             let text =
-                crate::views::terminal_view::tests_grid_text(tab.borrow().terminal.session());
+                crate::views::terminal_view::tests_grid_text(tab.borrow().active_view().session());
             if text.contains("__MINO_TAB_READY__") {
                 ready = true;
                 break;
@@ -6685,10 +7943,10 @@ mod tab_tests {
         std::fs::remove_dir_all(base).ok();
     }
 
-    /// 标签栏与状态栏都渲染当前目录的末级名（不再是固定 "本地终端"），
-    /// 悬浮标题显示全路径。
+    /// 标签栏渲染当前目录的末级名（不再是固定 "本地终端"），悬浮标题显示全路径。
+    ///（状态栏已随 Kaku 化移除：状态指示并入标签栏右端。）
     #[test]
-    fn 标签栏与状态栏显示当前目录名() {
+    fn 标签栏显示当前目录名() {
         use kittest::Queryable;
         use std::time::{Duration, Instant};
 
@@ -6703,7 +7961,7 @@ mod tab_tests {
         while Instant::now() < deadline {
             harness.step();
             let text = crate::views::terminal_view::tests_grid_text(
-                harness.state().tabs[0].terminal.session(),
+                harness.state().tabs[0].active_view().session(),
             );
             if !text.trim().is_empty() {
                 ready = true;
@@ -6729,18 +7987,18 @@ mod tab_tests {
         let mut shown = false;
         while Instant::now() < deadline {
             harness.step();
-            if harness.query_all_by_label("proj-beta").count() == 2 {
+            if harness.query_all_by_label("proj-beta").count() == 1 {
                 shown = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(60));
         }
         let tab_title = crate::views::terminal_view::tests_grid_text(
-            harness.state().tabs[0].terminal.session(),
+            harness.state().tabs[0].active_view().session(),
         );
         assert!(
             shown,
-            "标签栏与状态栏应各显示一次目录名，实际 “proj-beta” 出现 {} 次；终端内容：\n{tab_title}",
+            "标签栏应显示目录名，实际 “proj-beta” 出现 {} 次；终端内容：\n{tab_title}",
             harness.query_all_by_label("proj-beta").count()
         );
 
@@ -6782,7 +8040,7 @@ mod tab_tests {
         let mut view = TerminalView::new(session);
         // 模拟 Tab/粘贴/方向键后的跟踪失效：此前标题会永久停在旧值。
         view.workdir_for_test().invalidate();
-        let tab = TerminalTab::new(1, "本地终端".into(), view);
+        let tab = TerminalTab::new(1, "本地终端".into(), view, 1, SessionOrigin::Local);
         let expected = std::fs::canonicalize(&project)
             .expect("规范化测试目录失败")
             .to_string_lossy()
@@ -6806,7 +8064,7 @@ mod tab_tests {
 
         // 经由 shell 函数里的 cd（跟踪器只认行首 `cd`，函数体内的 cd
         // 在它眼里只是普通文本 + 回车，目录推测保持不动）。
-        tab.terminal
+        tab.active_view()
             .session()
             .write(format!("mygoto() {{ cd {} ; }}; mygoto\n", project.display()).as_bytes());
         let deadline = Instant::now() + Duration::from_secs(8);
@@ -6834,28 +8092,27 @@ mod tab_tests {
 
         let mut harness = egui_kittest::Harness::new_eframe(|cc| MinoApp::new(cc));
         harness.run_steps(6);
-        harness.event(egui::Event::Key {
-            key: egui::Key::W,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::COMMAND,
-        });
+        // 关闭全部标签进入空状态（⌘W 在最后一个标签上会最小化窗口——
+        // Kaku 语义，见 `smart_close`；这里直接驱动关闭动作）。
+        harness.state_mut().close_tab(0);
         for _ in 0..4 {
             harness.step();
         }
 
         let title = harness.get_by_label(PRODUCT_NAME);
         assert!(
-            title.rect().top() > 110.0,
-            "空状态标题应与顶部标签栏保持距离，实际 top={}",
+            title.rect().top() > 60.0,
+            "空状态标题应避开顶部标题条与窗口上沿，实际 top={}",
             title.rect().top()
         );
-        assert!(harness.get_by_label("⌘T").rect().height() > 0.0);
-        assert!(harness.get_by_label("⌘N").rect().height() > 0.0);
-        assert!(harness.get_by_label("⌘O").rect().height() > 0.0);
+        for chip in ["⌘T", "⌘D", "⌘O", "⌘F"] {
+            assert!(
+                harness.get_by_label(chip).rect().height() > 0.0,
+                "空状态应展示 {chip} 键帽"
+            );
+        }
         let shortcut_left = harness.get_by_label("⌘T").rect().left();
-        let shortcut_right = harness.get_by_label("打开项目").rect().right();
+        let shortcut_right = harness.get_by_label("搜索").rect().right();
         let shortcut_center = (shortcut_left + shortcut_right) * 0.5;
         let title_center = title.rect().center().x;
         assert!(
@@ -6914,9 +8171,12 @@ mod tab_tests {
     /// 曾以"＋右侧 60px"为锚点；项目按钮插入 ＋ 与 `>_` 之间后该点落在按钮上，
     /// 改为以 `>_` 为基准（其右侧到齿轮之间为连续空白）。
     fn titlebar_gap_pos(harness: &mut egui_kittest::Harness<MinoApp>) -> egui::Pos2 {
-        use kittest::Queryable as _;
-        let ssh = harness.get_by_label(">_");
-        egui::pos2(ssh.rect().right() + 40.0, ssh.rect().center().y)
+        // 拖拽区在顶部标题条（Kaku 集成标题栏样式）：取整条的水平中点、
+        // 竖直中心——避开左上角红绿灯预留区（约 80pt）且条上无其它控件。
+        let width = harness
+            .ctx
+            .input(|i| i.raw.screen_rect.map(|r| r.width()).unwrap_or(800.0));
+        egui::pos2(width * 0.5, 14.0)
     }
 
     /// 本地会话默认工作目录为 home（Finder 启动 cwd=/ 时终端应落在 ~）。
@@ -7053,6 +8313,7 @@ mod dblclick_probe {
 
 #[cfg(test)]
 mod settings_tests {
+    use super::workspace_test_support::open_workspace_menu;
     use super::*;
 
     /// 设置标题区的品牌图标即使被指针悬浮，也不应绘制光晕图元。
@@ -7176,13 +8437,15 @@ mod settings_tests {
         harness.run_steps(6);
 
         // 用足够多的主机条目撑高设置内容，确保设置 ScrollArea 可滚动。
-        harness.state_mut().config.hosts = (0..12)
-            .map(|index| HostProfile {
+        harness.state_mut().config.workspaces = (0..12)
+            .map(|index| Workspace::Ssh {
                 name: format!("测试主机 {index}"),
                 host: "127.0.0.1".into(),
                 port: 22,
                 user: "root".into(),
-                auth: Auth::Password(String::new()),
+                auth: mino_core::config::Auth::Password(String::new()),
+                path: String::new(),
+                command: String::new(),
             })
             .collect();
         harness.state_mut().show_settings = true;
@@ -7191,7 +8454,7 @@ mod settings_tests {
         // 人工构造 scrollback 并先向上滚动；若滚轮穿透，向下滚时该值会变小。
         {
             let term = harness.state().tabs[harness.state().active_tab]
-                .terminal
+                .active_view()
                 .session()
                 .term();
             let mut guard = term.lock();
@@ -7203,7 +8466,7 @@ mod settings_tests {
         }
         let terminal_offset_before = {
             let term = harness.state().tabs[harness.state().active_tab]
-                .terminal
+                .active_view()
                 .session()
                 .term();
             let guard = term.lock();
@@ -7225,7 +8488,7 @@ mod settings_tests {
 
         let terminal_offset_after = {
             let term = harness.state().tabs[harness.state().active_tab]
-                .terminal
+                .active_view()
                 .session()
                 .term();
             let guard = term.lock();
@@ -7263,7 +8526,7 @@ mod settings_tests {
         }
         // 打开后渲染"主机管理"分组。
         assert!(harness.state().show_settings, "⌘, 应打开设置弹窗");
-        harness.get_by_label("主机管理");
+        harness.get_by_label("工作区");
 
         // 再按 ⌘, 关闭。
         harness.event(egui::Event::Key {
@@ -7303,7 +8566,7 @@ mod settings_tests {
             modifiers: egui::Modifiers::COMMAND,
         });
         harness.run_steps(3);
-        assert!(harness.state().show_new_conn);
+        assert!(harness.state().workspace_edit.is_some());
         assert!(!harness.state().show_settings);
 
         harness.event(egui::Event::Key {
@@ -7314,7 +8577,10 @@ mod settings_tests {
             modifiers: egui::Modifiers::NONE,
         });
         harness.run_steps(3);
-        assert!(!harness.state().show_new_conn, "Esc 应关闭新建连接对话框");
+        assert!(
+            !harness.state().workspace_edit.is_some(),
+            "Esc 应关闭新建连接对话框"
+        );
         assert!(harness.state().show_settings, "Esc 后应恢复设置弹窗");
 
         harness.event(egui::Event::Key {
@@ -7335,7 +8601,7 @@ mod settings_tests {
             modifiers: egui::Modifiers::COMMAND,
         });
         harness.run_steps(3);
-        assert!(harness.state().show_new_conn);
+        assert!(harness.state().workspace_edit.is_some());
 
         harness.event(egui::Event::Key {
             key: egui::Key::Escape,
@@ -7345,7 +8611,10 @@ mod settings_tests {
             modifiers: egui::Modifiers::NONE,
         });
         harness.run_steps(3);
-        assert!(!harness.state().show_new_conn, "Esc 应关闭新建连接对话框");
+        assert!(
+            !harness.state().workspace_edit.is_some(),
+            "Esc 应关闭新建连接对话框"
+        );
     }
 
     /// 标签栏齿轮按钮存在且在标签栏最右侧（> 200 px）。
@@ -7372,15 +8641,16 @@ mod settings_tests {
             harness.step();
         }
         assert!(harness.state().show_settings, "齿轮点击应打开设置弹窗");
-        harness.get_by_label("主机管理");
+        harness.get_by_label("工作区");
     }
 
-    /// 回归：关闭新建连接对话框后再次打开，不能带出上一次填写的内容。
+    /// 工作区编辑每次打开都重置：关闭丢弃输入、重开回到默认值；
+    /// 打开期间重复 ⌘N 不打断正在填写的表单。
     #[test]
-    fn 新建连接每次打开都重置表单() {
+    fn 工作区编辑每次打开都重置表单() {
         use kittest::Queryable;
 
-        let config_path = test_config_path("new-conn-reset");
+        let config_path = test_config_path("workspace-edit-reset");
         let mut harness = egui_kittest::Harness::new_eframe(|cc| {
             MinoApp::new_with_config(cc, config_path.clone())
         });
@@ -7394,10 +8664,9 @@ mod settings_tests {
             modifiers: egui::Modifiers::COMMAND,
         });
         harness.run_steps(3);
-        harness.get_by_label("新建连接").click();
+        harness.get_by_label("新增 SSH 主机").click();
         harness.run_steps(3);
 
-        // 显式点击名称输入框，写入一段应被下一次打开清除的内容。
         let name_input = harness
             .root()
             .query_all_by_role(accesskit::Role::TextInput)
@@ -7407,7 +8676,14 @@ mod settings_tests {
         harness.run_steps(2);
         harness.event(egui::Event::Text("上一次连接".into()));
         harness.run_steps(3);
-        assert_eq!(harness.state().form.name, "上一次连接");
+        assert_eq!(
+            harness
+                .state()
+                .workspace_edit
+                .as_ref()
+                .map(|e| e.name.clone()),
+            Some("上一次连接".to_string())
+        );
 
         // 弹窗已经打开时重复按 ⌘N 不应重置用户正在填写的表单。
         harness.event(egui::Event::Key {
@@ -7418,52 +8694,72 @@ mod settings_tests {
             modifiers: egui::Modifiers::COMMAND,
         });
         harness.run_steps(3);
-        assert_eq!(harness.state().form.name, "上一次连接");
+        assert_eq!(
+            harness
+                .state()
+                .workspace_edit
+                .as_ref()
+                .map(|e| e.name.clone()),
+            Some("上一次连接".to_string())
+        );
 
         harness.get_by_label("取消").click();
         harness.run_steps(3);
-        assert!(!harness.state().show_new_conn, "取消后对话框应关闭");
+        assert!(
+            harness.state().workspace_edit.is_none(),
+            "取消后对话框应关闭"
+        );
 
-        harness.get_by_label("新建连接").click();
+        harness.get_by_label("新增 SSH 主机").click();
         harness.run_steps(3);
-        assert!(harness.state().show_new_conn, "第二次点击应重新打开对话框");
-        assert_eq!(harness.state().form.name, "", "名称不应残留");
-        assert_eq!(harness.state().form.host, "", "主机不应残留");
-        assert_eq!(harness.state().form.password, "", "密码不应残留");
-        assert_eq!(harness.state().form.user, "root", "默认用户名应恢复");
-        assert_eq!(harness.state().form.port, "22", "默认端口应恢复");
+        assert!(
+            harness.state().workspace_edit.is_some(),
+            "第二次点击应重新打开对话框"
+        );
+        let edit = harness
+            .state()
+            .workspace_edit
+            .as_ref()
+            .expect("工作区编辑表单应存在");
+        assert_eq!(edit.name, "", "名称不应残留");
+        assert_eq!(edit.host, "", "主机不应残留");
+        assert_eq!(edit.password, "", "密码不应残留");
+        assert_eq!(edit.user, "root", "默认用户名应恢复");
+        assert_eq!(edit.port, "22", "默认端口应恢复");
 
         std::fs::remove_file(&config_path).ok();
     }
 
-    /// 回归：主机行的身份列和认证列不应受名称长度影响而漂移。
-    /// 认证列右对齐固定槽位，故断言右缘对齐（而非左缘）。
+    /// 工作区列表行：短名与长名的名称/详情左缘对齐（行模板共用）。
     #[test]
-    fn 设置主机卡片列对齐() {
+    fn 工作区列表行对齐() {
         use kittest::Queryable;
 
-        let config_path = test_config_path("host-card-align");
+        let config_path = test_config_path("workspace-card-align");
         let config = HostConfig {
-            hosts: vec![
-                HostProfile {
+            workspaces: vec![
+                Workspace::Ssh {
                     name: "短名".into(),
                     host: "10.0.0.1".into(),
                     port: 22,
                     user: "root".into(),
-                    auth: Auth::Password("x".into()),
+                    auth: mino_core::config::Auth::Password("x".into()),
+                    path: String::new(),
+                    command: String::new(),
                 },
-                HostProfile {
-                    name: "一个很长的主机显示名称".into(),
+                Workspace::Ssh {
+                    name: "一个很长的工作区显示名称".into(),
                     host: "192.168.31.233".into(),
                     port: 22022,
                     user: "ubuntu".into(),
-                    auth: Auth::Key {
+                    auth: mino_core::config::Auth::Key {
                         path: PathBuf::from("~/.ssh/id_ed25519"),
                         passphrase: None,
                     },
+                    path: String::new(),
+                    command: String::new(),
                 },
             ],
-            projects: Vec::new(),
             ..Default::default()
         };
         config.save(&config_path).expect("写入测试配置失败");
@@ -7482,38 +8778,49 @@ mod settings_tests {
         harness.run_steps(3);
 
         let short_name = harness.get_by_label("短名").rect();
-        let long_name = harness.get_by_label("一个很长的主机显示名称").rect();
-        let short_addr = harness.get_by_label("root@10.0.0.1:22").rect();
+        let long_name = harness.get_by_label("一个很长的工作区显示名称").rect();
+        let short_addr = harness.get_by_label("root@10.0.0.1").rect();
         let long_addr = harness.get_by_label("ubuntu@192.168.31.233:22022").rect();
-        let password = harness.get_by_label("PASSWORD").rect();
-        let key = harness.get_by_label("SSH KEY").rect();
+        // 类型徽标两行同列。
+        let badges: Vec<_> = harness.root().query_all_by_label("SSH").collect();
+        assert!(badges.len() >= 2, "两行都应有 SSH 类型徽标");
 
-        assert!((short_name.left() - long_name.left()).abs() < 1.0);
-        assert!((short_name.left() - short_addr.left()).abs() < 1.0);
-        assert!((long_name.left() - long_addr.left()).abs() < 1.0);
-        assert!((password.right() - key.right()).abs() < 1.0);
+        assert!(
+            (short_name.left() - long_name.left()).abs() < 1.0,
+            "短名与长名应左对齐：{} vs {}",
+            short_name.left(),
+            long_name.left()
+        );
+        assert!(
+            (short_name.left() - short_addr.left()).abs() < 1.0,
+            "名称与详情应同一列"
+        );
+        assert!(
+            (long_name.left() - long_addr.left()).abs() < 1.0,
+            "长名与详情应同一列"
+        );
 
         std::fs::remove_file(&config_path).ok();
     }
 
-    /// 标签栏 ">_" 快捷按钮：点击弹出已保存主机列表，单击主机行直接发起
-    /// 连接（隔离配置路径，不碰用户真实 hosts.toml）。
+    /// 标签栏「工作区」按钮：点击弹出统一列表，单击 SSH 行直接发起连接。
     #[test]
-    fn ssh快捷按钮连接主机() {
+    fn 工作区菜单连接主机() {
         use kittest::Queryable;
 
-        let config_path = test_config_path("ssh-quick");
+        let config_path = test_config_path("workspace-quick");
         let config = HostConfig {
-            hosts: vec![HostProfile {
+            workspaces: vec![Workspace::Ssh {
                 name: "快捷主机".into(),
                 host: "127.0.0.1".into(),
                 // 端口 9（discard）必然拒绝连接：只验证"发起连接"，
                 // 不依赖测试 sshd。
                 port: 9,
                 user: "root".into(),
-                auth: Auth::Password("x".into()),
+                auth: mino_core::config::Auth::Password("x".into()),
+                path: String::new(),
+                command: String::new(),
             }],
-            projects: Vec::new(),
             ..Default::default()
         };
         config.save(&config_path).expect("写入测试配置失败");
@@ -7523,76 +8830,73 @@ mod settings_tests {
         });
         harness.run_steps(6);
 
-        // 点击 ">_" → 弹出主机菜单（主机名可见）。
-        harness.get_by_label(">_").click();
-        harness.run_steps(6);
+        open_workspace_menu(&mut harness);
         harness.get_by_label("快捷主机");
 
-        // 单击主机行 → 直接发起连接（pending_label 记录目标主机）。
         harness.get_by_label("快捷主机").click();
         harness.run_steps(6);
         assert_eq!(
             harness.state().pending_label,
             "快捷主机",
-            "单击主机行应直接发起连接"
+            "单击 SSH 工作区行应直接发起连接"
         );
-        // 弹出菜单应已关闭（user@host 行不再可见）。
         assert!(
             harness
                 .root()
                 .query_all_by_label("root@127.0.0.1")
                 .next()
                 .is_none(),
-            "点击主机行后快捷菜单应关闭"
+            "点击工作区行后快捷菜单应关闭"
         );
 
         std::fs::remove_file(&config_path).ok();
     }
 
-    /// 无已保存主机时，" >_" 快捷菜单应提示并引导新建连接。
+    /// 无工作区时，「工作区」快捷菜单应提示并可新增。
     #[test]
-    fn ssh快捷按钮无主机提示() {
+    fn 工作区菜单无条目提示() {
         use kittest::Queryable;
 
-        let config_path = test_config_path("ssh-quick-empty");
+        let config_path = test_config_path("workspace-quick-empty");
         let mut harness = egui_kittest::Harness::new_eframe(|cc| {
             MinoApp::new_with_config(cc, config_path.clone())
         });
         harness.run_steps(6);
 
-        harness.get_by_label(">_").click();
-        harness.run_steps(6);
-        harness.get_by_label("暂无已保存主机");
-        harness.get_by_label("新建连接");
+        open_workspace_menu(&mut harness);
+        harness.get_by_label("暂无工作区");
+        harness.get_by_label("新增工作区…");
 
         std::fs::remove_file(&config_path).ok();
     }
 
-    /// 快捷菜单行：短名称与长名称左缘对齐（不因 add_sized 居中），
-    /// 名称与 user@host 同一列。
+    /// 工作区菜单行：短名与长名的名称/详情左缘对齐（行模板共用）。
     #[test]
-    fn ssh快捷菜单行左对齐() {
+    fn 工作区菜单行左对齐() {
         use kittest::Queryable;
 
-        let config_path = test_config_path("ssh-quick-align");
+        let config_path = test_config_path("workspace-quick-align");
         let config = HostConfig {
-            hosts: vec![
-                HostProfile {
+            workspaces: vec![
+                Workspace::Ssh {
                     name: "短名".into(),
                     host: "10.0.0.1".into(),
                     port: 9,
                     user: "root".into(),
-                    auth: Auth::Password("x".into()),
+                    auth: mino_core::config::Auth::Password("x".into()),
+                    path: String::new(),
+                    command: String::new(),
                 },
-                HostProfile {
-                    name: "很长的主机名称对齐".into(),
+                Workspace::Ssh {
+                    name: "很长的工作区名称对齐".into(),
                     host: "192.168.31.233".into(),
                     port: 9,
                     user: "ubuntu".into(),
-                    auth: Auth::Password("x".into()),
+                    auth: mino_core::config::Auth::Password("x".into()),
+                    path: String::new(),
+                    command: String::new(),
                 },
             ],
-            projects: Vec::new(),
             ..Default::default()
         };
         config.save(&config_path).expect("写入测试配置失败");
@@ -7601,38 +8905,26 @@ mod settings_tests {
             MinoApp::new_with_config(cc, config_path.clone())
         });
         harness.run_steps(6);
-        harness.get_by_label(">_").click();
-        harness.run_steps(6);
+        open_workspace_menu(&mut harness);
 
         let short = harness.get_by_label("短名").rect();
-        let long = harness.get_by_label("很长的主机名称对齐").rect();
-        let short_addr = harness.get_by_label("root@10.0.0.1").rect();
-        let long_addr = harness.get_by_label("ubuntu@192.168.31.233").rect();
+        let long = harness.get_by_label("很长的工作区名称对齐").rect();
+        let short_addr = harness.get_by_label("root@10.0.0.1:9").rect();
+        let long_addr = harness.get_by_label("ubuntu@192.168.31.233:9").rect();
 
         assert!(
             (short.left() - long.left()).abs() < 1.0,
-            "短名称与长名称应左对齐（曾被 add_sized 居中），短={:.1} 长={:.1}",
+            "短名与长名应左对齐：短={:.1} 长={:.1}",
             short.left(),
             long.left()
         );
         assert!(
             (short.left() - short_addr.left()).abs() < 1.0,
-            "名称与地址应同一列左对齐，名称={:.1} 地址={:.1}",
-            short.left(),
-            short_addr.left()
+            "名称与地址应同一列左对齐"
         );
         assert!(
             (long.left() - long_addr.left()).abs() < 1.0,
-            "长名称与地址应同一列左对齐"
-        );
-        // 短名称若被居中，右缘会靠近/越过两列内容的水平中线。
-        let menu_right = long.right().max(long_addr.right());
-        let menu_center = (short.left() + menu_right) * 0.5;
-        assert!(
-            short.right() < menu_center,
-            "短名称右缘应在内容中线左侧（居中时会越过中线），right={:.1} center={:.1}",
-            short.right(),
-            menu_center
+            "长名与地址应同一列左对齐"
         );
 
         std::fs::remove_file(&config_path).ok();
@@ -7641,6 +8933,7 @@ mod settings_tests {
 
 #[cfg(test)]
 mod project_tests {
+    use super::workspace_test_support::open_workspace_menu;
     use super::*;
     use std::time::{Duration, Instant};
 
@@ -7651,38 +8944,23 @@ mod project_tests {
         base
     }
 
-    /// 点击标签栏项目按钮（`>_` 左侧最近的 Button；标签栏顺序 ＋ → 项目 → `>_`）。
-    fn open_project_menu(harness: &mut egui_kittest::Harness<MinoApp>) {
-        use kittest::Queryable;
-        let ssh_left = harness.get_by_label(">_").rect().left();
-        harness
-            .root()
-            .query_all_by_role(accesskit::Role::Button)
-            .filter(|n| n.rect().right() < ssh_left)
-            .max_by(|a, b| a.rect().right().partial_cmp(&b.rect().right()).unwrap())
-            .expect("项目按钮应在 >_ 左侧")
-            .click();
-        harness.run_steps(6);
-    }
-
-    /// 快捷菜单单击好路径行打开新本地标签；坏路径行只 toast、不建 tab。
+    /// 快捷菜单单击本地工作区打开新标签；坏路径只 toast、不建标签。
     #[test]
-    fn 项目菜单单击打开新标签() {
+    fn 工作区菜单单击打开新标签() {
         use kittest::Queryable;
         let base = project_base("menu");
         let dir_a = base.join("alpha");
         std::fs::create_dir_all(&dir_a).unwrap();
 
-        let config_path = test_config_path("projects-menu");
+        let config_path = test_config_path("workspaces-menu");
         let config = HostConfig {
-            hosts: Vec::new(),
-            projects: vec![
-                ProjectProfile {
-                    name: "项目甲".into(),
+            workspaces: vec![
+                Workspace::Local {
+                    name: "工作区甲".into(),
                     path: dir_a.clone(),
                     command: String::new(),
                 },
-                ProjectProfile {
+                Workspace::Local {
                     name: "坏路径".into(),
                     path: base.join("gone"),
                     command: String::new(),
@@ -7698,34 +8976,37 @@ mod project_tests {
         harness.run_steps(6);
         let tabs_before = harness.state().tabs.len();
 
-        open_project_menu(&mut harness);
-        harness.get_by_label("项目甲");
+        open_workspace_menu(&mut harness);
+        harness.get_by_label("工作区甲");
 
-        harness.get_by_label("项目甲").click();
+        harness.get_by_label("工作区甲").click();
         harness.run_steps(6);
         assert_eq!(
             harness.state().tabs.len(),
             tabs_before + 1,
-            "单击项目行应打开新标签"
+            "单击本地工作区行应打开新标签"
         );
         let active = harness.state().active_tab;
         assert!(
-            !harness.state().tabs[active].terminal.session().is_remote(),
-            "项目打开的应是本地标签"
+            !harness.state().tabs[active]
+                .active_view()
+                .session()
+                .is_remote(),
+            "本地工作区打开的应是本地标签"
         );
 
-        open_project_menu(&mut harness);
+        open_workspace_menu(&mut harness);
         harness.get_by_label("坏路径").click();
         harness.run_steps(6);
         assert_eq!(
             harness.state().tabs.len(),
             tabs_before + 1,
-            "坏路径项目不应新建标签"
+            "坏路径不应新建标签"
         );
         let toast = harness.state().toast.as_ref().expect("应有错误提示");
         assert!(toast.is_error, "坏路径应为错误提示");
         assert!(
-            toast.message.contains("项目目录不存在"),
+            toast.message.contains("目录不存在"),
             "错误提示应说明目录不存在：{}",
             toast.message
         );
@@ -7734,7 +9015,7 @@ mod project_tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
-    /// ⌘O 打开面板 → 输入过滤词只剩一项 → 回车打开新标签并关闭面板。
+    /// ⌘O 打开工作区面板 → 输入过滤词只剩一项 → 回车打开新标签并关闭面板。
     #[test]
     fn 面板搜索过滤与回车打开() {
         use kittest::Queryable;
@@ -7744,17 +9025,16 @@ mod project_tests {
         std::fs::create_dir_all(&dir_a).unwrap();
         std::fs::create_dir_all(&dir_b).unwrap();
 
-        let config_path = test_config_path("projects-panel");
+        let config_path = test_config_path("workspaces-panel");
         let config = HostConfig {
-            hosts: Vec::new(),
-            projects: vec![
-                ProjectProfile {
-                    name: "项目甲".into(),
+            workspaces: vec![
+                Workspace::Local {
+                    name: "工作区甲".into(),
                     path: dir_a.clone(),
                     command: String::new(),
                 },
-                ProjectProfile {
-                    name: "项目乙".into(),
+                Workspace::Local {
+                    name: "工作区乙".into(),
                     path: dir_b.clone(),
                     command: String::new(),
                 },
@@ -7777,15 +9057,19 @@ mod project_tests {
             modifiers: egui::Modifiers::COMMAND,
         });
         harness.run_steps(6);
-        assert!(harness.state().show_projects, "⌘O 应打开项目面板");
-        harness.get_by_label("打开项目");
+        assert!(harness.state().show_workspaces, "⌘O 应打开工作区面板");
+        harness.get_by_label("工作区");
 
         harness.event(egui::Event::Text("甲".into()));
         harness.run_steps(6);
-        harness.get_by_label("项目甲");
+        harness.get_by_label("工作区甲");
         assert!(
-            harness.root().query_all_by_label("项目乙").next().is_none(),
-            "过滤后项目乙不应再可见"
+            harness
+                .root()
+                .query_all_by_label("工作区乙")
+                .next()
+                .is_none(),
+            "过滤后工作区乙不应再可见"
         );
 
         harness.event(egui::Event::Key {
@@ -7796,28 +9080,28 @@ mod project_tests {
             modifiers: egui::Modifiers::NONE,
         });
         harness.run_steps(6);
-        assert!(!harness.state().show_projects, "回车打开后面板应关闭");
+        assert!(!harness.state().show_workspaces, "回车打开后面板应关闭");
         assert_eq!(
             harness.state().tabs.len(),
             tabs_before + 1,
-            "回车应打开选中项目的新标签"
+            "回车应打开选中工作区的新标签"
         );
 
         std::fs::remove_file(&config_path).ok();
         std::fs::remove_dir_all(&base).ok();
     }
 
-    /// ⌘D 收藏当前目录并落盘；再按一次去重，数量不变。
+    /// ⌘B 收藏当前目录为工作区并落盘；再按一次去重，数量不变。
     #[test]
-    fn 收藏当前目录并落盘() {
-        let config_path = test_config_path("projects-bookmark");
+    fn 收藏当前目录为工作区() {
+        let config_path = test_config_path("workspace-bookmark");
         let mut harness = egui_kittest::Harness::new_eframe(|cc| {
             MinoApp::new_with_config(cc, config_path.clone())
         });
         harness.run_steps(6);
 
         harness.event(egui::Event::Key {
-            key: egui::Key::D,
+            key: egui::Key::B,
             physical_key: None,
             pressed: true,
             repeat: false,
@@ -7825,25 +9109,28 @@ mod project_tests {
         });
         harness.run_steps(6);
         assert_eq!(
-            harness.state().config.projects.len(),
+            harness.state().config.workspaces.len(),
             1,
-            "⌘D 应收藏当前目录"
+            "⌘B 应收藏当前目录为工作区"
         );
         let home_canon = std::fs::canonicalize(std::env::var("HOME").expect("测试环境应有 HOME"))
             .expect("规范化 HOME 失败");
-        assert_eq!(
-            harness.state().config.projects[0].path,
-            home_canon,
-            "新建终端的当前目录应为 HOME"
-        );
+        let Workspace::Local { path, .. } = &harness.state().config.workspaces[0] else {
+            panic!("收藏当前目录应得到本地工作区");
+        };
+        assert_eq!(*path, home_canon, "新建终端的当前目录应为 HOME");
         let content = std::fs::read_to_string(&config_path).expect("配置应已落盘");
         assert!(
             content.contains(home_canon.to_string_lossy().as_ref()),
             "落盘 toml 应含收藏路径：{content}"
         );
+        assert!(
+            content.contains("kind = \"local\""),
+            "落盘应使用统一工作区格式：{content}"
+        );
 
         harness.event(egui::Event::Key {
-            key: egui::Key::D,
+            key: egui::Key::B,
             physical_key: None,
             pressed: true,
             repeat: false,
@@ -7851,29 +9138,32 @@ mod project_tests {
         });
         harness.run_steps(6);
         assert_eq!(
-            harness.state().config.projects.len(),
+            harness.state().config.workspaces.len(),
             1,
             "重复收藏同一目录不应新增"
         );
 
         std::fs::remove_file(&config_path).ok();
     }
-    /// 回归（用户报告“cd 后收藏的还是启动目录”）：粘贴 `cd` 让输入跟踪
-    /// `invalidate` 后，收藏必须用 shell 真正所在的目录（内核 cwd，与标题
-    /// 同源），不能停在跟踪旧值。仅 macOS：Linux 无内核 cwd 接口。
-    #[cfg(target_os = "macos")]
+
+    /// 粘贴 `cd` 致输入跟踪失效后，⌘B 收藏的仍是内核真实目录。
+    ///
+    /// 仅 macOS 有效（依赖 `PROC_PIDVNODEPATHINFO`）：目录取
+    /// `fresh_local_directory`（内核 cwd 优先），不走纯跟踪值。
     #[test]
+    #[cfg(target_os = "macos")]
     fn 粘贴cd后收藏真实目录() {
-        use std::time::{Duration, Instant};
-        let base = project_base("bookmark-stale");
-        let target = base.join("real");
+        let base = project_base("bookmark-fresh");
+        let target = base.join("target-dir");
         std::fs::create_dir_all(&target).unwrap();
-        let config_path = test_config_path("projects-bookmark-stale");
+        let config_path = test_config_path("workspace-bookmark-fresh");
         let mut harness = egui_kittest::Harness::new_eframe(|cc| {
             MinoApp::new_with_config(cc, config_path.clone())
         });
         harness.run_steps(6);
-        harness.event(egui::Event::Text("printf __MINO_BOOKMARK_READY__".into()));
+        // 等 shell 就绪：打一条标记命令并等回显（目录名不含固定串，
+        // 用命令本身做信号最可靠）。
+        harness.event(egui::Event::Text("echo __MINO_BOOKMARK_READY__".into()));
         harness.event(egui::Event::Key {
             key: egui::Key::Enter,
             physical_key: None,
@@ -7881,22 +9171,23 @@ mod project_tests {
             repeat: false,
             modifiers: egui::Modifiers::default(),
         });
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
         let mut ready = false;
-        while Instant::now() < deadline {
+        while std::time::Instant::now() < deadline {
             harness.step();
             let text = crate::views::terminal_view::tests_grid_text(
-                harness.state().tabs[harness.state().active_tab]
-                    .terminal
-                    .session(),
+                harness.state().tabs[0].active_view().session(),
             );
-            if text.contains("__MINO_BOOKMARK_READY__") {
+            if text.contains("__MINO_BOOKMARK_READY__")
+                && text.matches("__MINO_BOOKMARK_READY__").count() >= 2
+            {
                 ready = true;
                 break;
             }
-            std::thread::sleep(Duration::from_millis(60));
+            std::thread::sleep(std::time::Duration::from_millis(60));
         }
         assert!(ready, "zsh 未就绪");
+        // 粘贴 cd（跟踪器对粘贴文本不做解析 → 失效路径），等内核 cwd 跟上。
         harness.event(egui::Event::Paste(format!("cd {}", target.display())));
         harness.event(egui::Event::Key {
             key: egui::Key::Enter,
@@ -7905,49 +9196,53 @@ mod project_tests {
             repeat: false,
             modifiers: egui::Modifiers::default(),
         });
-        harness.run_steps(6);
         let expected = std::fs::canonicalize(&target).expect("规范化测试目录失败");
-        let expected_text = expected.to_string_lossy().into_owned();
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
         loop {
             harness.step();
-            let dir = harness.state().tabs[harness.state().active_tab]
-                .terminal
+            let dir = harness.state().tabs[0]
+                .active_view()
                 .effective_local_directory();
-            if dir.as_deref() == Some(expected_text.as_str()) {
+            if dir.as_deref() == Some(expected.to_string_lossy().as_ref()) {
                 break;
             }
             assert!(
-                Instant::now() < deadline,
-                "内核 cwd 未跟随到目标目录，当前：{dir:?}（期望 {expected_text}）"
+                std::time::Instant::now() < deadline,
+                "内核 cwd 未跟随到目标目录，当前：{dir:?}"
             );
-            std::thread::sleep(Duration::from_millis(60));
+            std::thread::sleep(std::time::Duration::from_millis(60));
         }
-        harness.state_mut().bookmark_current_directory();
-        assert_eq!(harness.state().config.projects.len(), 1, "应收藏一项");
+        harness.event(egui::Event::Key {
+            key: egui::Key::B,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        harness.run_steps(6);
+        let Workspace::Local { path, .. } = &harness.state().config.workspaces[0] else {
+            panic!("收藏当前目录应得到本地工作区");
+        };
         assert_eq!(
-            harness.state().config.projects[0].path,
-            expected,
-            "粘贴 cd 后收藏的应是真实目录"
+            *path, expected,
+            "⌘B 收藏的应是内核真实目录（不是失效的跟踪值）"
         );
         std::fs::remove_file(&config_path).ok();
         std::fs::remove_dir_all(&base).ok();
     }
 
-    /// 项目启动命令在打开后自动执行（终端输出出现标记）。
+    /// 本地工作区的启动命令在首个提示符后自动执行。
     #[test]
     fn 启动命令自动执行() {
         use kittest::Queryable;
-        let base = project_base("cmd");
-        let dir_a = base.join("alpha");
-        std::fs::create_dir_all(&dir_a).unwrap();
+        let base = project_base("command");
+        std::fs::create_dir_all(&base).unwrap();
 
-        let config_path = test_config_path("projects-cmd");
+        let config_path = test_config_path("workspaces-command");
         let config = HostConfig {
-            hosts: Vec::new(),
-            projects: vec![ProjectProfile {
-                name: "命令项目".into(),
-                path: dir_a.clone(),
+            workspaces: vec![Workspace::Local {
+                name: "命令工作区".into(),
+                path: base.clone(),
                 command: "echo MINO_PROJ_MARK".into(),
             }],
             ..Default::default()
@@ -7959,15 +9254,15 @@ mod project_tests {
         });
         harness.run_steps(6);
 
-        open_project_menu(&mut harness);
-        harness.get_by_label("命令项目").click();
+        open_workspace_menu(&mut harness);
+        harness.get_by_label("命令工作区").click();
         let deadline = Instant::now() + Duration::from_secs(8);
         let mut found = false;
         while Instant::now() < deadline {
             harness.step();
             let text = crate::views::terminal_view::tests_grid_text(
                 harness.state().tabs[harness.state().active_tab]
-                    .terminal
+                    .active_view()
                     .session(),
             );
             if text.contains("MINO_PROJ_MARK") {
@@ -7976,7 +9271,7 @@ mod project_tests {
             }
             std::thread::sleep(Duration::from_millis(60));
         }
-        assert!(found, "启动命令未在终端输出中出现");
+        assert!(found, "启动命令应自动执行并出现在终端上");
 
         std::fs::remove_file(&config_path).ok();
         std::fs::remove_dir_all(&base).ok();
@@ -7986,11 +9281,11 @@ mod project_tests {
 #[cfg(test)]
 mod project_manage_tests {
     use super::*;
-    use kittest::NodeT as _;
+    /// 设置里新增本地工作区并落盘（名称 + 使用当前终端目录）。
     #[test]
-    fn 设置项目管理新增并落盘() {
+    fn 设置工作区新增并落盘() {
         use kittest::Queryable;
-        let config_path = test_config_path("projects-manage");
+        let config_path = test_config_path("workspaces-manage");
         let mut harness = egui_kittest::Harness::new_eframe(|cc| {
             MinoApp::new_with_config(cc, config_path.clone())
         });
@@ -8004,30 +9299,33 @@ mod project_manage_tests {
             modifiers: egui::Modifiers::COMMAND,
         });
         harness.run_steps(6);
-        harness.get_by_label("项目管理");
+        harness.get_by_label("工作区");
 
         macro_rules! find_button {
             ($label:expr) => {
                 harness
                     .root()
                     .query_all_by_role(accesskit::Role::Button)
-                    .find(|n| n.accesskit_node().label() == Some($label.to_string()))
+                    .find(|n| {
+                        use kittest::NodeT as _;
+                        n.accesskit_node().label() == Some($label.to_string())
+                    })
                     .unwrap_or_else(|| panic!("找不到按钮：{}", $label))
             };
         }
-        find_button!("新增项目").click();
+        find_button!("新增本地目录").click();
         harness.run_steps(6);
         harness.get_by_label("使用当前终端目录");
 
-        // 表单输入框顺序：名称、路径、启动命令。
+        // 表单输入框顺序（本地分支）：名称、目录、启动命令。
         let inputs: Vec<_> = harness
             .root()
             .query_all_by_role(accesskit::Role::TextInput)
             .collect();
-        assert!(inputs.len() >= 3, "新增表单应有名称/路径/命令输入框");
+        assert!(inputs.len() >= 3, "新增表单应有名称/目录/命令输入框");
         inputs[0].click();
         harness.run_steps(2);
-        harness.event(egui::Event::Text("管理项目".into()));
+        harness.event(egui::Event::Text("管理工作区".into()));
         harness.run_steps(2);
 
         find_button!("使用当前终端目录").scroll_to_me();
@@ -8038,82 +9336,469 @@ mod project_manage_tests {
         harness.run_steps(6);
 
         assert_eq!(
-            harness.state().config.projects.len(),
+            harness.state().config.workspaces.len(),
             1,
-            "保存后应新增一个项目"
+            "保存后应新增一个工作区"
         );
         let home_canon = std::fs::canonicalize(std::env::var("HOME").expect("测试环境应有 HOME"))
             .expect("规范化 HOME 失败");
-        assert_eq!(harness.state().config.projects[0].name, "管理项目");
-        assert_eq!(harness.state().config.projects[0].path, home_canon);
+        let Workspace::Local { name, path, .. } = &harness.state().config.workspaces[0] else {
+            panic!("新增的应是本地工作区");
+        };
+        assert_eq!(name, "管理工作区");
+        assert_eq!(*path, home_canon);
         let content = std::fs::read_to_string(&config_path).expect("配置应已落盘");
         assert!(
-            content.contains("管理项目"),
-            "落盘 toml 应含新项目：{content}"
+            content.contains("管理工作区"),
+            "落盘 toml 应含新工作区：{content}"
         );
 
         std::fs::remove_file(&config_path).ok();
     }
 
-    /// 新增表单布局回归：保存/取消页脚右对齐，"使用当前终端目录"不再是
-    /// 表单级按钮（本次重构：页脚 `right_to_left` + 行内小操作）。
-    ///
-    /// 断言三件事（都是截图里"散"的直接证据）：
-    /// - 页脚顺序：`right_to_left` 布局里先加的排最右，保存必须在取消之右；
-    /// - 层级："使用当前终端目录"按钮的高度必须明显矮于保存按钮
-    ///   （`field_action_button` 22px vs 页脚 28px），不是同排等权按钮；
-    /// - 位置：行内小操作贴"路径"标签行（纵向距离 < 1 行输入框高 30px），
-    ///   而不是和保存/取消挤在同一行。
+    /// 工作区编辑对话框的页脚：保存/取消右对齐（保存为主按钮在最右）。
     #[test]
-    fn 新增表单页脚右对齐且行内操作分层() {
+    fn 工作区编辑页脚右对齐() {
         use kittest::Queryable;
-        let config_path = test_config_path("projects-layout");
+        let config_path = test_config_path("workspace-footer");
         let mut harness = egui_kittest::Harness::new_eframe(|cc| {
             MinoApp::new_with_config(cc, config_path.clone())
         });
         harness.run_steps(6);
-        harness.event(egui::Event::Key {
-            key: egui::Key::Comma,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::COMMAND,
-        });
+        harness.state_mut().open_workspace_editor(1);
         harness.run_steps(6);
-        harness.get_by_label("项目管理");
 
         macro_rules! find_button {
             ($label:expr) => {
                 harness
                     .root()
                     .query_all_by_role(accesskit::Role::Button)
-                    .find(|n| n.accesskit_node().label() == Some($label.to_string()))
+                    .find(|n| {
+                        use kittest::NodeT as _;
+                        n.accesskit_node().label() == Some($label.to_string())
+                    })
                     .unwrap_or_else(|| panic!("找不到按钮：{}", $label))
             };
         }
-        find_button!("新增项目").click();
+        let save = find_button!("保存").rect();
+        let cancel = find_button!("取消").rect();
+        assert!(
+            save.right() > cancel.right(),
+            "保存（主按钮）应在取消右侧：保存 right={:.1}，取消 right={:.1}",
+            save.right(),
+            cancel.right()
+        );
+        assert!(
+            save.right() > 400.0,
+            "页脚应右对齐到对话框右缘：保存 right={:.1}",
+            save.right()
+        );
+
+        std::fs::remove_file(&config_path).ok();
+    }
+}
+
+/// 测试支持：跨测试模块共用的小工具（避免各模块重复定义）。
+#[cfg(test)]
+mod workspace_test_support {
+    use super::*;
+
+    /// 点击标签栏「工作区」按钮（右端第二个按钮：最右是齿轮）。
+    ///
+    /// 两者都是空文字矢量按钮：按 `Role::Button` + 底部区域 + 右缘排序定位。
+    pub(super) fn open_workspace_menu(harness: &mut egui_kittest::Harness<MinoApp>) {
+        use kittest::Queryable;
+        let mut buttons: Vec<_> = harness
+            .root()
+            .query_all_by_role(accesskit::Role::Button)
+            .filter(|n| n.rect().top() > 560.0)
+            .collect();
+        buttons.sort_by(|a, b| {
+            b.rect()
+                .right()
+                .partial_cmp(&a.rect().right())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        assert!(buttons.len() >= 2, "标签栏应有齿轮与工作区按钮");
+        buttons[1].click();
         harness.run_steps(6);
-        harness.get_by_label("使用当前终端目录");
+    }
+}
 
-        let save = find_button!("保存");
-        let cancel = find_button!("取消");
-        let locate = find_button!("使用当前终端目录");
-        let save_rect = save.rect();
-        let cancel_rect = cancel.rect();
-        let locate_rect = locate.rect();
-        assert!(
-            save_rect.center().x > cancel_rect.center().x,
-            "保存应在取消之右（页脚右对齐）：保存 {save_rect:?} vs 取消 {cancel_rect:?}"
+/// 新增功能回归（分屏/搜索/快照/覆盖层/快捷键族）。
+#[cfg(test)]
+mod kaku_feature_tests {
+    use super::*;
+
+    fn key(
+        harness: &mut egui_kittest::Harness<MinoApp>,
+        key: egui::Key,
+        modifiers: egui::Modifiers,
+    ) {
+        harness.event(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        });
+        harness.run_steps(4);
+    }
+
+    /// ⌘D 右分屏 / ⌘⇧D 下分屏：标签内出现两个窗格、布局树与集合同源；
+    /// 关闭窗格回到单窗格；⌘⇧Enter 放大、⌘⇧S 翻转方向。
+    #[test]
+    fn 分屏拆分与关闭窗格() {
+        let config_path = test_config_path("panes-split");
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            MinoApp::new_with_config(cc, config_path.clone())
+        });
+        harness.run_steps(6);
+        assert_eq!(harness.state().tabs[0].panes.len(), 1, "初始单窗格");
+
+        // ⌘D：左右并排。
+        key(&mut harness, egui::Key::D, egui::Modifiers::COMMAND);
+        assert_eq!(
+            harness.state().tabs[0].panes.len(),
+            2,
+            "⌘D 应分裂出第二窗格"
         );
-        assert!(
-            locate_rect.height() < save_rect.height(),
-            "行内操作应比页脚按钮矮一层：定位 {locate_rect:?} vs 保存 {save_rect:?}",
-        );
-        assert!(
-            (locate_rect.center().y - save_rect.center().y).abs() > save_rect.height(),
-            "行内操作不应与保存同行：定位 {locate_rect:?} vs 保存 {save_rect:?}"
+        // 新窗格在右：布局矩形 x 更大。
+        let rects = harness.state().tabs[0].pane_rects.clone();
+        assert_eq!(rects.len(), 2);
+        let right = rects
+            .iter()
+            .max_by(|a, b| a.1.left().partial_cmp(&b.1.left()).unwrap())
+            .unwrap();
+        assert_eq!(
+            right.0,
+            harness.state().tabs[0].active_pane,
+            "新窗格（右）应获得焦点"
         );
 
+        // ⌘⇧D：在活动窗格上再向下拆分 → 3 个窗格。
+        key(
+            &mut harness,
+            egui::Key::D,
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+        );
+        assert_eq!(
+            harness.state().tabs[0].panes.len(),
+            3,
+            "⌘⇧D 应再分裂一个窗格"
+        );
+
+        // ⌘⇧Enter：放大；再按还原。
+        key(
+            &mut harness,
+            egui::Key::Enter,
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+        );
+        assert!(
+            harness.state().tabs[0].zoomed.is_some(),
+            "⌘⇧Enter 应放大活动窗格"
+        );
+        key(
+            &mut harness,
+            egui::Key::Enter,
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+        );
+        assert!(harness.state().tabs[0].zoomed.is_none(), "再按应还原");
+
+        // ⌘⇧S：翻转最近一层拆分方向（布局树仍与窗格集合一致）。
+        let before = harness.state().tabs[0].layout.clone();
+        key(
+            &mut harness,
+            egui::Key::S,
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+        );
+        assert_ne!(harness.state().tabs[0].layout, before, "⌘⇧S 应翻转拆分方向");
+
+        // ⌘⌥←：焦点移到相邻窗格。
+        let active_before = harness.state().tabs[0].active_pane;
+        key(
+            &mut harness,
+            egui::Key::ArrowLeft,
+            egui::Modifiers::COMMAND | egui::Modifiers::ALT,
+        );
+        assert_ne!(
+            harness.state().tabs[0].active_pane,
+            active_before,
+            "⌘⌥← 应移焦到左侧窗格"
+        );
+
+        // 关闭窗格：⌘W 关掉一个窗格而不是整个标签。
+        key(&mut harness, egui::Key::W, egui::Modifiers::COMMAND);
+        assert_eq!(harness.state().tabs[0].panes.len(), 2, "⌘W 应关窗格");
+        assert_eq!(harness.state().tabs.len(), 1, "标签仍在");
+        key(&mut harness, egui::Key::W, egui::Modifiers::COMMAND);
+        assert_eq!(harness.state().tabs[0].panes.len(), 1, "再关一个");
+        // 最后一个窗格上的 ⌘W → 最小化窗口，标签保留（Kaku 语义）。
+        let mut minimized = false;
+        harness.event(egui::Event::Key {
+            key: egui::Key::W,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        for _ in 0..4 {
+            harness.step();
+            if let Some(vp) = harness
+                .output()
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+            {
+                for cmd in &vp.commands {
+                    if matches!(cmd, egui::ViewportCommand::Minimized(true)) {
+                        minimized = true;
+                    }
+                }
+            }
+        }
+        assert!(minimized, "唯一窗格唯一标签上的 ⌘W 应最小化窗口");
+        assert_eq!(harness.state().tabs.len(), 1);
+
+        std::fs::remove_file(&config_path).ok();
+    }
+
+    /// ⌘⇧W 关闭整个标签（含全部窗格）；⌘⇧T 重开最近关闭的标签。
+    #[test]
+    fn 快捷键关闭与重开标签() {
+        let config_path = test_config_path("panes-close-reopen");
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            MinoApp::new_with_config(cc, config_path.clone())
+        });
+        harness.run_steps(6);
+        key(&mut harness, egui::Key::D, egui::Modifiers::COMMAND);
+        assert_eq!(harness.state().tabs[0].panes.len(), 2);
+        key(&mut harness, egui::Key::T, egui::Modifiers::COMMAND);
+        assert_eq!(harness.state().tabs.len(), 2, "⌘T 新标签");
+
+        // ⌘⇧W：关闭当前标签（不是窗格）。
+        key(
+            &mut harness,
+            egui::Key::W,
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+        );
+        assert_eq!(harness.state().tabs.len(), 1, "⌘⇧W 应关闭整个标签");
+
+        // ⌘⇧T：重开。
+        key(
+            &mut harness,
+            egui::Key::T,
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+        );
+        assert_eq!(harness.state().tabs.len(), 2, "⌘⇧T 应重开标签");
+        std::fs::remove_file(&config_path).ok();
+    }
+
+    /// ⌘K 清屏并清空回滚；⌘F 搜索浮层开关；⌘L AI 面板开关；⌘O 工作区面板。
+    #[test]
+    fn kaku快捷键族() {
+        let config_path = test_config_path("kaku-keys");
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            MinoApp::new_with_config(cc, config_path.clone())
+        });
+        harness.run_steps(6);
+
+        // ⌘F：搜索打开/关闭。
+        key(&mut harness, egui::Key::F, egui::Modifiers::COMMAND);
+        assert!(
+            harness.state().tabs[0].active_view().search_open(),
+            "⌘F 应打开搜索浮层"
+        );
+        // 浮层里输入过滤词（键盘在浮层，不进 PTY）。
+        harness.event(egui::Event::Text("xxx".into()));
+        harness.run_steps(3);
+        key(&mut harness, egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(
+            !harness.state().tabs[0].active_view().search_open(),
+            "Esc 应关闭搜索浮层"
+        );
+
+        // ⌘K：清屏（不崩溃；清空回滚后 offset 归零）。
+        key(&mut harness, egui::Key::K, egui::Modifiers::COMMAND);
+
+        // ⌘L：AI 面板打开/关闭。
+        key(&mut harness, egui::Key::L, egui::Modifiers::COMMAND);
+        assert!(harness.state().ai_panel.is_open(), "⌘L 应打开 AI 面板");
+        key(&mut harness, egui::Key::L, egui::Modifiers::COMMAND);
+        assert!(!harness.state().ai_panel.is_open(), "⌘L 再按应关闭");
+
+        // ⌘O：工作区面板打开/关闭。
+        key(&mut harness, egui::Key::O, egui::Modifiers::COMMAND);
+        assert!(harness.state().show_workspaces, "⌘O 应打开工作区面板");
+        key(&mut harness, egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(!harness.state().show_workspaces, "Esc 应关闭面板");
+
+        std::fs::remove_file(&config_path).ok();
+    }
+
+    /// ⌘⇧O 标签导航器：列出标签、输入过滤、回车切换；⌘⇧P 命令面板：执行动作。
+    #[test]
+    fn 标签导航与命令面板() {
+        use kittest::Queryable;
+        let config_path = test_config_path("launcher-flow");
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            MinoApp::new_with_config(cc, config_path.clone())
+        });
+        harness.run_steps(6);
+        key(&mut harness, egui::Key::T, egui::Modifiers::COMMAND);
+        assert_eq!(harness.state().tabs.len(), 2);
+        harness.state_mut().active_tab = 0;
+
+        // ⌘⇧O：标签导航。
+        key(
+            &mut harness,
+            egui::Key::O,
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+        );
+        assert!(harness.state().launcher.is_some(), "⌘⇧O 应打开标签导航");
+        assert!(
+            harness
+                .root()
+                .query_all_by_label("标签导航")
+                .next()
+                .is_some(),
+            "导航器标题应可见"
+        );
+        // 方向键选择第 2 项并回车切换。
+        key(&mut harness, egui::Key::ArrowDown, egui::Modifiers::NONE);
+        key(&mut harness, egui::Key::Enter, egui::Modifiers::NONE);
+        assert!(harness.state().launcher.is_none(), "确认后浮层应关闭");
+        assert_eq!(harness.state().active_tab, 1, "回车应切换到第二个标签");
+
+        // ⌘⇧P：命令面板执行"新建本地终端标签"。
+        let tabs_before = harness.state().tabs.len();
+        key(
+            &mut harness,
+            egui::Key::P,
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+        );
+        assert!(harness.state().launcher.is_some(), "⌘⇧P 应打开命令面板");
+        harness.event(egui::Event::Text("新建本地".into()));
+        harness.run_steps(4);
+        key(&mut harness, egui::Key::Enter, egui::Modifiers::NONE);
+        assert_eq!(
+            harness.state().tabs.len(),
+            tabs_before + 1,
+            "命令面板应执行新建标签"
+        );
+        std::fs::remove_file(&config_path).ok();
+    }
+
+    /// 窗口快照：保存后文件 0600 且含工作区/本地条目；恢复按条目重建标签。
+    #[test]
+    fn 窗口快照保存与恢复() {
+        let config_path = test_config_path("window-snapshot");
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            MinoApp::new_with_config(cc, config_path.clone())
+        });
+        harness.run_steps(6);
+        key(&mut harness, egui::Key::T, egui::Modifiers::COMMAND);
+        assert_eq!(harness.state().tabs.len(), 2);
+        harness.state().save_window_snapshot();
+
+        let snapshot = harness.state().snapshot_path();
+        let content = std::fs::read_to_string(&snapshot).expect("快照应已写入");
+        assert!(
+            content.contains("kind = \"local\""),
+            "快照应包含本地标签：{content}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&snapshot).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "含凭据的快照必须 0600");
+        }
+
+        // 恢复到既有窗口（追加 2 个标签）。
+        let ctx = harness.ctx.clone();
+        harness.state_mut().restore_window_snapshot(&ctx);
+        harness.run_steps(6);
+        assert_eq!(harness.state().tabs.len(), 4, "恢复应重建两个标签");
+
+        std::fs::remove_file(&config_path).ok();
+        std::fs::remove_file(&snapshot).ok();
+    }
+
+    /// ⌘B 收藏 SSH 工作区：从远程标签的来源档案生成 Ssh 条目（去重）。
+    #[test]
+    fn 收藏远程会话为工作区() {
+        let config_path = test_config_path("workspace-bookmark-ssh");
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            MinoApp::new_with_config(cc, config_path.clone())
+        });
+        harness.run_steps(6);
+        // 直接构造一个"远程标签"（不真连）：用本地会话 + origin 标记。
+        {
+            let state = harness.state_mut();
+            let session = mino_core::terminal::Session::spawn_local(
+                mino_core::terminal::SessionOptions::default(),
+                80,
+                24,
+                std::sync::Arc::new(|_ev: &mino_core::terminal::SessionEvent| {}),
+            )
+            .expect("创建本地终端失败");
+            let mut view = crate::views::terminal_view::TerminalView::new(session);
+            view.set_font_size(state.config.font_size);
+            let profile = HostProfile {
+                name: "线上机".into(),
+                host: "example.internal".into(),
+                port: 2222,
+                user: "deploy".into(),
+                auth: mino_core::config::Auth::Password("secret".into()),
+            };
+            let id = state.allocate_id();
+            let pane_id = state.allocate_id();
+            state.tabs.push(Box::new(TerminalTab::new(
+                id,
+                "线上机".into(),
+                view,
+                pane_id,
+                SessionOrigin::Remote(profile),
+            )));
+            state.active_tab = state.tabs.len() - 1;
+        }
+        harness.run_steps(2);
+        harness.state_mut().bookmark_current_workspace();
+        assert_eq!(harness.state().config.workspaces.len(), 1);
+        let Workspace::Ssh {
+            host, port, user, ..
+        } = &harness.state().config.workspaces[0]
+        else {
+            panic!("远程收藏应得到 Ssh 工作区");
+        };
+        assert_eq!(
+            (host.as_str(), *port, user.as_str()),
+            ("example.internal", 2222, "deploy")
+        );
+        // 去重：再收藏一次数量不变。
+        harness.state_mut().bookmark_current_workspace();
+        assert_eq!(
+            harness.state().config.workspaces.len(),
+            1,
+            "同主机不应重复收藏"
+        );
+        std::fs::remove_file(&config_path).ok();
+    }
+
+    /// ⌘⇧E：应用最近一次 AI 建议（无建议时给出提示而不是 panic）。
+    #[test]
+    fn 应用ai建议路径() {
+        let config_path = test_config_path("ai-apply");
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            MinoApp::new_with_config(cc, config_path.clone())
+        });
+        harness.run_steps(6);
+        key(
+            &mut harness,
+            egui::Key::E,
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+        );
+        let toast = harness.state().toast.as_ref().expect("无建议应有提示");
+        assert!(toast.message.contains("暂无 AI 建议"), "{}", toast.message);
         std::fs::remove_file(&config_path).ok();
     }
 }

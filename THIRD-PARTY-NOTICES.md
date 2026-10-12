@@ -101,7 +101,12 @@
 - 仓库：https://github.com/JetBrains/JetBrainsMono
 - 版本：v2.304（静态 TTF，非 variable）
 - 许可证：SIL Open Font License 1.1（许可证全文见 `crates/mino-app/fonts/OFL.txt`；OFL 允许随软件打包分发）
-- 用途：终端 Monospace 族主字体（Regular / Italic / Bold / BoldItalic 四字重，`main.rs::setup_fonts` 经 `include_bytes!` 编译期嵌入）
+- 用途：终端 Monospace 族主字体，**Regular / Medium / SemiBold 三字重**（Kaku 字重体系：深色主题正文 Regular、粗体 Medium；浅色主题正文 Medium、粗体 SemiBold；`main.rs::setup_fonts` 经 `include_bytes!` 编译期嵌入，按命名族供终端渲染选择）
+
+### Symbols Nerd Font Mono（Nerd Fonts 符号集，随应用打包）
+- 仓库：https://github.com/ryanoasis/nerd-fonts（Symbols-only 子集）
+- 许可证：MIT（许可证全文见 `crates/mino-app/fonts/SymbolsNerdFont-LICENSE.txt`）
+- 用途：等宽符号兜底（私有区图标，如 SSH 锁形 U+F08C0 等），排在 JetBrains Mono 之后
 
 其余字体（Menlo、PingFang / STHeiti）由 macOS 系统提供，不随应用分发。
 

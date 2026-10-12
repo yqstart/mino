@@ -89,6 +89,26 @@ impl WorkdirTracker {
         }
     }
 
+    /// shell 集成上报的权威目录（OSC 7）：直接覆盖推测值。
+    ///
+    /// 输入跟踪在别名/函数/`cd -`/复合命令下会失效，OSC 7 是 shell 自己
+    /// 在每个提示符处上报的真值（本地与远程会话通用）；置位 `cwd_dirty`
+    /// 防止旧逻辑再把它重置回初始 home。
+    pub fn set_directory(&mut self, path: PathBuf) {
+        self.cwd = path;
+        self.valid = true;
+        self.cwd_dirty = true;
+        self.text.clear();
+    }
+
+    /// 当前输入行（提示符后已输入、尚未回车的可见文本）。
+    ///
+    /// 供 AI 失败命令建议与 `#` 自然语言拦截取上下文；跟踪失效时内容
+    /// 可能不完整（调用方自行判断 `valid` 语义）。
+    pub fn current_input(&self) -> &str {
+        &self.text
+    }
+
     /// 设置初始目录，但不覆盖用户已经通过终端输入跟踪到的目录。
     pub fn set_cwd_if_unmodified(&mut self, cwd: PathBuf) {
         if !self.cwd_dirty {

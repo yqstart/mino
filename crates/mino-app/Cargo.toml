@@ -7,6 +7,9 @@ description = "Mino 轻量终端与 SFTP GUI 应用"
 
 [dependencies]
 mino-core = { path = "../mino-core" }
+# 窗口快照（含 SSH 认证信息）的序列化与原子落盘（0600）。
+serde = { workspace = true }
+toml = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
 epaint = { workspace = true }

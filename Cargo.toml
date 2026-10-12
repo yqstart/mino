@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/mino-core", "crates/mino-app"]
 
 [workspace.package]
-version = "1.1.2"
+version = "2.0.0"
 edition = "2021"
 license = "MIT"
 
@@ -29,6 +29,8 @@ bytemuck = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "process", "fs"] }
 # 配置
 serde = { version = "1", features = ["derive"] }
+# AI 客户端：Codex 登录态（auth.json）与 API 响应都是 JSON。
+serde_json = "1"
 toml = "0.9"
 # 工具
 thiserror = "2"

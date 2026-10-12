@@ -22,14 +22,6 @@ use mino_core::terminal::keys::{
 };
 use mino_core::terminal::{Session, SessionEvent, TermMode};
 
-/// 装饰网格线的顶点缓存（面板矩形 / 主题修订号 / 缩放比全都没变时直接复用）。
-struct GridLinesCache {
-    rect: Rect,
-    theme_revision: u64,
-    ppp: f32,
-    mesh: std::sync::Arc<egui::Mesh>,
-}
-
 /// 行缓存：内容 hash 未变时复用已布局文本（Galley），避免每帧重建。
 /// `runs` 与 pixels_per_point 绑定，窗口缩放后需全量失效（见 `show`）。
 #[derive(Clone)]
@@ -40,6 +32,57 @@ struct RowCache {
     runs: Vec<CachedRun>,
     /// 背景段（合并相邻相同背景色，含起止列）。
     backgrounds: Vec<BgRect>,
+    /// 行内裸文本链接（列区间 `[start, end)` + 目标；Kaku 的 Cmd+Click）。
+    text_links: Vec<TextLink>,
+}
+
+/// 行内裸文本链接：终端列区间（半开）与解析后的打开目标。
+type TextLink = (usize, usize, String);
+
+/// 终端右键菜单的选择（Kaku 右键菜单的 Mino 适配）。
+///
+/// 终端本地的动作（复制/粘贴/搜索/清屏…）在 `TerminalView` 内直接执行；
+/// 跨窗格/标签的动作（分屏、关标签、重置字号）进 `pending_menu`，由应用层
+/// 在渲染后统一消费。
+#[derive(Clone)]
+pub enum MenuChoice {
+    OpenLink(String),
+    Copy,
+    Paste,
+    SelectAll,
+    Search,
+    ClearScrollback,
+    ResetFontSize,
+    SplitRight,
+    SplitDown,
+    ClosePane,
+    NewTab,
+    CloseTab,
+}
+
+/// 搜索浮层上的按钮动作（渲染闭包只记录意图，闭包外统一应用）。
+#[derive(Clone, Copy)]
+enum SearchAction {
+    Next,
+    Prev,
+    ToggleCase,
+    Close,
+}
+
+/// 搜索浮层状态（⌘F；Kaku/WezTerm 的滚动缓冲搜索）。
+struct SearchState {
+    query: String,
+    case_sensitive: bool,
+    /// 命中：`(网格行, 起始列, 结束列[半开))`，按网格行升序。
+    matches: Vec<(i32, usize, usize)>,
+    /// 当前命中下标（0 基；matches 为空时无意义）。
+    current: usize,
+    /// 结果集是否待刷新（查询变化立即刷；内容变化按节流置位）。
+    dirty: bool,
+    /// 上次扫描时刻（流式输出下每帧全量扫历史太贵，内容变化按 150ms 节流）。
+    last_scan: std::time::Instant,
+    /// 打开后首帧需要聚焦输入框。
+    needs_focus: bool,
 }
 
 /// 缓存的文本分段（列定位 + 已布局 Galley）。
@@ -69,12 +112,21 @@ struct CachedRun {
     fg: Color32,
 }
 
-/// 宽字符 Galley 缓存键。
+/// 宽字符 Galley 缓存键：`(字符, 前景, 粗体, 斜体, 下划线, 下划线色, 删除线)`。
 ///
 /// 宽字符段恒为单字符，同一（字符, 影响布局的样式）的 Galley 可跨行跨帧复用，
-/// 中文文本字符高度重复，layout 实际只发生一次。粗体不参与——它只经 `fg`
-/// 映射到亮色（见 `singleline_job`）；背景不参与——背景由背景段单独绘制。
-type WideGlyphKey = (char, Color32, bool, UnderlineStyle, Option<Color32>, bool);
+/// 中文文本字符高度重复，layout 实际只发生一次。粗体进键：粗体段用
+/// Medium/SemiBold 命名族，与常规段的字形不同（主题深浅由 `theme_revision`
+/// 统一失效缓存，不进键）；背景不参与——背景由背景段单独绘制。
+type WideGlyphKey = (
+    char,
+    Color32,
+    bool,
+    bool,
+    UnderlineStyle,
+    Option<Color32>,
+    bool,
+);
 
 /// 下划线变体（SGR 4 系列；VT 层 `Flags` 的渲染侧映射）。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -126,6 +178,8 @@ struct LineData {
     cell_keys: Vec<u64>,
     segments: Vec<Segment>,
     backgrounds: Vec<BgRect>,
+    /// 行内裸文本链接（列区间 + 目标）。
+    text_links: Vec<TextLink>,
 }
 
 /// 终端选区中的一个 cell 坐标。
@@ -185,8 +239,30 @@ impl TerminalSelection {
     }
 }
 
-/// 终端内容内边距（文本与面板边缘的间距，参照 Terminal.app 观感）。
-const PADDING: f32 = 10.0;
+/// TerminalView 实例序号（焦点 Id 唯一化；分屏多视图并发）。
+static NEXT_VIEW_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// 终端内容内边距（设备像素，Kaku `get_default_padding` 同源）：
+/// 高分辨率屏 40px、低分辨率屏（ppp ≤ 1）26px；换回 egui 点用 `padding_points`。
+const PADDING_DEVICE_PX: f32 = 40.0;
+
+/// 低分辨率屏的内边距（设备像素）。
+const PADDING_DEVICE_PX_LOW_RES: f32 = 26.0;
+
+/// Kaku 风格内边距：返回 egui 点（= 设备像素 / 缩放比）。
+///
+/// Kaku 的 padding 用**设备像素**而不是点（"pt doubles the visible gutter
+/// on a 2x display, which is where the spacing was tuned"）：在 2x 屏上
+/// 40px = 20pt。底边不内缩（Kaku 底边 0，标签栏在最底部）。
+/// 悬浮控件（终端右上角 SFTP 按钮）与终端内容对齐时复用本函数。
+pub(crate) fn padding_points(ppp: f32) -> f32 {
+    let px = if ppp <= 1.0 {
+        PADDING_DEVICE_PX_LOW_RES
+    } else {
+        PADDING_DEVICE_PX
+    };
+    px / ppp
+}
 
 /// 终端网格的最小列数（窗口被缩到极小时的钳制值）。
 const MIN_TERMINAL_COLS: usize = 20;
@@ -252,6 +328,22 @@ pub struct TerminalView {
     pwd_output_rows: Option<Vec<String>>,
     /// 远程会话的初始目录（由 SFTP realpath(".") 提供）。
     remote_home: Option<std::path::PathBuf>,
+    /// shell 集成状态：`OSC 133;C`（命令开始）之后、`133;D`/`133;A` 之前
+    /// 为 true——命令正在执行（关闭确认 SmartPrompt 的依据）。
+    shell_running: bool,
+    /// 已提交的最后一条命令行（Enter 时快照；AI 失败建议的上下文）。
+    last_command: Option<String>,
+    /// 最近一次命令结束的退出码（未被应用消费前保留）。
+    last_exit: Option<i32>,
+    /// 注意力标记（Bell 或失败命令；标签上的橙色点，Kaku `attention` 同款，
+    /// 标签被激活后由应用层清除）。
+    attention: bool,
+    /// 搜索浮层（⌘F）；Some 时终端不消费键盘输入（键都给浮层输入框）。
+    search: Option<SearchState>,
+    /// 右键菜单待应用层执行的命令（分屏/标签/字号；渲染后由 MinoApp 取走）。
+    pending_menu: Vec<MenuChoice>,
+    /// `# <自然语言>` 命令生成请求（Enter 时拦截；应用层取走并跑 AI）。
+    ai_generate_request: Option<String>,
     /// 上一帧终端是否持有焦点（焦点自动恢复用）。
     had_focus: bool,
     /// 本地目录缓存 `(规范路径, 取值时刻)`。
@@ -274,16 +366,11 @@ pub struct TerminalView {
     damaged_bits: Vec<Option<(usize, usize)>>,
     /// 本帧待布局的行数据（复用缓冲；每帧 `clear`）。
     lines_scratch: Vec<(i32, LineData)>,
-    /// 本帧终端内容区域（`outer` 内缩 `PADDING` 后的矩形）。
+    /// 本帧终端内容区域（`outer` 内边距后的矩形）。
     ///
-    /// Phase C 的行顶点是「行内相对」坐标，`inner.min` 变化必须让所有行
+    /// 行顶点是「行内相对」坐标，`inner.min` 变化必须让所有行
     /// 顶点失效；测试也需要它把网格坐标换算成屏幕坐标做命中断言。
     last_inner: Rect,
-    /// 装饰网格线的已 tessellate 顶点缓存（面板矩形不变时零重建）。
-    ///
-    /// 网格线每帧约 40+26 条，形状完全静态却要重新 tessellate 并逐条提交；
-    /// 缓存成 `Shape::Mesh` 后每帧只提交一个图元。
-    grid_lines_cache: Option<GridLinesCache>,
     /// 组字串的已布局 Galley 缓存 `(文本, 字号, Galley)`。
     ///
     /// 组字期间每帧都重绘，而预编辑串在两次按键之间不变——缓存避免每帧
@@ -430,7 +517,13 @@ impl TerminalView {
             last_ppp: 0.0,
             last_theme_revision: crate::theme::theme_revision(),
             wide_glyphs: HashMap::new(),
-            focus_id: egui::Id::new("terminal_view"),
+            // 焦点 Id 必须**每个视图唯一**：分屏后多个 TerminalView 共享同一
+            // Id 会互相顶掉焦点（点击一个窗格另一个跟着"被聚焦"，分屏的活动
+            // 窗格判定也会永远命中第一个窗格）。
+            focus_id: egui::Id::new((
+                "terminal_view",
+                NEXT_VIEW_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            )),
             initialized: false,
             last_mode: TermMode::NONE,
             last_reported_focus: None,
@@ -438,13 +531,19 @@ impl TerminalView {
             workdir: crate::workdir::WorkdirTracker::new(cwd),
             pwd_output_rows: None,
             remote_home: None,
+            shell_running: false,
+            last_command: None,
+            last_exit: None,
+            attention: false,
+            search: None,
+            pending_menu: Vec::new(),
+            ai_generate_request: None,
             had_focus: false,
             dir_cache: std::cell::RefCell::new(None),
             shapes_scratch: Vec::new(),
             damaged_bits: Vec::new(),
             lines_scratch: Vec::new(),
             last_inner: Rect::NOTHING,
-            grid_lines_cache: None,
             ime_preedit_cache: None,
             gpu: None,
             gpu_rows: crate::views::terminal_gpu::RowBuffers::default(),
@@ -718,6 +817,30 @@ impl TerminalView {
         self.last_inner
     }
 
+    /// 键盘焦点 Id（分屏时 App 用它在焦点变化里判断活动窗格）。
+    pub fn focus_id(&self) -> egui::Id {
+        self.focus_id
+    }
+
+    /// 当前 cell 尺寸 `(宽, 高)`（分屏比例换算用；尚未测量时 None）。
+    pub fn cell_metrics(&self) -> Option<(f32, f32)> {
+        (self.cell_width > 0.0).then_some((self.cell_width, self.cell_height))
+    }
+
+    /// 命令是否正在执行（shell 集成 133;C 之后未见 133;D/A）。
+    ///
+    /// 用于关闭确认（Kaku `SmartPrompt`）：命令运行中关闭标签/窗格先确认。
+    pub fn shell_command_running(&self) -> bool {
+        self.shell_running
+    }
+
+    /// 取走最近一次命令结束的 `(退出码, 命令行)`（供 AI 失败建议与标签
+    /// 注意力点消费；无未被消费的结果时 None）。
+    pub fn take_command_result(&mut self) -> Option<(i32, Option<String>)> {
+        let code = self.last_exit.take()?;
+        Some((code, self.last_command.take()))
+    }
+
     /// 会话引用（供状态栏等读取标题）。
     pub fn session(&self) -> &Session {
         &self.session
@@ -736,7 +859,12 @@ impl TerminalView {
     /// `force` 给远程建连初期的重试窗口用（那几帧必须真发，不能被节流吞掉）。
     fn request_backend_resize(&mut self, force: bool) {
         let now = std::time::Instant::now();
+        // 首次尺寸（首帧布局）立即送达后端：节流只服务于拖拽抖动，首帧被
+        // 吞会让 shell/TUI 按旧尺寸绘制、与门面网格错位（kittest 无真实
+        // 时间流逝，节流窗口永远等不到；实机上则是首屏内容错位一闪）。
+        let first_sync = self.last_backend_resize_at.is_none();
         let due = force
+            || first_sync
             || self
                 .last_backend_resize_at
                 .is_none_or(|at| now.duration_since(at) >= Self::BACKEND_RESIZE_MIN_INTERVAL);
@@ -900,6 +1028,9 @@ impl TerminalView {
                     let until = std::time::Instant::now() + std::time::Duration::from_millis(600);
                     self.bell_until =
                         Some(self.bell_until.map(|prev| prev.max(until)).unwrap_or(until));
+                    // Kaku 的 bell_tab_indicator：标签上亮橙点（背景标签也能
+                    // 看到"有动静"）。
+                    self.attention = true;
                 }
                 // 程序查询终端配色（OSC 4/10/11/12）：VT 仿真层不知道主题，
                 // 必须由这里给出真实颜色，否则查询永无应答，TUI 只能按
@@ -922,6 +1053,29 @@ impl TerminalView {
                     let text = self.clipboard.clipboard_text().unwrap_or_default();
                     let reply = formatter(&text);
                     self.session.write(reply.as_bytes());
+                }
+                // shell 集成：OSC 7 上报的权威工作目录（本地与远程通用；
+                // 远程此前只能靠 cd 文本跟踪，别名/函数场景会停在旧目录）。
+                SessionEvent::Cwd(path) => {
+                    self.workdir.set_directory(std::path::PathBuf::from(path));
+                }
+                // shell 集成：提示符就绪（133;A/B）——命令已结束、shell 空闲。
+                SessionEvent::PromptReady => {
+                    self.shell_running = false;
+                }
+                // shell 集成：命令开始执行（133;C）。
+                SessionEvent::CommandStart => {
+                    self.shell_running = true;
+                }
+                // shell 集成：命令结束与退出码（133;D）：交给应用层消费
+                //（AI 失败建议、标签注意力点）。
+                SessionEvent::CommandFinished(code) => {
+                    self.shell_running = false;
+                    if code != 0 {
+                        // 失败命令同样点亮注意力点（Kaku attention 语义）。
+                        self.attention = true;
+                    }
+                    self.last_exit = Some(code);
                 }
                 // 文本区像素尺寸查询（CSI 14 t）：用实际 cell 尺寸换算。
                 SessionEvent::TextAreaSizeRequest(formatter) => {
@@ -983,9 +1137,11 @@ impl TerminalView {
         self.shapes_scratch.clear();
 
         // 主题会改变默认前景、基本色和终端背景；旧 Galley 与背景段不能跨主题复用。
+        // 宽字符 Galley 缓存同样依赖主题（深浅决定 Regular/Medium 字重族）。
         let theme_revision = crate::theme::theme_revision();
         if self.last_theme_revision != theme_revision {
             self.rows_cache.clear();
+            self.wide_glyphs.clear();
             self.invalidate_row_meshes();
             self.last_theme_revision = theme_revision;
         }
@@ -1056,27 +1212,13 @@ impl TerminalView {
             0.0,
             Color32::from_rgb(term_bg.r, term_bg.g, term_bg.b),
         ));
-        // 低对比网格：提供科技感的空间层次，但不干扰终端文本。
-        // 形状完全静态（只依赖面板矩形与 ppp），缓存成 `Shape::Mesh` 后每帧
-        // 只提交一个图元，不再逐条 line_segment 提交并重新 tessellate。
-        let grid_up_to_date = self
-            .grid_lines_cache
-            .as_ref()
-            .is_some_and(|c| c.rect == outer && c.theme_revision == theme_revision && c.ppp == ppp);
-        if !grid_up_to_date {
-            self.grid_lines_cache = Some(GridLinesCache {
-                rect: outer,
-                theme_revision,
-                ppp,
-                mesh: std::sync::Arc::new(build_grid_lines_mesh(outer, ppp)),
-            });
-        }
-        if let Some(cache) = self.grid_lines_cache.as_ref() {
-            self.shapes_scratch
-                .push(egui::Shape::Mesh(cache.mesh.clone()));
-        }
-        // 终端内容区域：背景铺满面板，文本/光标在内边距内绘制。
-        let inner = outer.shrink(PADDING);
+        // 终端内容区域：背景铺满面板，文本/光标在内边距内绘制（Kaku 风格：
+        // 左右上 40 设备像素、底边 0——标签栏在最底部）。
+        let pad = padding_points(ppp);
+        let inner = Rect::from_min_max(
+            outer.min + Vec2::new(pad, pad),
+            egui::pos2(outer.max.x - pad, outer.max.y),
+        );
         self.last_inner = inner;
 
         // ==================== 事件泵 ====================
@@ -1207,6 +1349,11 @@ impl TerminalView {
         let mut cursor_rect: Option<Rect> = None;
         let mut cursor_color: Option<Color32> = None;
         let cursor_shape: CursorShape;
+        // 光标是否处于闪烁「亮」相位（只影响绘制；候选窗/选区等位置消费者
+        // 不随闪烁跳动——IME 面板每帧重读 rect，闪烁会让它在屏幕上抖）。
+        let cursor_visible: bool;
+        // 本帧是否有内容损坏（搜索命中集需要随之置脏，见锁外节流重扫）。
+        let content_damaged: bool;
         let display_offset: usize;
         // 闪烁重绘意图：锁内置位、锁外统一 `request_repaint_after`。
         let need_blink_repaint: bool;
@@ -1246,6 +1393,7 @@ impl TerminalView {
                 }
             };
             guard.reset_damage();
+            content_damaged = full_damage || damaged.iter().any(|slot| slot.is_some());
 
             let content = guard.renderable_content();
             let colors = content.colors;
@@ -1265,7 +1413,7 @@ impl TerminalView {
             // 闪烁重绘锁外统一安排，不延长持锁时间。
             let blinking = cursor_style.blinking;
             need_blink_repaint = blinking;
-            let cursor_visible = mode.contains(TermMode::SHOW_CURSOR)
+            cursor_visible = mode.contains(TermMode::SHOW_CURSOR)
                 && (!blinking || ((ui_time * 2.0) as u64).is_multiple_of(2));
 
             // 逐显示行：缓存命中（未损坏且 hash 一致）则跳过，否则锁内构建段。
@@ -1338,7 +1486,9 @@ impl TerminalView {
             }
 
             // 光标矩形（Block 之外的光标形状）。
-            if cursor_visible && cursor.shape != CursorShape::Hidden {
+            // 位置计算与闪烁无关：闪烁只决定本帧是否绘制，不决定位置——
+            // IME 候选窗跟随、焦点换算都读这个矩形。
+            if mode.contains(TermMode::SHOW_CURSOR) && cursor.shape != CursorShape::Hidden {
                 let (line, col) = (cursor.point.line.0 as usize, cursor.point.column.0);
                 // 滚动（查看 scrollback）时视口向上偏移 display_offset 行，
                 // 光标网格行号需换算为显示行号；滚出视口则不绘制。
@@ -1359,6 +1509,20 @@ impl TerminalView {
         }
         if need_blink_repaint {
             ctx.request_repaint_after(Duration::from_millis(500));
+        }
+
+        // 搜索命中受内容变化影响：损坏行出现时按 150ms 节流置脏重扫
+        //（流式输出下每帧全量扫历史缓冲太贵）。
+        if content_damaged {
+            if let Some(search) = &mut self.search {
+                if search.last_scan.elapsed() >= Duration::from_millis(150) {
+                    search.dirty = true;
+                }
+            }
+        }
+        // 搜索浮层：键处理 + 结果刷新 + 浮层渲染（锁外）。
+        if self.search.is_some() {
+            self.update_search(ui, inner);
         }
 
         // ==================== 绘制（锁外） ====================
@@ -1384,6 +1548,13 @@ impl TerminalView {
         // 宽字符段恒为单字符，Galley 按 (字符, 样式) 跨行跨帧复用。
         let mut rebuilt_rows_scratch = std::mem::take(&mut self.rebuilt_display_rows);
         rebuilt_rows_scratch.clear();
+        // 命名字重族是否已绑定（`setup_fonts` 注册；裸 Context 的测试回退
+        // 到 Monospace）。定义表是引用，检查一次的开销可忽略。
+        let families_bound = ui.fonts(|f| {
+            f.definitions()
+                .families
+                .contains_key(&egui::FontFamily::Name(crate::MONO_FAMILY_DARK.into()))
+        });
         for (grid_line, data) in &mut lines_data {
             let mut runs = Vec::with_capacity(data.segments.len());
             for seg in &data.segments {
@@ -1392,12 +1563,12 @@ impl TerminalView {
                         if let Some(cached) = self.wide_glyphs.get(&key) {
                             cached.clone()
                         } else {
-                            let galley = layout_segment(ui, seg, self.font_size);
+                            let galley = layout_segment(ui, seg, self.font_size, families_bound);
                             self.wide_glyphs.insert(key, galley.clone());
                             galley
                         }
                     }
-                    None => layout_segment(ui, seg, self.font_size),
+                    None => layout_segment(ui, seg, self.font_size, families_bound),
                 };
                 runs.push(CachedRun {
                     start_col: seg.start_col,
@@ -1415,6 +1586,7 @@ impl TerminalView {
                     runs,
                     // 直接移动所有权：每次重建行少一次 Vec 深拷贝。
                     backgrounds: std::mem::take(&mut data.backgrounds),
+                    text_links: std::mem::take(&mut data.text_links),
                 },
             );
             // 内容变了的显示行必须重建网格顶点（显示行 = 网格行 + display_offset）。
@@ -1499,12 +1671,13 @@ impl TerminalView {
         self.rebuilt_display_rows = rebuilt_rows_scratch;
 
         let origin = inner.min;
-        let selection_bg = Color32::from_rgba_unmultiplied(
-            theme.accent.r(),
-            theme.accent.g(),
-            theme.accent.b(),
-            92,
-        );
+        // 选择高亮：Kaku Dark 是 55% 紫、Kaku Light 是不透明米灰；
+        // 终端选择是方角 cell 矩形（WezTerm 语义），不做圆角。
+        let selection_bg = theme.term_selection_bg;
+        let search_overlay = self
+            .search
+            .as_ref()
+            .map(|s| (s.matches.as_slice(), s.current));
         let shapes = &mut self.shapes_scratch;
         // 悬浮链接命中：绘制循环已经遍历了每行每个 run，在这里顺带判定命中，
         // 避免 `open_hovered_hyperlink` 再整屏遍历一次（rows × runs）。
@@ -1534,7 +1707,37 @@ impl TerminalView {
                             origin + Vec2::new(start as f32 * cell_width, v as f32 * cell_height),
                             Vec2::new((end - start) as f32 * cell_width, cell_height),
                         );
-                        shapes.push(egui::Shape::rect_filled(rect, 2.0, selection_bg));
+                        shapes.push(egui::Shape::rect_filled(rect, 0.0, selection_bg));
+                    }
+                }
+                // 搜索高亮：命中按行升序，二分定位本行的命中区间；当前命中
+                // 用更深的 accent 底以示区分（WezTerm 同款视觉层级）。
+                if let Some((search_matches, search_current)) = search_overlay {
+                    let first = search_matches.partition_point(|(line, _, _)| *line < grid_line);
+                    for (index, &(line, start, end)) in search_matches[first..].iter().enumerate() {
+                        if line != grid_line {
+                            break;
+                        }
+                        let rect = Rect::from_min_size(
+                            origin + Vec2::new(start as f32 * cell_width, v as f32 * cell_height),
+                            Vec2::new((end - start) as f32 * cell_width, cell_height),
+                        );
+                        let color = if first + index == search_current {
+                            egui::Color32::from_rgba_unmultiplied(
+                                theme.accent.r(),
+                                theme.accent.g(),
+                                theme.accent.b(),
+                                120,
+                            )
+                        } else {
+                            egui::Color32::from_rgba_unmultiplied(
+                                theme.accent.r(),
+                                theme.accent.g(),
+                                theme.accent.b(),
+                                56,
+                            )
+                        };
+                        shapes.push(egui::Shape::rect_filled(rect, 0.0, color));
                     }
                 }
                 // 文本：整行一个 `Shape::Mesh`（所有分段已合成为单个顶点缓冲）。
@@ -1596,6 +1799,26 @@ impl TerminalView {
                         }
                     }
                 }
+                // 裸文本链接（URL/裸域名/文件路径，Kaku Cmd+Click 语义）：
+                // 悬停时画下划线（可点击提示）并参与命中；OSC8 已命中则不重复。
+                for (link_start, link_end, url) in &cache.text_links {
+                    if link_end <= link_start {
+                        continue;
+                    }
+                    let rect = Rect::from_min_size(
+                        origin + Vec2::new(*link_start as f32 * cell_width, v as f32 * cell_height),
+                        Vec2::new((*link_end - *link_start) as f32 * cell_width, cell_height),
+                    );
+                    if hover_pos.is_some_and(|p| rect.contains(p)) {
+                        shapes.push(egui::Shape::line_segment(
+                            [rect.left_bottom(), rect.right_bottom()],
+                            Stroke::new(1.0, theme.accent2),
+                        ));
+                        if hovered_link.is_none() {
+                            hovered_link = Some(url.clone());
+                        }
+                    }
+                }
             }
         } // 结束 shapes 借用作用域（之后要调 `&mut self` 方法）
 
@@ -1608,40 +1831,48 @@ impl TerminalView {
         // OSC8 超链接点击：命中链接段则经 `open_url` 打开（浏览器/文件）。
         // 只在未订阅鼠标上报时处理——订阅时点击已透传给程序，链接由程序自己管。
         if input_enabled && !self.last_mode.intersects(TermMode::MOUSE_MODE) {
-            self.open_hovered_hyperlink(ui, hovered_link);
+            self.open_hovered_hyperlink(ui, hovered_link.clone());
         }
 
         // 光标形状绘制（shape 已在锁内读取，无需二次上锁）。
-        if let (Some(rect), Some(color)) = (cursor_rect, cursor_color) {
-            match cursor_shape {
-                CursorShape::Block => {
-                    self.shapes_scratch
-                        .push(egui::Shape::rect_filled(rect, 0.0, color));
+        // 竖条/下划线光标厚度 = Kaku `cursor_thickness = '2px'`（设备像素，
+        // 2x 屏即 1pt；低分辨率屏 2pt 封顶）。闪烁「灭」相位不绘制。
+        if cursor_visible {
+            if let (Some(rect), Some(color)) = (cursor_rect, cursor_color) {
+                let thickness = (2.0 / ppp).max(1.0);
+                match cursor_shape {
+                    CursorShape::Block => {
+                        self.shapes_scratch
+                            .push(egui::Shape::rect_filled(rect, 0.0, color));
+                    }
+                    CursorShape::Underline => {
+                        self.shapes_scratch.push(egui::Shape::line_segment(
+                            [
+                                rect.left_bottom() + Vec2::new(0.0, -thickness / 2.0),
+                                rect.right_bottom() + Vec2::new(0.0, -thickness / 2.0),
+                            ],
+                            Stroke::new(thickness, color),
+                        ));
+                    }
+                    CursorShape::Beam => {
+                        self.shapes_scratch.push(egui::Shape::line_segment(
+                            [
+                                rect.left_top() + Vec2::new(thickness / 2.0, 0.0),
+                                rect.left_bottom() + Vec2::new(thickness / 2.0, 0.0),
+                            ],
+                            Stroke::new(thickness, color),
+                        ));
+                    }
+                    CursorShape::HollowBlock => {
+                        self.shapes_scratch.push(egui::Shape::rect_stroke(
+                            rect,
+                            0.0,
+                            Stroke::new(1.0, color),
+                            egui::StrokeKind::Middle,
+                        ));
+                    }
+                    CursorShape::Hidden => {}
                 }
-                CursorShape::Underline => {
-                    self.shapes_scratch.push(egui::Shape::line_segment(
-                        [
-                            rect.left_bottom() + Vec2::new(0.0, -1.0),
-                            rect.right_bottom() + Vec2::new(0.0, -1.0),
-                        ],
-                        Stroke::new(1.5, color),
-                    ));
-                }
-                CursorShape::Beam => {
-                    self.shapes_scratch.push(egui::Shape::line_segment(
-                        [rect.left_top(), rect.left_bottom()],
-                        Stroke::new(1.5, color),
-                    ));
-                }
-                CursorShape::HollowBlock => {
-                    self.shapes_scratch.push(egui::Shape::rect_stroke(
-                        rect,
-                        0.0,
-                        Stroke::new(1.0, color),
-                        egui::StrokeKind::Middle,
-                    ));
-                }
-                CursorShape::Hidden => {}
             }
         }
         // Bell 视觉脉冲：到期前在终端左上角画 accent 色圆点（0.6s 自消失）。
@@ -1746,6 +1977,95 @@ impl TerminalView {
             if !mouse_reporting {
                 self.selection = None;
             }
+            // Option+Click（Kaku）：把 shell 光标移到点击列（仅当前输入行；
+            // 空闲提示符内，跨行/历史区点击不生效）。
+            if input_enabled && !mouse_reporting {
+                let alt_held = ui.input(|i| i.modifiers.alt);
+                if alt_held {
+                    if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                        self.move_shell_cursor_to(pos, inner);
+                    }
+                }
+            }
+        }
+        // 右键菜单（Kaku：粘贴/搜索/分屏/关闭/标签操作；区分鼠标上报——
+        // 程序订阅鼠标时右键已透传，本地不抢）。
+        if !mouse_reporting {
+            let link_for_menu = hovered_link.clone();
+            let has_selection = self.selection.is_some();
+            let mut choice: Option<MenuChoice> = None;
+            response.context_menu(|ui| {
+                if let Some(url) = link_for_menu.as_ref() {
+                    if ui.button("打开链接").clicked() {
+                        choice = Some(MenuChoice::OpenLink(url.clone()));
+                        ui.close();
+                    }
+                }
+                if ui
+                    .add_enabled(has_selection, egui::Button::new("复制"))
+                    .clicked()
+                {
+                    choice = Some(MenuChoice::Copy);
+                    ui.close();
+                }
+                if ui.button("粘贴").clicked() {
+                    choice = Some(MenuChoice::Paste);
+                    ui.close();
+                }
+                if ui.button("全选").clicked() {
+                    choice = Some(MenuChoice::SelectAll);
+                    ui.close();
+                }
+                if ui.button("搜索（⌘F）").clicked() {
+                    choice = Some(MenuChoice::Search);
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("向右分屏（⌘D）").clicked() {
+                    choice = Some(MenuChoice::SplitRight);
+                    ui.close();
+                }
+                if ui.button("向下分屏（⌘⇧D）").clicked() {
+                    choice = Some(MenuChoice::SplitDown);
+                    ui.close();
+                }
+                if ui.button("关闭窗格").clicked() {
+                    choice = Some(MenuChoice::ClosePane);
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("新建标签（⌘T）").clicked() {
+                    choice = Some(MenuChoice::NewTab);
+                    ui.close();
+                }
+                if ui.button("关闭标签（⌘⇧W）").clicked() {
+                    choice = Some(MenuChoice::CloseTab);
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("清屏并清空回滚（⌘K）").clicked() {
+                    choice = Some(MenuChoice::ClearScrollback);
+                    ui.close();
+                }
+                if ui.button("重置字号（⌘0）").clicked() {
+                    choice = Some(MenuChoice::ResetFontSize);
+                    ui.close();
+                }
+            });
+            if let Some(choice) = choice {
+                self.apply_menu_choice(ui.ctx(), choice);
+            }
+        }
+        // 双击选词 / 三击选行（Kaku `selection_word_boundary` 语义：
+        // 空格/制表/括号/引号/连字符为词边界），并复制即选中。
+        if !mouse_reporting && (response.double_clicked() || response.triple_clicked()) {
+            let triple = response.triple_clicked();
+            if let Some(pos) = response.interact_pointer_pos() {
+                if self.select_word_or_line(pos, inner, triple) {
+                    self.copy_selection(ui.ctx());
+                    ui.ctx().request_repaint();
+                }
+            }
         }
         if response.drag_started() {
             let start_pos = ui
@@ -1788,13 +2108,27 @@ impl TerminalView {
         }
         if response.drag_stopped() {
             self.selecting = false;
+            // 复制即选中（Kaku/Kitty 的 copy_on_select，Kaku 把左键抬起绑定为
+            // `CompleteSelection('ClipboardAndPrimarySelection')`）：拖选结束
+            // 立即写入系统剪贴板，选区保留高亮。鼠标上报模式下本地无选区，
+            // 不复制。
+            if !mouse_reporting && self.selection.is_some() {
+                self.copy_selection(ui.ctx());
+                ui.ctx().request_repaint();
+            }
         }
         // 向后端声明 IME 意图：终端聚焦（且前台无弹窗抢夺输入）时允许输入法；
         // 否则禁用，避免中文输入法候选窗跟随一个不接受中文的视图。
         // 声明必须每帧执行——egui-winit 只在 `PlatformOutput::ime` 为 Some
         // 时才调 `Window::set_ime_allowed(true)`，缺了这一帧输入法就起不来。
-        self.update_ime_output_with_input(ui, inner, cursor_rect, input_enabled);
-        if input_enabled && ui.memory(|m| m.has_focus(self.focus_id)) {
+        // 搜索浮层打开时终端不声明 IME、不消费键盘（键都给浮层输入框）。
+        self.update_ime_output_with_input(
+            ui,
+            inner,
+            cursor_rect,
+            input_enabled && self.search.is_none(),
+        );
+        if input_enabled && self.search.is_none() && ui.memory(|m| m.has_focus(self.focus_id)) {
             self.handle_input(ui, inner, output_rows);
         }
     }
@@ -2157,8 +2491,58 @@ impl TerminalView {
                         if modifiers.command {
                             if *key == egui::Key::C {
                                 actions.push(InputAction::CopySelection);
+                            } else {
+                                // Kaku 的 shell 编辑键（readline 控制字符）：
+                                // ⌘←/⌘→ → Ctrl+A/Ctrl+E（行首/行尾），
+                                // ⌘⌫ → Ctrl+U（删到行首）。
+                                let seq: Option<&[u8]> = match key {
+                                    egui::Key::ArrowLeft => Some(b"\x01"),
+                                    egui::Key::ArrowRight => Some(b"\x05"),
+                                    egui::Key::Backspace => Some(b"\x15"),
+                                    _ => None,
+                                };
+                                if let Some(seq) = seq {
+                                    pending_writes.extend_from_slice(seq);
+                                    actions.push(InputAction::Bytes(seq.to_vec()));
+                                }
                             }
                             continue;
+                        }
+                        // Kaku 的 Option 编辑键：Opt+←/→ → ESC b / ESC f
+                        //（readline 词跳），Opt+⌫ → Ctrl+W（删词）。放在通用
+                        // Ctrl/Alt 编码前拦截，避免编成 CSI 修饰序列。
+                        if modifiers.alt && !modifiers.ctrl {
+                            let seq: Option<&[u8]> = match key {
+                                egui::Key::ArrowLeft => Some(b"\x1bb"),
+                                egui::Key::ArrowRight => Some(b"\x1bf"),
+                                egui::Key::Backspace => Some(b"\x17"),
+                                _ => None,
+                            };
+                            if let Some(seq) = seq {
+                                pending_writes.extend_from_slice(seq);
+                                actions.push(InputAction::Bytes(seq.to_vec()));
+                                continue;
+                            }
+                        }
+                        // `# <自然语言>` 拦截（Kaku：输入 `# 描述` 回车直接
+                        // 生成命令）：把整行从 shell 撤回（Ctrl+U）并记录请求，
+                        // 由应用层异步生成后回填到提示符（不自动执行）。
+                        if *key == egui::Key::Enter
+                            && !modifiers.shift
+                            && !modifiers.ctrl
+                            && !modifiers.alt
+                            && !modifiers.command
+                            && !self.shell_running
+                        {
+                            if let Some(query) = self.take_hash_query() {
+                                // Ctrl+U 清掉 shell 输入行（含 `# 描述` 本身），
+                                // 不发回车——命令由 AI 生成后回填。
+                                self.session.write(b"\x15");
+                                self.workdir.reset();
+                                self.ai_generate_request = Some(query);
+                                ui.ctx().request_repaint();
+                                continue;
+                            }
                         }
                         let mods = Mods {
                             shift: modifiers.shift,
@@ -2515,6 +2899,11 @@ impl TerminalView {
         match bytes {
             // 回车：执行命令并尝试解析 cd，清空当前输入跟踪。
             b"\r" | b"\n" => {
+                // 先快照命令（tracker 随后清空；AI 失败建议要用它）。
+                let line = self.workdir.current_input().trim().to_string();
+                if !line.is_empty() {
+                    self.last_command = Some(line);
+                }
                 if self.session.is_remote() {
                     self.workdir.execute_remote(self.remote_home.as_deref());
                 } else {
@@ -2547,6 +2936,501 @@ impl TerminalView {
                 self.workdir.invalidate();
             }
         }
+    }
+
+    /// Option+Click：把 shell 光标在**当前输入行**内移到点击列。
+    ///
+    /// Kaku/WezTerm 语义：只在提示符行内移动（不跨硬换行、不进入历史区），
+    /// 命令执行中（全屏应用/运行中的命令）不响应。实现用左右方向键计数
+    /// 位移（等价 WezTerm 合成键序列）。
+    fn move_shell_cursor_to(&mut self, pos: egui::Pos2, inner: Rect) {
+        if self.shell_running {
+            return;
+        }
+        let (click_col, click_row) = terminal_cell_from_screen(
+            pos,
+            inner,
+            self.cell_width,
+            self.cell_height,
+            self.cols as usize,
+            self.rows as usize,
+        );
+        let (cursor_disp_row, cursor_col) = {
+            let term = self.session.term();
+            let guard = term.lock();
+            let content = guard.renderable_content();
+            (
+                content.cursor.point.line.0 + content.display_offset as i32,
+                content.cursor.point.column.0,
+            )
+        };
+        if click_row as i32 != cursor_disp_row {
+            return;
+        }
+        if click_col == cursor_col {
+            return;
+        }
+        let (step, count) = if click_col > cursor_col {
+            (b"\x1b[C".as_slice(), click_col - cursor_col)
+        } else {
+            (b"\x1b[D".as_slice(), cursor_col - click_col)
+        };
+        let mut bytes = Vec::with_capacity(count * step.len());
+        for _ in 0..count {
+            bytes.extend_from_slice(step);
+        }
+        self.session.write(&bytes);
+    }
+
+    /// 双击选词 / 三击选行；返回是否建立了非空选区。
+    ///
+    /// 词边界与 Kaku 的 `selection_word_boundary = " \t\n{}[]()\"'-"`
+    /// 一致（这些字符视作分隔符，词 = 不含分隔符的最大连续段）。宽字符
+    /// 双列：命中列落在宽字符上时按该字符所在列段整体选中。
+    fn select_word_or_line(&mut self, pos: egui::Pos2, inner: Rect, triple: bool) -> bool {
+        let (click_col, click_row) = terminal_cell_from_screen(
+            pos,
+            inner,
+            self.cell_width,
+            self.cell_height,
+            self.cols as usize,
+            self.rows as usize,
+        );
+        let (grid_line, start_col, end_col) = {
+            let term = self.session.term();
+            let guard = term.lock();
+            let content = guard.renderable_content();
+            let display_offset = content.display_offset;
+            let grid_line = click_row as i32 - display_offset as i32;
+            let grid = guard.grid();
+            let row = grid_row(grid, grid_line);
+            let chars: Vec<char> = row
+                .into_iter()
+                .take(self.cols as usize)
+                .map(|cell| cell.c)
+                .collect();
+            if triple {
+                (grid_line, 0, self.cols as usize)
+            } else {
+                let boundary = |c: char| {
+                    matches!(
+                        c,
+                        ' ' | '\t' | '\n' | '{' | '}' | '[' | ']' | '(' | ')' | '"' | '\'' | '-'
+                    )
+                };
+                let at = |index: usize| chars.get(index).copied().unwrap_or(' ');
+                if boundary(at(click_col)) {
+                    (grid_line, click_col, click_col + 1)
+                } else {
+                    let mut start = click_col;
+                    while start > 0 && !boundary(at(start - 1)) {
+                        start -= 1;
+                    }
+                    let mut end = click_col + 1;
+                    while end < chars.len() && !boundary(at(end)) {
+                        end += 1;
+                    }
+                    (grid_line, start, end)
+                }
+            }
+        };
+        if end_col <= start_col {
+            return false;
+        }
+        self.selection = Some(TerminalSelection {
+            anchor: SelectionPoint {
+                grid_line,
+                col: start_col,
+            },
+            focus: SelectionPoint {
+                grid_line,
+                col: end_col - 1,
+            },
+        });
+        true
+    }
+
+    /// 当前输入行是否为 `# <自然语言>`（是则返回描述部分并清空跟踪）。
+    fn take_hash_query(&mut self) -> Option<String> {
+        let line = self.workdir.current_input().trim().to_string();
+        let query = line.strip_prefix('#')?.trim().to_string();
+        (!query.is_empty()).then_some(query)
+    }
+
+    /// 取走 `#` 命令生成请求（应用层每帧轮询）。
+    pub fn take_ai_generate_request(&mut self) -> Option<String> {
+        self.ai_generate_request.take()
+    }
+
+    /// 把文本注入当前提示符（不回车；AI 生成结果回填用）。
+    pub fn inject_command(&mut self, command: &str) {
+        if command.is_empty() {
+            return;
+        }
+        self.session.write(command.as_bytes());
+        self.workdir.push_text(command);
+        self.selection = None;
+    }
+
+    /// 终端当前可见行的快照（AI 失败建议的 `tail_output` 上下文）。
+    pub fn visible_rows_snapshot(&self) -> Vec<String> {
+        visible_terminal_rows(&self.session)
+    }
+
+    /// 取走右键菜单里需要应用层执行的动作（渲染后由 MinoApp 调用）。
+    pub fn take_menu_choices(&mut self) -> Vec<MenuChoice> {
+        std::mem::take(&mut self.pending_menu)
+    }
+
+    /// 应用右键菜单选择：本地动作就地完成，跨窗格动作转交应用层。
+    fn apply_menu_choice(&mut self, ctx: &egui::Context, choice: MenuChoice) {
+        match choice {
+            MenuChoice::OpenLink(url) => {
+                if let Some(target) = open_target_url(&url) {
+                    ctx.open_url(egui::OpenUrl::same_tab(target));
+                }
+            }
+            MenuChoice::Copy => self.copy_selection(ctx),
+            MenuChoice::Paste => self.paste_from_clipboard(),
+            MenuChoice::SelectAll => self.select_all(),
+            MenuChoice::Search => self.toggle_search(),
+            MenuChoice::ClearScrollback => self.clear_scrollback_and_screen(),
+            other => self.pending_menu.push(other),
+        }
+    }
+
+    /// 菜单「粘贴」：把系统剪贴板文本按括号粘贴协议写回 PTY。
+    ///
+    /// 与 ⌘V 的事件路径同语义（`handle_input` 的 `Event::Paste` 分支）：
+    /// 程序订阅括号粘贴时用 `ESC[200~…ESC[201~` 包裹，防止多行内容被逐行
+    /// 执行；跟踪器同步记录写回的文本。
+    fn paste_from_clipboard(&mut self) {
+        let Some(text) = self.clipboard.clipboard_text() else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        let payload = if self.last_mode.contains(TermMode::BRACKETED_PASTE) {
+            bracketed_paste_payload(&text)
+        } else {
+            text.clone()
+        };
+        self.session.write(payload.as_bytes());
+        self.track_input_bytes(payload.as_bytes());
+        self.selection = None;
+    }
+
+    /// 菜单「全选」：选中整个滚动缓冲（历史 + 视口）。
+    fn select_all(&mut self) {
+        let (history, rows, cols) = {
+            let term = self.session.term();
+            let guard = term.lock();
+            let grid = guard.grid();
+            (
+                grid.history_size() as i32,
+                grid.screen_lines(),
+                grid.columns(),
+            )
+        };
+        if rows == 0 || cols == 0 {
+            return;
+        }
+        self.selection = Some(TerminalSelection {
+            anchor: SelectionPoint {
+                grid_line: -history,
+                col: 0,
+            },
+            focus: SelectionPoint {
+                grid_line: rows as i32 - 1,
+                col: cols - 1,
+            },
+        });
+    }
+
+    /// ⌘F：打开/关闭搜索浮层。
+    pub fn toggle_search(&mut self) {
+        if self.search.is_some() {
+            self.close_search();
+        } else {
+            self.search = Some(SearchState {
+                query: String::new(),
+                case_sensitive: false,
+                matches: Vec::new(),
+                current: 0,
+                dirty: false,
+                last_scan: std::time::Instant::now(),
+                needs_focus: true,
+            });
+        }
+    }
+
+    /// 搜索浮层是否打开。
+    pub fn search_open(&self) -> bool {
+        self.search.is_some()
+    }
+
+    fn close_search(&mut self) {
+        self.search = None;
+    }
+
+    /// 命中导航：切到下一个/上一个命中并滚动到可见。
+    fn search_step(&mut self, forward: bool) {
+        let Some(search) = &mut self.search else {
+            return;
+        };
+        if search.matches.is_empty() {
+            return;
+        }
+        let len = search.matches.len();
+        search.current = if forward {
+            (search.current + 1) % len
+        } else {
+            (search.current + len - 1) % len
+        };
+        let grid_line = search.matches[search.current].0;
+        self.scroll_to_grid_line(grid_line);
+    }
+
+    /// 把某网格行滚动到可见区域（最小移动；行已在视口内则不动）。
+    fn scroll_to_grid_line(&mut self, grid_line: i32) {
+        let term = self.session.term();
+        let mut guard = term.lock();
+        let grid = guard.grid_mut();
+        let rows = grid.screen_lines() as i32;
+        if rows == 0 {
+            return;
+        }
+        let history = grid.history_size() as i32;
+        let offset = grid.display_offset() as i32;
+        // 视口展示的网格行区间：`[-(offset) .. rows-1-offset]`。
+        let top = -offset;
+        let bottom = rows - 1 - offset;
+        let new_offset = if grid_line < top {
+            -grid_line
+        } else if grid_line > bottom {
+            rows - 1 - grid_line
+        } else {
+            offset
+        }
+        .clamp(0, history);
+        if new_offset != offset {
+            grid.scroll_display(Scroll::Delta(new_offset - offset));
+        }
+    }
+
+    /// 重建命中集（查询变化立即刷；内容变化由调用方按节流置 `dirty`）。
+    fn refresh_search_matches(&mut self) {
+        let Some(search) = &self.search else {
+            return;
+        };
+        if search.query.is_empty() {
+            if let Some(search) = &mut self.search {
+                search.matches.clear();
+                search.current = 0;
+                search.dirty = false;
+            }
+            return;
+        }
+        let query = search.query.clone();
+        let case_sensitive = search.case_sensitive;
+        let matches = {
+            let term = self.session.term();
+            let guard = term.lock();
+            let grid = guard.grid();
+            // 用网格自身的尺寸（`self.rows/cols` 在尚未渲染过的视图上为 0；
+            // 后台标签搜索也必须扫全量）。
+            let history = grid.history_size() as i32;
+            let rows = grid.screen_lines() as i32;
+            let cols = grid.columns();
+            scan_matches(grid, -(history)..rows, cols, &query, case_sensitive)
+        };
+        let Some(search) = &mut self.search else {
+            return;
+        };
+        search.matches = matches;
+        if search.current >= search.matches.len() {
+            search.current = 0;
+        }
+        search.dirty = false;
+        search.last_scan = std::time::Instant::now();
+        let target = search.matches.get(search.current).map(|(line, _, _)| *line);
+        if let Some(grid_line) = target {
+            self.scroll_to_grid_line(grid_line);
+        }
+    }
+
+    /// 搜索浮层的每帧更新：键处理、按需重扫、浮层渲染。
+    fn update_search(&mut self, ui: &Ui, inner: Rect) {
+        let ctx = ui.ctx().clone();
+        let field_id = egui::Id::new(("mino_search_field", self.focus_id));
+        // 焦点回补：egui 0.36 在 Text/Key 事件帧后可能清掉焦点
+        // （`Memory::end_pass` dead-man-switch，kittest 必现），搜索框失焦
+        // 后 Enter/Esc 全都会漏掉——无其它焦点持有者时把焦点要回来。
+        if ctx.memory(|m| m.focused().is_none()) {
+            ctx.memory_mut(|m| m.request_focus(field_id));
+        }
+        // Esc 无条件关闭搜索（搜索打开时 Esc 的第一语义就是关搜索，
+        // 与 vim 的 Esc 冲突由用户自己先关搜索解决）。
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.close_search();
+            ctx.memory_mut(|m| m.request_focus(self.focus_id));
+            return;
+        }
+        let bar_focused = ctx.memory(|m| m.has_focus(field_id))
+            || self.search.as_ref().is_some_and(|state| state.needs_focus);
+        if bar_focused {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+                self.search_step(true);
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter)) {
+                self.search_step(false);
+            }
+        }
+        if self.search.as_ref().is_some_and(|state| state.dirty) {
+            self.refresh_search_matches();
+        }
+        let theme = crate::theme::current_theme();
+        let (mut query, case_sensitive, mut needs_focus) = {
+            let Some(state) = self.search.as_ref() else {
+                return;
+            };
+            (state.query.clone(), state.case_sensitive, state.needs_focus)
+        };
+        let (matches_len, current) = {
+            let Some(state) = self.search.as_ref() else {
+                return;
+            };
+            (state.matches.len(), state.current)
+        };
+        let mut action: Option<SearchAction> = None;
+        let mut query_changed = false;
+        // 浮层锚在窗格右上角（WezTerm 的搜索框同位置）。
+        let bar_pos = egui::pos2(inner.right() - 8.0, inner.top() + 6.0);
+        egui::Area::new(egui::Id::new(("mino_search_bar", self.focus_id)))
+            .order(egui::Order::Foreground)
+            .fixed_pos(bar_pos)
+            .pivot(egui::Align2::RIGHT_TOP)
+            .show(&ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(theme.bg_elevated)
+                    .stroke(egui::Stroke::new(1.0, theme.border))
+                    .corner_radius(crate::theme::tokens::RADIUS_SM)
+                    .inner_margin(egui::Margin::symmetric(8, 6))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut query)
+                                    .id(field_id)
+                                    .desired_width(180.0)
+                                    .hint_text("搜索…"),
+                            );
+                            query_changed = resp.changed();
+                            if needs_focus {
+                                resp.request_focus();
+                                needs_focus = false;
+                            }
+                            let count_text = if query.is_empty() {
+                                String::new()
+                            } else if matches_len == 0 {
+                                "无结果".to_string()
+                            } else {
+                                format!("{}/{}", current + 1, matches_len)
+                            };
+                            if !count_text.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(count_text)
+                                        .size(11.0)
+                                        .color(theme.text_muted),
+                                );
+                            }
+                            if ui
+                                .small_button("↑")
+                                .on_hover_text("上一个（Shift+Enter）")
+                                .clicked()
+                            {
+                                action = Some(SearchAction::Prev);
+                            }
+                            if ui
+                                .small_button("↓")
+                                .on_hover_text("下一个（Enter）")
+                                .clicked()
+                            {
+                                action = Some(SearchAction::Next);
+                            }
+                            let case_color = if case_sensitive {
+                                theme.accent
+                            } else {
+                                theme.text_muted
+                            };
+                            if ui
+                                .small_button(
+                                    egui::RichText::new("Aa").size(11.0).color(case_color),
+                                )
+                                .on_hover_text("区分大小写")
+                                .clicked()
+                            {
+                                action = Some(SearchAction::ToggleCase);
+                            }
+                            if ui.small_button("×").on_hover_text("关闭（Esc）").clicked() {
+                                action = Some(SearchAction::Close);
+                            }
+                        });
+                    });
+            });
+        if let Some(state) = &mut self.search {
+            if query_changed || state.query != query {
+                state.query = query;
+                state.dirty = true;
+                state.current = 0;
+            }
+            state.case_sensitive = case_sensitive;
+            state.needs_focus = needs_focus;
+        }
+        match action {
+            Some(SearchAction::Next) => self.search_step(true),
+            Some(SearchAction::Prev) => self.search_step(false),
+            Some(SearchAction::ToggleCase) => {
+                if let Some(state) = &mut self.search {
+                    state.case_sensitive = !state.case_sensitive;
+                    state.dirty = true;
+                }
+            }
+            Some(SearchAction::Close) => {
+                self.close_search();
+                ctx.memory_mut(|m| m.request_focus(self.focus_id));
+            }
+            None => {}
+        }
+    }
+
+    /// ⌘K：清屏并清空回滚缓冲（Kaku：先发 Ctrl+L 再 ClearScrollback）。
+    ///
+    /// 顺序与 Kaku 的 `Multiple{ SendKey(Ctrl+L), ClearScrollback }` 一致：
+    /// 先让 shell 把提示符重绘到干净视口，再清掉本地历史；清历史后行缓存
+    /// 与网格顶点全部失效（滚动位置也随之归零）。
+    pub fn clear_scrollback_and_screen(&mut self) {
+        self.session.write(b"\x0c");
+        {
+            let term = self.session.term();
+            let mut guard = term.lock();
+            guard.grid_mut().clear_history();
+        }
+        self.rows_cache.clear();
+        self.wide_glyphs.clear();
+        self.invalidate_row_meshes();
+        self.selection = None;
+    }
+
+    /// 命令失败后的注意力标记（标签橙色点；`take` 语义消费一次）。
+    pub fn attention(&self) -> bool {
+        self.attention
+    }
+
+    /// 清除注意力标记（标签被激活/查看后由调用方清除）。
+    pub fn clear_attention(&mut self) {
+        self.attention = false;
     }
 
     /// 复制成功后的非侵入式反馈，不抢终端焦点。
@@ -2647,17 +3531,23 @@ fn visible_terminal_rows(session: &Session) -> Vec<String> {
     let mut rows = Vec::new();
     let mut current_line: Option<i32> = None;
     let mut current = String::new();
+    // alacritty 把 `WRAPLINE` 打在**换行前那一行的最后一个 cell** 上
+    //（"本行未完，下一行是续行"）。续行与上一逻辑行合并：长路径在列宽处
+    // 换行时会被拆成两行，`pwd` 输出校正拿不到完整路径（SFTP 定位/⌘D
+    // 收藏会因此失效）。
+    let mut after_wrap = false;
 
     for item in content.display_iter {
         let line = item.point.line.0;
         if current_line != Some(line) {
-            if current_line.is_some() {
+            if current_line.is_some() && !after_wrap {
                 rows.push(current.trim_end().to_string());
+                current.clear();
             }
             current_line = Some(line);
-            current.clear();
         }
         let cell = item.cell;
+        after_wrap = cell.flags.contains(Flags::WRAPLINE);
         if cell.flags.contains(Flags::WIDE_CHAR_SPACER) || cell.flags.contains(Flags::HIDDEN) {
             continue;
         }
@@ -2750,9 +3640,18 @@ impl TerminalView {
             return;
         };
         ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
-        if ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Primary)) {
-            ui.ctx().open_url(egui::OpenUrl::same_tab(url));
+        // Kaku：Cmd+Click 打开链接（egui 的 `command` 在 macOS = ⌘、其它平台
+        // = Ctrl）。普通点击保留给选区——终端里点一下就开浏览器太容易误触。
+        if !ui.input(|i| i.modifiers.command) {
+            return;
         }
+        if !ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Primary)) {
+            return;
+        }
+        let Some(target) = open_target_url(&url) else {
+            return;
+        };
+        ui.ctx().open_url(egui::OpenUrl::same_tab(target));
     }
 }
 
@@ -2863,44 +3762,6 @@ fn build_row_mesh(
                 color: v.color,
             }));
         mesh.indices.extend(glyphs.indices.iter().map(|i| i + base));
-    }
-    mesh
-}
-
-/// 一次性 tessellate 装饰网格线为单个 `Mesh`（面板矩形与缩放比相同即复用）。
-///
-/// 网格线是纯色线段：顶点 uv 取 `WHITE_UV`（字体图集左上角的白像素），
-/// 纹理 id 用 `TextureId::Managed(0)` 即字体图集本身，因此不需要额外的纹理
-/// 资源（epaint 对 `Shape::Mesh` 只做顶点追加，不做 uv 归一化）。
-fn build_grid_lines_mesh(panel: Rect, ppp: f32) -> egui::Mesh {
-    const GRID_STEP: f32 = 32.0;
-    let mut mesh = egui::Mesh::default();
-    let mut tessellator = egui::epaint::Tessellator::new(
-        ppp,
-        egui::epaint::TessellationOptions::default(),
-        [1, 1],
-        Vec::new(),
-    );
-    let stroke = egui::Stroke::new(1.0, crate::theme::tokens::GRID_LINE);
-    let first_x = panel.left() - panel.left().rem_euclid(GRID_STEP);
-    let first_y = panel.top() - panel.top().rem_euclid(GRID_STEP);
-    for x in (0..=((panel.width() / GRID_STEP).ceil() as usize + 1))
-        .map(|i| first_x + i as f32 * GRID_STEP)
-    {
-        tessellator.tessellate_line_segment(
-            [egui::pos2(x, panel.top()), egui::pos2(x, panel.bottom())],
-            stroke,
-            &mut mesh,
-        );
-    }
-    for y in (0..=((panel.height() / GRID_STEP).ceil() as usize + 1))
-        .map(|i| first_y + i as f32 * GRID_STEP)
-    {
-        tessellator.tessellate_line_segment(
-            [egui::pos2(panel.left(), y), egui::pos2(panel.right(), y)],
-            stroke,
-            &mut mesh,
-        );
     }
     mesh
 }
@@ -3116,7 +3977,7 @@ struct ResolvedCell {
     is_wide: bool,
 }
 
-/// 解析 cell 的颜色与样式（粗体亮色映射、INVERSE 反色、DIM 减暗）。
+/// 解析 cell 的颜色与样式（Kaku 覆写表、INVERSE 反色、DIM 减暗、对比度下限）。
 ///
 /// 行内容构建与逐 cell 指纹必须走同一份解析，否则指纹会与实际绘制脱节
 /// （表现为「样式变了但行不重建」）。
@@ -3126,16 +3987,25 @@ fn resolve_cell(
     default_fg: Rgb,
     default_bg: Rgb,
 ) -> ResolvedCell {
+    let theme = crate::theme::current_theme();
     let bold = cell.flags.contains(Flags::BOLD);
-    let mut fg = resolve_color(cell.fg, colors, default_fg, bold);
-    let mut bg = resolve_color(cell.bg, colors, default_bg, false);
+    // Kaku 的 color_overrides / foreground_color_overrides：把第三方 TUI
+    // 写死的低对比前景/背景替换为可读值（如 Claude Code 的引用块底色）。
+    let mut fg = apply_color_table(
+        theme.fg_overrides,
+        resolve_color(cell.fg, colors, default_fg),
+    );
+    let mut bg = apply_color_table(
+        theme.bg_overrides,
+        resolve_color(cell.bg, colors, default_bg),
+    );
     let italic = cell.flags.contains(Flags::ITALIC);
     let underline = underline_style_of(cell.flags);
     let strikeout = cell.flags.contains(Flags::STRIKEOUT);
     // SGR 58 下划线颜色（`Color::Spec` 直接 RGB，其余走调色板解析）。
     let underline_color = cell.underline_color().map(|c| match c {
         AColor::Spec(rgb) => to_egui(rgb),
-        other => resolve_color(other, colors, default_fg, false),
+        other => resolve_color(other, colors, default_fg),
     });
 
     // INVERSE 反色。
@@ -3146,6 +4016,9 @@ fn resolve_cell(
     if cell.flags.contains(Flags::DIM) && !bold {
         fg = Color32::from_rgb(fg.r() / 2, fg.g() / 2, fg.b() / 2);
     }
+    // Kaku 的强制性对比度下限（`text_min_contrast_ratio = 3.0`）：第三方 TUI
+    // 的暗色前景朝黑/白混合到达标，不改变程序语义上的颜色选择。
+    let fg = enforce_min_contrast(fg, bg, MIN_TEXT_CONTRAST);
 
     let leading_spacer = cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER);
     let spacer = cell.flags.contains(Flags::WIDE_CHAR_SPACER) && !leading_spacer;
@@ -3171,6 +4044,78 @@ fn resolve_cell(
         // 行尾换行占位（LEADING）与隐藏字符视作半角空格宽度。
         is_wide: !leading_spacer && !hidden && cell.flags.contains(Flags::WIDE_CHAR),
     }
+}
+
+/// Kaku 最低文本对比度（`text_min_contrast_ratio = 3.0`）。
+const MIN_TEXT_CONTRAST: f32 = 3.0;
+
+/// Kaku `color_overrides` 风格的替换表查找（键为程序写死的原始 RGB）。
+fn apply_color_table(table: &[(Rgb, Rgb)], color: Color32) -> Color32 {
+    for (from, to) in table {
+        if color.r() == from.r && color.g() == from.g && color.b() == from.b {
+            return to_egui(*to);
+        }
+    }
+    color
+}
+
+/// WCAG 相对亮度。
+fn relative_luminance(c: Color32) -> f32 {
+    let lin = |v: u8| {
+        let s = v as f32 / 255.0;
+        if s <= 0.03928 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+}
+
+/// WCAG 对比度（(L1+0.05)/(L2+0.05)）。
+fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// 最低对比度强制（Kaku `text_min_contrast_ratio`）。
+///
+/// 前景与背景对比度低于阈值时，把前景朝「远处端」（背景亮 → 向黑，背景暗
+/// → 向白）二分混合到刚好达标。达标时零开销直接返回原色。
+fn enforce_min_contrast(fg: Color32, bg: Color32, min_ratio: f32) -> Color32 {
+    if contrast_ratio(fg, bg) >= min_ratio {
+        return fg;
+    }
+    let target = if relative_luminance(bg) > 0.5 {
+        Color32::BLACK
+    } else {
+        Color32::WHITE
+    };
+    let mix = |t: f32| {
+        let blend = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
+        Color32::from_rgb(
+            blend(fg.r(), target.r()),
+            blend(fg.g(), target.g()),
+            blend(fg.b(), target.b()),
+        )
+    };
+    // 极限值仍不达标（理论上不会：纯黑/白对任意背景的对比度都 ≥ 3）：
+    // 直接用极限，避免死循环。
+    if contrast_ratio(mix(1.0), bg) < min_ratio {
+        return mix(1.0);
+    }
+    // 二分最小的达标混合比例（10 步 ≈ 1/1024 精度，视觉上足够）。
+    let (mut lo, mut hi) = (0.0_f32, 1.0_f32);
+    for _ in 0..10 {
+        let mid = (lo + hi) / 2.0;
+        if contrast_ratio(mix(mid), bg) >= min_ratio {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    mix(hi)
 }
 
 /// 单个 cell 的内容指纹（样式 + 字符 + 组合符 + OSC8 链接 URI）。
@@ -3264,6 +4209,10 @@ fn build_line_data(
     let mut segments: Vec<Segment> = Vec::new();
     let mut backgrounds: Vec<BgRect> = Vec::new();
     let mut cell_keys: Vec<u64> = Vec::with_capacity(cols);
+    // 行文本与「字节位置 → 终端列」映射：链接识别在整行文本上做（URL 可能
+    // 跨样式段），命中后再映射回列区间参与绘制/命中。
+    let mut row_text = String::with_capacity(cols);
+    let mut byte_to_col: Vec<(usize, usize)> = Vec::with_capacity(cols);
     let row = grid_row(grid, grid_line);
 
     for (col, cell) in row.into_iter().enumerate().take(cols) {
@@ -3281,6 +4230,9 @@ fn build_line_data(
             // 不再追加文本（其背景/属性变化已由 `cell_key` 覆盖）。
             continue;
         }
+
+        byte_to_col.push((row_text.len(), col));
+        row_text.push(resolved.text);
 
         let zero_width = if resolved.drop_zero_width {
             None
@@ -3307,7 +4259,32 @@ fn build_line_data(
         cell_keys,
         segments,
         backgrounds,
+        text_links: detect_row_links(&row_text, &byte_to_col),
     }
+}
+
+/// 识别行内裸文本链接并映射回终端列区间（半开 `[start, end)`）。
+///
+/// `byte_to_col` 按字节升序记录每个字符的起点（宽字符只记起点列，区间
+/// 覆盖其双列时由绘制侧取整——鼠标命中误差最多半格，无碍）。
+fn detect_row_links(text: &str, byte_to_col: &[(usize, usize)]) -> Vec<TextLink> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let col_of = |byte: usize| -> Option<usize> {
+        let index = byte_to_col.partition_point(|(b, _)| *b <= byte);
+        (index > 0).then(|| byte_to_col[index - 1].1)
+    };
+    let mut links = Vec::new();
+    for span in crate::views::link_detect::detect_links(text) {
+        let (Some(start_col), Some(end_col)) =
+            (col_of(span.start), col_of(span.end.saturating_sub(1)))
+        else {
+            continue;
+        };
+        links.push((start_col, end_col + 1, span.url));
+    }
+    links
 }
 
 /// 追加一个背景 cell；只有颜色相同且列号紧邻时才允许合并。
@@ -3328,10 +4305,105 @@ fn push_background(backgrounds: &mut Vec<BgRect>, col: usize, color: Color32, de
     });
 }
 
+/// 单网格行的可见文本与「字节 → 终端列」映射（搜索扫描用；含历史行）。
+///
+/// 与 `visible_terminal_rows` 同源（跳过宽字符占位与隐藏 cell、去尾部
+/// 空白），额外保留列映射以便命中回映射为终端列区间。
+fn grid_line_text(
+    grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
+    grid_line: i32,
+    cols: usize,
+) -> (String, Vec<(usize, usize)>) {
+    let row = grid_row(grid, grid_line);
+    let mut text = String::new();
+    let mut map: Vec<(usize, usize)> = Vec::with_capacity(cols);
+    for (col, cell) in row.into_iter().enumerate().take(cols) {
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) || cell.flags.contains(Flags::HIDDEN) {
+            continue;
+        }
+        map.push((text.len(), col));
+        text.push(cell.c);
+    }
+    while text.ends_with(' ') {
+        text.pop();
+    }
+    (text, map)
+}
+
+/// 字节位置 → 终端列（映射表按字节升序）。
+fn col_of_byte(map: &[(usize, usize)], byte: usize) -> Option<usize> {
+    let index = map.partition_point(|(b, _)| *b <= byte);
+    (index > 0).then(|| map[index - 1].1)
+}
+
+/// 子串查找（可选大小写不敏感），返回字节区间 `[start, end)`。
+///
+/// ASCII 查询走字节级扫描（零分配、大小写折叠只作用于 ASCII）；非 ASCII
+/// 查询（CJK 等）直接精确匹配——中文没有大小写，折叠无意义。
+fn find_needle(hay: &str, needle: &str, case_sensitive: bool) -> Option<(usize, usize)> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    if case_sensitive || !needle.is_ascii() {
+        return hay.find(needle).map(|start| (start, start + needle.len()));
+    }
+    let needle_lc = needle.to_ascii_lowercase();
+    let needle_bytes = needle_lc.as_bytes();
+    let hay_bytes = hay.as_bytes();
+    'scan: for start in 0..=(hay_bytes.len() - needle_bytes.len()) {
+        for (k, needle_byte) in needle_bytes.iter().enumerate() {
+            let hay_byte = hay_bytes[start + k];
+            // 多字节 UTF-8 的字节 ≥ 0x80，绝不会与 ASCII 查询字节相等，
+            // 因此匹配必然落在字符边界上。
+            if !hay_byte.is_ascii() || hay_byte.to_ascii_lowercase() != *needle_byte {
+                continue 'scan;
+            }
+        }
+        return Some((start, start + needle_bytes.len()));
+    }
+    None
+}
+
+/// 扫描网格行区间（含历史与视口）里的全部命中，按行升序。
+fn scan_matches(
+    grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
+    lines: std::ops::Range<i32>,
+    cols: usize,
+    query: &str,
+    case_sensitive: bool,
+) -> Vec<(i32, usize, usize)> {
+    let mut matches = Vec::new();
+    for grid_line in lines {
+        let (text, map) = grid_line_text(grid, grid_line, cols);
+        if text.is_empty() {
+            continue;
+        }
+        let mut offset = 0;
+        while offset < text.len() {
+            let Some((start, end)) = find_needle(&text[offset..], query, case_sensitive) else {
+                break;
+            };
+            let abs_start = offset + start;
+            let abs_end = offset + end;
+            if let (Some(start_col), Some(end_col)) = (
+                col_of_byte(&map, abs_start),
+                col_of_byte(&map, abs_end.saturating_sub(1)),
+            ) {
+                matches.push((grid_line, start_col, end_col + 1));
+            }
+            // 命中重叠（"aa" 里找 "a"）不算新命中：从命中末尾继续。
+            offset = abs_end.max(abs_start + 1);
+        }
+    }
+    matches
+}
+
 /// 解析终端颜色为 egui 颜色（主题调色板 + xterm 256 色表）。
 ///
 /// 优先级：程序直接指定颜色（Spec）> OSC 动态覆盖（term.colors）> 内置调色板。
-fn resolve_color(color: AColor, colors: &Colors, default: Rgb, bold: bool) -> Color32 {
+/// 粗体不改变颜色（Kaku `bold_brightens_ansi_colors = false`：粗体只换字重
+/// 命名族，见 `singleline_job`）。
+fn resolve_color(color: AColor, colors: &Colors, default: Rgb) -> Color32 {
     match color {
         AColor::Spec(rgb) => to_egui(rgb),
         AColor::Named(n) => {
@@ -3349,11 +4421,7 @@ fn resolve_color(color: AColor, colors: &Colors, default: Rgb, bold: bool) -> Co
                 NamedColor::Background => unreachable!(),
                 NamedColor::Cursor => to_egui(crate::theme::current_theme().term_cursor),
                 _ => {
-                    let mut idx = n as usize;
-                    // 粗体时将基本色映射到亮色（参照 Alacritty 默认行为）。
-                    if bold && idx < 8 {
-                        idx += 8;
-                    }
+                    let idx = n as usize;
                     if idx < 16 {
                         to_egui(crate::theme::current_theme().term_palette[idx])
                     } else {
@@ -3399,6 +4467,101 @@ fn underline_style_of(flags: Flags) -> UnderlineStyle {
 /// alacritty Rgb → egui Color32。
 fn to_egui(rgb: Rgb) -> Color32 {
     Color32::from_rgb(rgb.r, rgb.g, rgb.b)
+}
+
+/// 把识别出的链接目标变成系统可打开的形式。
+///
+/// - 带 scheme（`http(s)://` / `ftp://` / `file://` / `mailto:`）原样；
+/// - 本地文件路径（`/`、`./`、`../`、`~/` 开头）→ `file://` URL（去掉
+///   `:行[:列]` 后缀，路径做百分号编码，NSWorkspace 才能按默认应用打开）；
+/// - 其它（裸域名已由识别层补 `https://`）按原样尝试。
+fn open_target_url(raw: &str) -> Option<String> {
+    let target = raw.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let has_scheme = target.contains("://") || target.starts_with("mailto:");
+    if has_scheme {
+        return Some(target.to_owned());
+    }
+    let is_path = target.starts_with('/')
+        || target.starts_with("./")
+        || target.starts_with("../")
+        || target.starts_with("~/");
+    if is_path {
+        // 去掉 `:行[:列]` 后缀（编辑器行号约定，不是路径的一部分）；
+        // `~/` 展开复用识别层的规整实现（读 HOME，未传 cwd 时才展开）。
+        let path_part = strip_line_suffix(target);
+        let expanded = crate::views::link_detect::normalize_target(path_part, None);
+        return Some(format!("file://{}", percent_encode_path(&expanded)));
+    }
+    Some(target.to_owned())
+}
+
+/// 去掉路径尾部的 `:行[:列]` 后缀（仅当数字紧随其后时）。
+fn strip_line_suffix(path: &str) -> &str {
+    let bytes = path.as_bytes();
+    let mut index = bytes.len();
+    let mut colons = 0;
+    while index > 0 && bytes[index - 1].is_ascii_digit() {
+        index -= 1;
+    }
+    // 至少有一位数字，且前面是 `:`。
+    if index == bytes.len() {
+        return path;
+    }
+    if index > 0 && bytes[index - 1] == b':' {
+        colons += 1;
+        index -= 1;
+        // 再看一段可选的 `:列`。
+        let mut second = index;
+        while second > 0 && bytes[second - 1].is_ascii_digit() {
+            second -= 1;
+        }
+        if second < index && second > 0 && bytes[second - 1] == b':' {
+            colons += 1;
+            index = second - 1;
+        }
+    }
+    if colons > 0 {
+        &path[..index]
+    } else {
+        path
+    }
+}
+
+/// 文件 URL 的百分号编码（保留 `/` 与 URL 未保留字符集）。
+fn percent_encode_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        let keep = byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'/' | b'-'
+                    | b'.'
+                    | b'_'
+                    | b'~'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b':'
+                    | b'@'
+            );
+        if keep {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 /// cell 的文本样式（用于段合并判断与哈希）。
@@ -3532,7 +4695,12 @@ fn style_key(
 }
 
 /// 为单个文本段 layout 单行 Galley（按段样式）。
-fn layout_segment(ui: &Ui, seg: &Segment, font_size: f32) -> std::sync::Arc<egui::Galley> {
+fn layout_segment(
+    ui: &Ui,
+    seg: &Segment,
+    font_size: f32,
+    families_bound: bool,
+) -> std::sync::Arc<egui::Galley> {
     ui.fonts_mut(|f| {
         f.layout_job(singleline_job(
             &seg.text,
@@ -3543,6 +4711,7 @@ fn layout_segment(ui: &Ui, seg: &Segment, font_size: f32) -> std::sync::Arc<egui
             seg.underline,
             seg.underline_color,
             seg.strikeout,
+            families_bound,
         ))
     })
 }
@@ -3563,11 +4732,34 @@ fn wide_glyph_key(seg: &Segment) -> Option<WideGlyphKey> {
     Some((
         c,
         seg.fg,
+        seg.bold,
         seg.italic,
         seg.underline,
         seg.underline_color,
         seg.strikeout,
     ))
+}
+
+/// 终端等宽字体族：按「主题深浅 × 粗体」选择 Kaku 字重体系中的命名族。
+///
+/// 深色主题正文 Regular / 粗体 Medium；浅色主题正文 Medium / 粗体 SemiBold
+/// （族定义见 `main.rs::setup_fonts`）。
+///
+/// `families_bound` 为 false 时回退到默认 `Monospace`：命名字重族只由
+/// `setup_fonts` 绑定，部分单元测试用裸 `Context` 渲染终端，向 epaint 要
+/// 一个未绑定的族会直接 panic（"FontFamily::Name(...) is not bound to any
+/// fonts"）。
+fn mono_font_id(font_size: f32, bold: bool, families_bound: bool) -> FontId {
+    if !families_bound {
+        return FontId::monospace(font_size);
+    }
+    let name = match (crate::theme::current_theme().light, bold) {
+        (false, false) => crate::MONO_FAMILY_DARK,
+        (false, true) => crate::MONO_FAMILY_DARK_BOLD,
+        (true, false) => crate::MONO_FAMILY_LIGHT,
+        (true, true) => crate::MONO_FAMILY_LIGHT_BOLD,
+    };
+    FontId::new(font_size, egui::FontFamily::Name(name.into()))
 }
 
 /// 为单个同宽文本段构建单行 LayoutJob（不换行，按给定样式）。
@@ -3577,27 +4769,19 @@ fn singleline_job(
     font_size: f32,
     fg: Color32,
     bold: bool,
-    italic: bool,
+    _italic: bool,
     underline: UnderlineStyle,
     underline_color: Option<Color32>,
     strikeout: bool,
+    families_bound: bool,
 ) -> LayoutJob {
-    // 粗体 = 前景增亮 30%（封顶 255）+ egui 暂无合成粗体，不做描边仿粗
-    // （描边会让 CJK 笔画糊）。亮色映射仍由 `resolve_color` 的调色板负责，
-    // 这里只处理 Spec/真彩色的粗体增亮。
-    let fg = if bold {
-        Color32::from_rgb(
-            fg.r().saturating_add((255 - fg.r()) / 3),
-            fg.g().saturating_add((255 - fg.g()) / 3),
-            fg.b().saturating_add((255 - fg.b()) / 3),
-        )
-    } else {
-        fg
-    };
     let format = TextFormat {
-        font_id: FontId::monospace(font_size),
+        // 粗体换字重命名族（Kaku 的 bold 用 Medium/SemiBold 字形），
+        // 不做前景增亮（`bold_brightens_ansi_colors = false`）。
+        font_id: mono_font_id(font_size, bold, families_bound),
         color: fg,
-        italics: italic,
+        // Kaku 禁用真实斜体（"Normal italic: keep upright"）：斜体段保持正体。
+        italics: false,
         // Galley 只画 Single：其它变体由 paint 侧矢量线画，避免双线重叠。
         underline: if underline == UnderlineStyle::Single {
             Stroke::new(1.0, underline_color.unwrap_or(fg))
@@ -3626,7 +4810,7 @@ fn build_job(segments: &[Segment], font_size: f32) -> LayoutJob {
         let format = TextFormat {
             font_id: FontId::monospace(font_size),
             color: seg.fg,
-            italics: seg.italic,
+            italics: false,
             underline: if seg.underline == UnderlineStyle::Single {
                 Stroke::new(1.0, seg.underline_color.unwrap_or(seg.fg))
             } else {
@@ -3897,6 +5081,7 @@ mod tests {
                 cell_keys: vec![1],
                 runs: Vec::new(),
                 backgrounds: Vec::new(),
+                text_links: Vec::new(),
             },
         );
         view.cell_width = 8.0;
@@ -3914,6 +5099,7 @@ mod tests {
                 cell_keys: vec![1],
                 runs: Vec::new(),
                 backgrounds: Vec::new(),
+                text_links: Vec::new(),
             },
         );
         view.set_font_size(18.0);
@@ -4104,6 +5290,68 @@ mod tests {
         );
     }
 
+    /// 搜索子串查找：大小写折叠、尾随空白、非 ASCII 精确匹配。
+    #[test]
+    fn 搜索子串查找语义() {
+        assert_eq!(find_needle("Hello World", "world", false), Some((6, 11)));
+        assert_eq!(find_needle("Hello World", "world", true), None);
+        assert_eq!(find_needle("中文abc中文", "abc", false), Some((6, 9)));
+        assert_eq!(
+            find_needle("中文abc中文", "中文", false).map(|(s, e)| &"中文abc中文"[s..e]),
+            Some("中文")
+        );
+        assert_eq!(find_needle("", "x", false), None);
+        assert_eq!(find_needle("short", "longer-than-hay", false), None);
+    }
+
+    /// 搜索命中计算与导航：跨历史行、列区间正确、大小写开关生效。
+    #[test]
+    fn 搜索命中与导航() {
+        use mino_core::terminal::{Session, SessionOptions};
+        use std::sync::Arc;
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let mut view = TerminalView::new(session);
+        view.session()
+            .inject_program_output_for_test(b"alpha beta\r\ngamma Alpha\r\nno match here\r\n");
+        view.toggle_search();
+        {
+            let state = view.search.as_mut().expect("搜索已打开");
+            state.query = "alpha".into();
+            state.dirty = true;
+        }
+        view.refresh_search_matches();
+        let matches = view.search.as_ref().expect("搜索已打开").matches.clone();
+        assert_eq!(matches.len(), 2, "大小写不敏感应命中两处：{matches:?}");
+        // 第一行命中从列 0 开始、第二行（"gamma Alpha"）从列 6 开始。
+        let starts: Vec<usize> = matches.iter().map(|(_, start, _)| *start).collect();
+        assert_eq!(starts, vec![0, 6], "命中列区间：{matches:?}");
+        // 导航环形切换。
+        view.search_step(true);
+        assert_eq!(view.search.as_ref().expect("搜索已打开").current, 1);
+        assert_eq!(view.search.as_ref().expect("搜索已打开").matches.len(), 2);
+        // 区分大小写只命中一处。
+        {
+            let state = view.search.as_mut().expect("搜索已打开");
+            state.case_sensitive = true;
+            state.dirty = true;
+        }
+        view.refresh_search_matches();
+        assert_eq!(
+            view.search.as_ref().expect("搜索已打开").matches.len(),
+            1,
+            "区分大小写后只剩一处"
+        );
+        // 关闭后终端恢复键盘门禁。
+        view.toggle_search();
+        assert!(!view.search_open());
+    }
+
     /// 回归：Finder 拖入文件、目录或应用时，应把路径写到当前终端，
     /// 不自动回车执行，并正确处理包含空格的路径。
     #[test]
@@ -4117,9 +5365,14 @@ mod tests {
         .expect("创建本地终端失败");
         let view = Rc::new(RefCell::new(TerminalView::new(session)));
         let view_show = view.clone();
-        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
-            view_show.borrow_mut().show(ui);
-        });
+        // 宽终端：三条拖入路径 + 提示符接近 80 列，窄终端里 zsh 的 ZLE 会
+        // 横向滚动词行（`<`/`>` 标记遮挡路径），测试断言的是「路径确实写进
+        // 输入行」，不需要复现横向滚动的显示细节。
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::Vec2::new(1400.0, 600.0))
+            .build_ui(move |ui| {
+                view_show.borrow_mut().show(ui);
+            });
         assert!(wait_text(&view, &mut harness, "mino"), "zsh 未就绪");
 
         // 先让 egui 记录拖放结束时的鼠标位置；原生 dropped_files 本身不携带坐标。
@@ -4307,7 +5560,7 @@ mod tests {
 
         assert_eq!(
             harness.ctx.memory(|m| m.focused()),
-            Some(egui::Id::new("terminal_view")),
+            Some(view.borrow().focus_id()),
             "终端初始应持有焦点"
         );
         harness.event(egui::Event::Key {
@@ -4321,7 +5574,7 @@ mod tests {
 
         assert_eq!(
             harness.ctx.memory(|m| m.focused()),
-            Some(egui::Id::new("terminal_view")),
+            Some(view.borrow().focus_id()),
             "Tab 发送给 shell 后终端焦点不应被 egui 转移"
         );
     }
@@ -4718,7 +5971,9 @@ mod tests {
             egui::pos2(x0 as f32, y0 as f32),
             egui::pos2(x1 as f32 + 1.0, y1 as f32 + 1.0),
         );
-        let inner = outer.shrink(PADDING);
+        let pad = padding_points(harness.ctx.pixels_per_point());
+        let inner_min = outer.min + Vec2::splat(pad);
+        let inner = Rect::from_min_max(inner_min, egui::pos2(outer.max.x - pad, outer.max.y));
         let row_top = inner.top() + row_v as f32 * cell_height;
         let band = (row_top.max(0.0) as u32)..((row_top + cell_height) as u32);
         let is_ink = |x: u32| {
@@ -4728,9 +5983,11 @@ mod tests {
                 d(p[0], bg.r).max(d(p[1], bg.g)).max(d(p[2], bg.b)) > 24
             })
         };
-        // 行内墨迹列 → 连续墨迹簇。
+        // 行内墨迹列 → 连续墨迹簇。只扫面板区域：画布边缘（kittest 的
+        // 留白是纯黑）与新终端底色（#15141b）的通道差超过阈值，会被误判成
+        // 墨迹（曾因此多出一个 x≈0 的假簇）。
         let mut runs: Vec<(u32, u32)> = Vec::new();
-        for x in (0..img.width()).filter(|x| is_ink(*x)) {
+        for x in (outer.left() as u32..outer.right() as u32).filter(|x| is_ink(*x)) {
             match runs.last_mut() {
                 Some(last) if last.1 + 1 == x => last.1 = x,
                 _ => runs.push((x, x)),
@@ -5168,46 +6425,6 @@ mod mouse_wheel_tests {
             view.borrow().selection.is_none(),
             "鼠标上报开启时点击应透传程序，不建本地选区"
         );
-    }
-
-    /// 网格线改由缓存 `Mesh` 绘制后，顶点必须采样字体图集的白色像素
-    /// （`WHITE_UV` = 图集左上角）：uv 若非 (0,0)，网格线会采到字形像素
-    /// 而出现彩色噪点；纹理 id 也必须指向图集而不是自定义纹理。
-    #[test]
-    fn 网格线网格采样白像素() {
-        let mesh = build_grid_lines_mesh(
-            Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(200.0, 100.0)),
-            1.0,
-        );
-        assert!(
-            !mesh.vertices.is_empty() && mesh.indices.len().is_multiple_of(3),
-            "网格线网格不应为空且索引应为三角形：{} 顶点 / {} 索引",
-            mesh.vertices.len(),
-            mesh.indices.len()
-        );
-        assert_eq!(
-            mesh.texture_id,
-            egui::TextureId::Managed(0),
-            "网格线应使用字体图集（含白像素）作为纹理"
-        );
-        assert!(
-            mesh.vertices.iter().all(|v| v.uv == egui::epaint::WHITE_UV),
-            "网格线顶点应全部采样白像素，否则会采到字形像素"
-        );
-    }
-
-    /// 缓存命中必须复用同一份顶点数据（面板矩形与 ppp 不变时零重建）。
-    #[test]
-    fn 网格线缓存命中不重建() {
-        let rect = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(200.0, 100.0));
-        let first = build_grid_lines_mesh(rect, 1.0);
-        let second = build_grid_lines_mesh(rect, 1.0);
-        assert_eq!(
-            first.vertices.len(),
-            second.vertices.len(),
-            "同一面板矩形应产出确定的顶点数"
-        );
-        assert_eq!(first.indices, second.indices);
     }
 
     /// 回归：omp 发出的 OSC8 超链接（`tui.hyperlinks=always` 下路径/URL
@@ -6319,12 +7536,7 @@ mod osc_tests {
 
         // 任意主题下：背景应为主题色，而非 OSC 深色。
         let theme_bg = crate::theme::current_theme().term_bg;
-        let resolved = resolve_color(
-            TermColor::Named(Named::Background),
-            &colors,
-            theme_bg,
-            false,
-        );
+        let resolved = resolve_color(TermColor::Named(Named::Background), &colors, theme_bg);
         assert_eq!(
             resolved,
             Color32::from_rgb(theme_bg.r, theme_bg.g, theme_bg.b),
@@ -6337,12 +7549,7 @@ mod osc_tests {
             g: 0xff,
             b: 0x00,
         });
-        let resolved_fg = resolve_color(
-            TermColor::Named(Named::Foreground),
-            &colors,
-            theme_bg,
-            false,
-        );
+        let resolved_fg = resolve_color(TermColor::Named(Named::Foreground), &colors, theme_bg);
         assert_eq!(resolved_fg, Color32::from_rgb(0x00, 0xff, 0x00));
     }
 }
@@ -6403,9 +7610,13 @@ mod paste_tests {
         view.borrow_mut()
             .set_clipboard_for_test(Box::new(FakeClipboard));
         let view_show = view.clone();
-        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
-            view_show.borrow_mut().show(ui);
-        });
+        // 宽终端：token 较长（`@…/mino-…png`），窄终端里 zsh ZLE 的横向
+        // 滚动会把前缀移出视口，断言只看文件名与后缀的本意会被误伤。
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::Vec2::new(1400.0, 600.0))
+            .build_ui(move |ui| {
+                view_show.borrow_mut().show(ui);
+            });
         // 等 zsh 就绪。
         let deadline = Instant::now() + Duration::from_secs(8);
         let mut ready = false;
@@ -6428,7 +7639,7 @@ mod paste_tests {
         assert!(
             harness
                 .ctx
-                .memory(|m| m.has_focus(egui::Id::new("terminal_view"))),
+                .memory(|m| m.has_focus(view.borrow().focus_id())),
             "终端应持有焦点，否则图片粘贴不会触发"
         );
         harness.event(egui::Event::Key {

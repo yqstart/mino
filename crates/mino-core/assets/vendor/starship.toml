@@ -1,0 +1,76 @@
+# ~/.config/starship.toml
+
+add_newline = false
+# Upper bound for module commands (git status scan, `node --version`, ...).
+# Keep this tight: the prompt blocks on it, so a hung git or node freezes
+# every new prompt for the full duration. 2s is comfortably above normal
+# git-status times in large repos while bounding the worst case.
+command_timeout = 2000
+format = "$directory$git_branch$git_status$python$conda$package$nodejs$character"
+
+[directory]
+truncate_to_repo = true
+truncation_length = 2
+style = "bold blue"
+format = "[$path]($style)[$read_only]($read_only_style)"
+
+[character]
+success_symbol = " "
+error_symbol = " "
+format = "$symbol"
+
+# Git branch: shows the current branch name with a Nerd Font branch icon,
+# followed by the working-tree status from the [git_status] block below
+# (tasteful single-glyph markers, not the noisy default ASCII like [!?]).
+# Drop "$git_status" from `format` above to hide the status again.
+[git_branch]
+symbol = " "
+style = "bold purple"
+format = " [$symbol$branch]($style)"
+truncation_length = 24
+truncation_symbol = "…"
+
+[python]
+format = ' [\($virtualenv\)]($style)'
+style = 'bold green'
+python_binary = ['python3', 'python']
+detect_extensions = []
+detect_files = []
+detect_folders = []
+detect_env_vars = ['VIRTUAL_ENV']
+
+[conda]
+format = ' [\($environment\)]($style)'
+style = 'bold green'
+ignore_base = false
+
+[package]
+format = " is [$symbol$version]($style)"
+
+# Node.js version, shown only in JS/TS projects (package.json, .nvmrc, etc.).
+[nodejs]
+format = ' via [$symbol$version]($style)'
+style = 'bold green'
+
+# Avoid prompt width issues caused by emoji variation selectors (e.g. ☁️)
+# in some shell/font/wcwidth combinations.
+[aws]
+disabled = true
+
+# Git status indicators: single-character Nerd Font glyphs grouped together
+# with no brackets; counts only show when greater than one. Looks like:
+#   main  ↑2  ?3
+[git_status]
+format = ' [$ahead_behind$conflicted$staged$modified$untracked$stashed]($style)'
+style = "bold yellow"
+# Submodule contents don't affect the markers shown here; skipping them
+# keeps the per-prompt working-tree scan cheap in repos with submodules.
+ignore_submodules = true
+ahead = " ↑${count}"
+behind = " ↓${count}"
+diverged = " ⇕"
+conflicted = "  "
+staged = "  "
+modified = "  "
+untracked = " ?${count}"
+stashed = "  "

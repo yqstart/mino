@@ -4,6 +4,7 @@
 //! 远程会话由自建 tokio 读循环驱动（SSH channel 数据 → vte 解析器）。
 
 pub mod keys;
+pub mod sniffer;
 
 use std::collections::HashMap;
 use std::io;
@@ -16,7 +17,7 @@ use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, Msg};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::{self, Term};
+use alacritty_terminal::term::Term;
 use alacritty_terminal::tty;
 
 pub use alacritty_terminal::term::TermMode;
@@ -40,6 +41,23 @@ impl Dimensions for TermSize {
 
     fn columns(&self) -> usize {
         self.cols
+    }
+}
+
+/// Term 的共享配置（本地创建 / 远程连接 / 测试三处同源）。
+///
+/// - `kitty_keyboard`：kitty 键盘协议开关（按键编码见 `keys.rs`）；
+/// - `default_cursor_style`：Kaku 默认光标样式——闪烁竖条（BlinkingBar；
+///   2px 宽度由渲染层按设备像素绘制）。终端程序可用 `DECSCUSR` 覆盖，
+///   `CSI 0 q` 复位回本默认值。
+pub(crate) fn term_config() -> alacritty_terminal::term::Config {
+    alacritty_terminal::term::Config {
+        kitty_keyboard: true,
+        default_cursor_style: alacritty_terminal::vte::ansi::CursorStyle {
+            shape: alacritty_terminal::vte::ansi::CursorShape::Beam,
+            blinking: true,
+        },
+        ..alacritty_terminal::term::Config::default()
     }
 }
 
@@ -82,6 +100,19 @@ pub enum SessionEvent {
         /// 解码后的文本内容。
         text: String,
     },
+    /// shell 集成上报的当前目录（OSC 7，`file://host/path` 已解码为路径）。
+    ///
+    /// 工作目录跟踪的**权威来源**：本地与远程会话都适用（远程此前只能靠
+    /// `cd` 文本跟踪，别名/函数/`cd -` 等场景会停在旧目录）。
+    Cwd(String),
+    /// shell 集成标记：提示符就绪（OSC 133;A/B，shell 空闲待输入）。
+    PromptReady,
+    /// shell 集成标记：命令开始执行（OSC 133;C）。
+    CommandStart,
+    /// shell 集成标记：命令结束（OSC 133;D;<exit_code>）。
+    ///
+    /// 用于 AI 失败命令建议与标签注意力点（Kaku Assistant 同款触发源）。
+    CommandFinished(i32),
     /// 程序请求读取系统剪贴板（OSC52 load；默认配置拒绝，事件不会到达）。
     ClipboardLoad {
         /// 剪贴板类型。
@@ -109,6 +140,12 @@ impl std::fmt::Debug for SessionEvent {
             }
             SessionEvent::ClipboardLoad { .. } => f.write_str("ClipboardLoad"),
             SessionEvent::ResetTitle => f.write_str("ResetTitle"),
+            SessionEvent::Cwd(path) => f.debug_tuple("Cwd").field(path).finish(),
+            SessionEvent::PromptReady => f.write_str("PromptReady"),
+            SessionEvent::CommandStart => f.write_str("CommandStart"),
+            SessionEvent::CommandFinished(code) => {
+                f.debug_tuple("CommandFinished").field(code).finish()
+            }
         }
     }
 }
@@ -127,6 +164,41 @@ pub(crate) fn notify_wakeup(shared: &Shared, on_event: &EventHandler) {
     if !shared.wakeup.swap(true, Ordering::AcqRel) {
         (on_event)(&SessionEvent::Wakeup);
     }
+}
+
+/// shell 集成标记 → 会话事件。
+pub(crate) fn marker_to_event(marker: sniffer::Marker) -> SessionEvent {
+    match marker {
+        sniffer::Marker::Cwd(path) => SessionEvent::Cwd(path),
+        sniffer::Marker::PromptReady => SessionEvent::PromptReady,
+        sniffer::Marker::CommandStart => SessionEvent::CommandStart,
+        sniffer::Marker::CommandFinished(code) => SessionEvent::CommandFinished(code),
+    }
+}
+
+/// 把 shell 集成标记并入待处理队列并唤醒 UI。
+///
+/// `Cwd` / `PromptReady` 只保留最后一条（重复出现无意义，会挤占队列）；
+/// `CommandStart` / `CommandFinished` 与退出码保持追加。队列超限丢弃
+/// 最旧的一条（有界内存；与 `PtyWrite` 的丢弃策略一致）。
+pub(crate) fn push_marker_event(shared: &Shared, on_event: &EventHandler, event: SessionEvent) {
+    {
+        let mut pending = shared.pending.lock().unwrap();
+        if matches!(event, SessionEvent::Cwd(_) | SessionEvent::PromptReady) {
+            pending.retain(|existing| {
+                !matches!(
+                    (existing, &event),
+                    (SessionEvent::Cwd(_), SessionEvent::Cwd(_))
+                        | (SessionEvent::PromptReady, SessionEvent::PromptReady)
+                )
+            });
+        }
+        if pending.len() >= MAX_PENDING_EVENTS {
+            pending.remove(0);
+        }
+        pending.push(event);
+    }
+    notify_wakeup(shared, on_event);
 }
 
 /// 读取本地 shell 当前工作目录（macOS `PROC_PIDVNODEPATHINFO`）。
@@ -260,6 +332,10 @@ pub(crate) struct Shared {
 /// 只动这一条应答（其他模式的能力回执是正确的），且覆盖任意包内容——
 /// 程序常把 2026 查询与 kitty/OSC 11/DA1 等混在同一次写入里到达，
 /// 按“整包等于查询”匹配的旧实现从未命中（该缺陷的根因）。
+/// 待处理事件队列上限（`Listener::send_event` 与 `push_marker_event`
+/// 共用的公共上限；溢出时按各自策略合并或丢弃）。
+const MAX_PENDING_EVENTS: usize = 256;
+
 fn rewrite_sync_update_reply(text: &mut String) {
     const MARK: &str = "\x1b[?2026;";
     if !text.contains(MARK) {
@@ -294,7 +370,6 @@ impl EventListener for Listener {
             // 普通状态事件设置上限，避免异常事件无限增长。PtyWrite 是
             // 用户数据，不能因状态事件已满而丢弃；相邻写回合并以减少
             // 队列条目数量，数据本身仍完整保留。
-            const MAX_PENDING_EVENTS: usize = 256;
             match event {
                 Event::Title(title) => {
                     *self.shared.title.lock().unwrap() = title.clone();
@@ -535,6 +610,17 @@ pub struct Session {
     /// 是否为远程会话（远程不启用本地补全：无本机文件系统对应）。
     is_remote: bool,
     /// 本地会话的 PTY 读取线程（远程会话为 None）。
+    ///
+    /// unix 上读取路径经 `sniffer::pty::SniffingPty` 包装（OSC 标记嗅探），
+    /// 泛型参数随之变化；Windows 无该包装。
+    #[cfg(unix)]
+    pty_thread: Option<
+        JoinHandle<(
+            EventLoop<sniffer::pty::SniffingPty, Listener>,
+            alacritty_terminal::event_loop::State,
+        )>,
+    >,
+    #[cfg(not(unix))]
     pty_thread: Option<
         JoinHandle<(
             EventLoop<tty::Pty, Listener>,
@@ -596,10 +682,7 @@ impl Session {
         on_event: EventHandler,
     ) -> io::Result<Session> {
         let shared = Arc::new(Shared::default());
-        let config = term::Config {
-            kitty_keyboard: true,
-            ..term::Config::default()
-        };
+        let config = term_config();
 
         // 创建 PTY（macOS/Unix 平台）。
         let shell = options
@@ -623,6 +706,26 @@ impl Session {
         // （仅 unix 有此机制，Windows ConPTY 无对应问题）。
         #[cfg(unix)]
         let child_pid = pty.child().id() as i32;
+
+        // 读取路径包装：在 PTY 字节流上嗅探 shell 集成标记（OSC 7/133），
+        // 转成会话事件（工作目录、提示符就绪、命令结束与退出码）。
+        #[cfg(unix)]
+        let pty = {
+            let marker_shared = shared.clone();
+            let marker_on_event = on_event.clone();
+            let on_marker = Arc::new(move |marker: sniffer::Marker| {
+                push_marker_event(&marker_shared, &marker_on_event, marker_to_event(marker));
+            });
+            match sniffer::pty::SniffingPty::new(pty, on_marker) {
+                Ok(pty) => pty,
+                Err(err) => {
+                    // pty 随错误路径析构，先杀 shell 避免其 wait 阻塞。
+                    #[cfg(unix)]
+                    signal_child_if_running(child_pid, libc::SIGKILL);
+                    return Err(err);
+                }
+            }
+        };
 
         // 创建终端状态机。
         let term = Arc::new(FairMutex::new(Term::new(
@@ -660,6 +763,12 @@ impl Session {
             }
         };
         let channel = event_loop.channel();
+        #[cfg(unix)]
+        let pty_thread: JoinHandle<(
+            EventLoop<sniffer::pty::SniffingPty, Listener>,
+            alacritty_terminal::event_loop::State,
+        )> = event_loop.spawn();
+        #[cfg(not(unix))]
         let pty_thread: JoinHandle<(
             EventLoop<tty::Pty, Listener>,
             alacritty_terminal::event_loop::State,
@@ -1065,10 +1174,7 @@ mod tests {
         assert_eq!(events, 0);
         let _ = Session {
             term: Arc::new(FairMutex::new(Term::new(
-                term::Config {
-                    kitty_keyboard: true,
-                    ..term::Config::default()
-                },
+                term_config(),
                 &TermSize { rows: 1, cols: 1 },
                 Listener {
                     shared: shared.clone(),
