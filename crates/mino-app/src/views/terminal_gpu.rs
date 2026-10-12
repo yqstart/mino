@@ -275,6 +275,33 @@ pub struct RowBuffers {
 const V_START: u64 = 4 * 1024 * 1024;
 const I_START: u64 = 2 * 1024 * 1024;
 
+/// 顶点槽位的字节对齐单位（= `epaint::Vertex` 的尺寸）。
+///
+/// `draw_indexed` 的 `base_vertex` 是**顶点索引**：GPU 按
+/// `base_vertex * size_of::<Vertex>()` 定位顶点，而 `draw_params` 由槽位偏移
+/// 整除以该尺寸得到索引。槽位偏移不是它的整数倍时（曾用 `v_bytes * 2` 直接
+/// 当容量，480 字节的槽位落在 5856 这类偏移上），索引换算被截断，整行顶点从
+/// 错误字节位置读起——字形错乱或整行不可见（`v_off = 0` 的行 0 是唯一例外，
+/// 因此表现为「只有第一行正常」）。分配空间从 0 起、每笔容量按此对齐后，
+/// 偏移即恒为整数倍。
+const VERTEX_BYTES: u64 = std::mem::size_of::<epaint::Vertex>() as u64;
+
+/// 索引槽位的字节对齐单位（`draw_indexed` 的 `index_start` 是 u32 索引）。
+const INDEX_BYTES: u64 = std::mem::size_of::<u32>() as u64;
+
+/// 向上取整到 `align` 的倍数。
+fn align_up(value: u64, align: u64) -> u64 {
+    value.div_ceil(align) * align
+}
+
+/// 一行槽位的容量：两倍冗余 + 下限，并按对齐单位向上取整。
+///
+/// 对齐是硬约束（见 `VERTEX_BYTES`）——容量不对齐会让后续所有槽位偏移失去
+/// 对齐，`base_vertex` 换算不再无损。
+fn slot_capacity(bytes: u64, align: u64) -> u64 {
+    align_up((bytes * 2).max(256), align)
+}
+
 impl Default for RowBuffers {
     fn default() -> Self {
         Self {
@@ -393,9 +420,10 @@ impl RowBuffers {
             if self.slots.contains_key(&grid_line) {
                 self.remove_row(grid_line);
             }
-            // 容量翻倍冗余，避免字号/内容小幅增长就搬迁。
-            let v_cap = (v_bytes * 2).max(256);
-            let i_cap = (i_bytes * 2).max(256);
+            // 容量带两倍冗余，避免字号/内容小幅增长就搬迁；必须按顶点/索引
+            // 尺寸对齐（见 `VERTEX_BYTES`）。
+            let v_cap = slot_capacity(v_bytes, VERTEX_BYTES);
+            let i_cap = slot_capacity(i_bytes, INDEX_BYTES);
             let v_off = alloc_in(&mut self.free_v, &mut self.v_end, v_cap);
             let i_off = alloc_in(&mut self.free_i, &mut self.i_end, i_cap);
             let (Some(v_off), Some(i_off)) = (v_off, i_off) else {
@@ -478,6 +506,18 @@ impl RowBuffers {
     /// 取一行在缓冲中的绘制参数 `(index_start, index_count, base_vertex)`。
     pub fn draw_params(&self, grid_line: i32) -> Option<(u32, u32, i32)> {
         let slot = self.slots.get(&grid_line)?;
+        // 不变量：`base_vertex` 由槽位偏移整除以顶点尺寸得到，偏移必须对齐，
+        // 否则 GPU 从错误字节位置取顶点（整行字形错乱/不可见）。
+        debug_assert_eq!(
+            slot.v_off % VERTEX_BYTES,
+            0,
+            "顶点槽位偏移必须按顶点尺寸对齐"
+        );
+        debug_assert_eq!(
+            slot.i_off % INDEX_BYTES,
+            0,
+            "索引槽位偏移必须按索引尺寸对齐"
+        );
         Some((
             (slot.i_off / 4) as u32,
             (slot.i_len / 4) as u32,
@@ -627,5 +667,85 @@ impl UniformBlock {
 
     pub fn offset_of(&self, slot: usize) -> u32 {
         (slot as u64 * self.stride) as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 模拟 `upload_row` 的槽位分配算术（同一套 `slot_capacity` / `alloc_in` /
+    /// `free_in`），断言每次分配都按顶点尺寸对齐且 `base_vertex` 换算无损。
+    ///
+    /// 回归：曾用 `(v_bytes * 2).max(256)` 直接当容量，480 字节的槽位会落在
+    /// 5856 这类非 20 倍数的偏移上；`draw_params` 的 `v_off / 20` 截断后，
+    /// GPU 从错误字节取顶点，整行字形错乱/不可见（只有 `v_off = 0` 的行 0
+    /// 正常，用户现象是「输入命令不显示输出」）。
+    #[test]
+    fn 行槽位偏移按顶点尺寸对齐() {
+        let mut free_v: Vec<(u64, u64)> = Vec::new();
+        let mut free_i: Vec<(u64, u64)> = Vec::new();
+        let mut v_end = 0u64;
+        let mut i_end = 0u64;
+        let mut slots: Vec<(u64, u64)> = Vec::new(); // (v_off, v_cap)
+                                                     // 真实序列：短行 → 逐字增长 → 新行介入 → 大行 → 复用空洞。
+        let vertex_counts = [1u64, 2, 10, 20, 20, 3, 60, 1, 4, 300, 7, 40];
+        for (index, verts) in vertex_counts.iter().enumerate() {
+            let v_bytes = verts * VERTEX_BYTES;
+            // 顶点:索引 = 4:6（每字形一个四边形）。
+            let i_bytes = align_up(verts * 6 / 4 * INDEX_BYTES, INDEX_BYTES);
+            let v_cap = slot_capacity(v_bytes, VERTEX_BYTES);
+            let i_cap = slot_capacity(i_bytes, INDEX_BYTES);
+            let v_off = alloc_in(&mut free_v, &mut v_end, v_cap).expect("顶点分配失败");
+            let i_off = alloc_in(&mut free_i, &mut i_end, i_cap).expect("索引分配失败");
+            assert_eq!(
+                v_off % VERTEX_BYTES,
+                0,
+                "第 {index} 次分配顶点偏移 {v_off} 未按顶点尺寸对齐"
+            );
+            assert_eq!(
+                i_off % INDEX_BYTES,
+                0,
+                "第 {index} 次分配索引偏移 {i_off} 未按索引尺寸对齐"
+            );
+            // `base_vertex` 换算必须无损（GPU 按 base * 顶点尺寸 取数据）。
+            assert_eq!(
+                v_off / VERTEX_BYTES * VERTEX_BYTES,
+                v_off,
+                "base_vertex 换算有损：偏移 {v_off}"
+            );
+            assert_eq!(
+                i_off / INDEX_BYTES * INDEX_BYTES,
+                i_off,
+                "index_start 换算有损：偏移 {i_off}"
+            );
+            // 释放上一笔（模拟同一行内容增长后的重分配），走真实空洞回收路径。
+            if let Some((old_off, old_cap)) = slots.pop() {
+                free_in(&mut free_v, old_off, old_cap);
+            }
+            slots.push((v_off, v_cap));
+        }
+        // 空洞回收后仍满足对齐（`alloc_in` 优先复用空洞）。
+        for (off, cap) in &free_v {
+            assert_eq!(off % VERTEX_BYTES, 0, "空洞起点 {off} 失去对齐");
+            assert_eq!(cap % VERTEX_BYTES, 0, "空洞长度 {cap} 失去对齐");
+        }
+    }
+
+    /// 容量计算本身：下限 256、两倍冗余、按对齐单位向上取整。
+    #[test]
+    fn 槽位容量按对齐单位取整() {
+        assert_eq!(slot_capacity(0, VERTEX_BYTES), 260);
+        assert_eq!(slot_capacity(1, VERTEX_BYTES), 260);
+        assert_eq!(slot_capacity(128, VERTEX_BYTES), 260);
+        assert_eq!(slot_capacity(129, VERTEX_BYTES), 260);
+        assert_eq!(slot_capacity(130, VERTEX_BYTES), 260);
+        assert_eq!(slot_capacity(240, VERTEX_BYTES), 480);
+        assert_eq!(slot_capacity(480, VERTEX_BYTES), 960);
+        for bytes in [1u64, 20, 21, 99, 480, 1600, 2001] {
+            let cap = slot_capacity(bytes, VERTEX_BYTES);
+            assert_eq!(cap % VERTEX_BYTES, 0, "{bytes} 的容量 {cap} 未对齐");
+            assert!(cap >= bytes, "容量 {cap} 小于实际字节 {bytes}");
+        }
     }
 }

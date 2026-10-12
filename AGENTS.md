@@ -97,6 +97,7 @@ crates/
 - **管线逐项对齐 egui**（颜色格式/混合/采样数/顶点布局/抖动/gamma/预乘 alpha），否则自管绘制与相邻 egui 控件有可见色差；顶点 uv 是 epaint 的**纹素坐标**，归一化在顶点着色器里做（`a_tex_coord / r_locals.atlas_size`）
 - **图集换代看门狗（双条件）**：行顶点 uv 与图集尺寸强绑定，按「尺寸变化 **或** 填充率骤降」检测——epaint 整份重建字体系统时尺寸可能一模一样但字形位置全变（只比尺寸会漏，表现为字符错位/串码）；图集还会在同帧更晚的位置（其它控件首次用到新字形）继续变大，因此必须在**下一帧开头**再比一次当前尺寸与 `mesh_atlas_size`，不一致立即整屏重建并请求重绘
 - **逐行缓冲 + 区间分配器**：`RowBuffers` 每行独立槽位（容量翻倍冗余、`free_v`/`free_i` 空洞合并），容量不足时返回 false（该行本帧不可见）；uniform 步长按 `min_uniform_buffer_offset_alignment` 放大（`TerminalGpu::new` 读设备 limit），每行一个 `Locals`，**上限 `MAX_ROWS = 256`**
+- **槽位偏移必须按顶点尺寸对齐（2026-10-12 修复）**：`draw_indexed` 的 `base_vertex` 是**顶点索引**，GPU 按 `base_vertex × size_of::<Vertex>()`（20 字节）取顶点，而 `draw_params` 由槽位偏移整除以该尺寸反推索引——容量一旦不是 20 的整数倍（曾用 `v_bytes * 2` 直接当容量，480 字节的槽位落在 5856 这类偏移上），索引换算被截断、整行顶点从错误字节读起，用户现象是「第一行正常，其余行没有回显与输出，终端等于不可用」（`v_off = 0` 的首行是唯一例外，故极易误判为「只有首行能画」）。容量一律走 `slot_capacity`（`align_up` 到 `VERTEX_BYTES`/`INDEX_BYTES`），`draw_params` 带 `debug_assert` 不变量，回归测试 `行槽位偏移按顶点尺寸对齐` 覆盖分配-释放-复用全流程；该缺陷自 v1.1.2 起存在，kittest 默认 harness 无 wgpu 后端、覆盖不到自管路径，只有 `.wgpu()` harness 或实机才能暴露
 - **`screen_size` 必须是整个渲染目标的点尺寸**（窗口），不是终端内容区：着色器用「绝对坐标 ÷ 全屏尺寸」→ NDC，传内容区尺寸会把坐标放大（文字整体拉伸错位）
 
 ### 终端能力应答（v1.0.8 起，`terminal/mod.rs` + `terminal_view.rs` + `keys.rs`）
