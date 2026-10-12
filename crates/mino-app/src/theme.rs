@@ -556,6 +556,34 @@ pub fn current_theme() -> &'static Theme {
     &THEMES[CURRENT_THEME.load(Ordering::Relaxed)]
 }
 
+/// 窗口背景不透明度（Kaku `window_background_opacity`；1000 = 1.0 的定点）。
+///
+/// 进程级静态与主题同理：绘制层（终端背景、标题条、标签栏、面板）在取色时
+/// 统一经 [`apply_window_alpha`] 叠加，避免每个绘制点各传一份参数。
+static WINDOW_OPACITY: AtomicUsize = AtomicUsize::new(1000);
+
+/// 设置窗口背景不透明度（钳到 0.5..=1.0；1.0 = 不透明）。
+pub fn set_window_opacity(value: f32) {
+    let value = value.clamp(0.5, 1.0);
+    WINDOW_OPACITY.store((value * 1000.0).round() as usize, Ordering::Relaxed);
+}
+
+/// 当前窗口背景不透明度（1.0 = 不透明）。
+pub fn window_opacity() -> f32 {
+    WINDOW_OPACITY.load(Ordering::Relaxed) as f32 / 1000.0
+}
+
+/// 把主题色按窗口不透明度变成半透明（egui 的 `Color32` 是预乘 alpha，
+/// 等比缩放通道与 alpha 即正确的半透明色；1.0 时原样返回）。
+pub fn apply_window_alpha(color: Color32) -> Color32 {
+    let opacity = window_opacity();
+    if opacity >= 1.0 {
+        color
+    } else {
+        color.gamma_multiply(opacity)
+    }
+}
+
 /// 当前主题下标（0 深 / 1 浅）。
 pub fn current_theme_index() -> usize {
     CURRENT_THEME.load(Ordering::Relaxed)

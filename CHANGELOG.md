@@ -20,9 +20,23 @@
 - **窗口快照**：退出时自动保存标签布局（本地记目录、SSH 记主机档案），⌘⌥⇧T 或命令面板恢复（损坏/缺失按「没有快照」处理，0600 落盘）
 - **标签增强**：双击标签标题重命名；Bell/失败命令点亮标签注意力点（橙色，激活即消）
 
+### 终端行为与渲染对齐（Kaku B 组）
+
+- **分屏间隙**按 Kaku 语义换算：`split_pane_gap = 2` 的渲染语义是 `gutter = 1 + 2 × gap` 个字符宽（≈5 字宽，实测 Kaku 截图同量级），间隙按实测字宽动态计算（此前固定 10px，明显比 Kaku 窄）
+- **标签标题**改为「父目录/当前目录」（Kaku `tab_title_show_basename_only = false` 默认语义：`www/Kaku`），放大态追加 ` [Z]`；**窗口标题**跟随活动标签并在多标签时加 `[i/n]` 前缀（Kaku `format-window-title`，Mission Control/窗口菜单可见）
+- **`COLORFGBG` 注入**本地会话（浅色 `0;15`、深色 `15;0`，Kaku `set_environment_variables` 同款）：vim/tmux/部分 TUI 据此判浅深底
+- **`OSC 9;4` 进度上报**：出错(2)/暂停(4) 点亮标签注意力点（Kaku 文档同源），进行中(1)/不确定(3) 不上点，`OSC 9;<message>` 通知不误判
+- **拖选时滚轮扩展选区**（Kaku `selection_wheel_scroll_behavior = "Extend"` 默认）：滚轮滚动视口，选区端点按滚动后的偏移跟随光标，跨屏选择不用松手重选
+- **文件链接用编辑器打开**（Kaku `file_link_editor`）：⌘+点击带 `:行[:列]` 的本地文件链接交给编辑器（`路径:行:列` 单参数），解析顺序为配置 → `code`/`cursor` → `$VISUAL`/`$EDITOR` → 系统默认程序；远程会话与不存在的路径仍走系统默认程序
+- **右 Option 输入组合字符**（Kaku：左 Option = Meta、右 Option = 组合键）：按 `AltLeft`/`AltRight` 跟踪侧别，右 Option 的 `⌥2` 上屏 `™`，左 Option 仍是 ESC 前缀
+- **窗口不透明度与毛玻璃**（Kaku `window_background_opacity` / `macos_window_background_blur`）：设置弹窗可调（0.5–1.0 / 0–100），终端背景与窗口 chrome 统一下调 alpha；< 1.0 或模糊 > 0 时以透明窗口启动（窗口是否透明在创建时决定，改动需重启完整生效）；macOS 材质走 `NSVisualEffectView`（系统不暴露半径，数值只区分开/关）
+- **窗口尺寸/位置记忆**（Kaku `state.json` 的 `window_geometry`/`window_position`）：退出写入快照文件、启动按记录恢复（无记录/越界/损坏按默认居中）
+- **块字形无缝拼接**为既有字体链性质（JetBrains Mono 块字形覆盖整行高），新增像素级回归测试守卫——Kaku 用 `custom_block_glyphs` 自绘达成的效果在 Mino 由字体提供，无需自绘
+
 ### 改进
 
 - 截图/术语/文档全面对齐 Kaku（`AGENTS.md` 重写相关章节）
+- 替代屏（alt screen）滚轮维持映射方向键：VT 引擎（alacritty）在替代屏没有可滚动历史，照搬 Kaku 的"窥视回滚缓冲"默认只会让滚轮变成空操作（新增哨兵测试守卫该决策）
 - app 测试新增：分屏拆分与关闭窗格、快捷键关闭与重开标签、Kaku 快捷键族、标签导航与命令面板、窗口快照保存与恢复、收藏远程会话为工作区、应用 AI 建议路径、工作区菜单/面板/管理器、搜索子串语义与命中导航等
 
 ### 破坏性变更

@@ -45,9 +45,13 @@ const TAB_MIN_WIDTH: f32 = 84.0;
 const TAB_MAX_WIDTH: f32 = 320.0;
 /// 「＋」新建标签按钮宽度。
 const NEW_TAB_WIDTH: f32 = 34.0;
-/// 分屏窗格间隙（点）。Kaku `split_pane_gap = 2`（WezTerm cells 语义）的
-/// 视觉等效值：窗格底色相同，间隙只提供呼吸空间。
-const PANE_GAP: f32 = 10.0;
+/// 分屏窗格间隙（字符宽）。Kaku 默认 `split_pane_gap = 2`，其自带配置的
+/// 注释写明渲染语义是 `gutter = 1 + 2 × gap` 个字符宽（kaku.lua:4830），
+/// 即相邻窗格之间留 5 个字符宽的空白——实测 Kaku 截图（`/tmp/kaku.jpg`）
+/// 也是 5 个多字宽。字宽随字号变化，因此间隙按实测字宽换算而非固定像素。
+const PANE_GAP_CELLS: f32 = 5.0;
+/// 字宽尚未测量（字体初始化首帧）时的近似间隙（15pt 字号下 5 字符宽）。
+const PANE_GAP_FALLBACK: f32 = 45.0;
 
 /// 工作区编辑表单状态（本地目录 / SSH 主机二选一；新增或编辑既有条目）。
 struct WorkspaceEdit {
@@ -424,6 +428,53 @@ const CLOSED_TAB_STACK: usize = 12;
 struct WindowSnapshot {
     #[serde(default)]
     tabs: Vec<SnapshotTab>,
+    /// 窗口尺寸 `[宽, 高]`（点；Kaku `state.json` 的 `window_geometry`）。
+    /// 老快照缺字段时为 None → 按默认尺寸启动。
+    #[serde(default)]
+    window_size: Option<[f32; 2]>,
+    /// 窗口位置 `[x, y]`（屏幕坐标；Kaku `window_position`）。
+    #[serde(default)]
+    window_position: Option<[f32; 2]>,
+}
+
+/// 从配置读取窗口不透明度与毛玻璃强度（Kaku `window_background_opacity` /
+/// `macos_window_background_blur`）。
+///
+/// 必须在**窗口创建前**读（main）：窗口透明与否由系统在创建时确定。
+/// 读取失败按"全不透明、无模糊"处理（同 Kaku 的容错取向）。
+pub(crate) fn window_effects_from_config(config_path: &std::path::Path) -> (f32, f32) {
+    let config = HostConfig::load(config_path).unwrap_or_default();
+    (
+        config.window_background_opacity.clamp(0.5, 1.0),
+        config.macos_window_background_blur.max(0.0),
+    )
+}
+
+/// 上次退出时的窗口尺寸与位置（Kaku `state.json` 的窗口状态；缺失/损坏
+/// 按"没有记录"处理 → 用默认尺寸居中启动）。
+///
+/// 读取失败一律返回 None：几何记忆是便利功能，不能让启动流程失败。
+pub(crate) fn restored_window_geometry(
+    config_path: &std::path::Path,
+) -> Option<([f32; 2], Option<[f32; 2]>)> {
+    let text = std::fs::read_to_string(config_path.with_file_name("snapshot.toml")).ok()?;
+    let snapshot: WindowSnapshot = toml::from_str(&text).ok()?;
+    // 位置做基本范围检查：虚拟桌面坐标绝对值不会离谱（防手改/损坏的坐标
+    // 把窗口扔到看不见的地方）。
+    let position = snapshot.window_position.filter(|[x, y]| {
+        x.is_finite() && y.is_finite() && x.abs() <= 32000.0 && y.abs() <= 32000.0
+    });
+    snapshot
+        .window_size
+        .filter(|[w, h]| {
+            w.is_finite()
+                && h.is_finite()
+                && *w >= 200.0
+                && *h >= 150.0
+                && *w <= 20000.0
+                && *h <= 20000.0
+        })
+        .map(|size| (size, position))
 }
 
 /// 单个快照标签：本地记目录，远程记主机档案与远端目录。
@@ -557,24 +608,38 @@ impl TerminalTab {
     /// 标签标题：`(显示文本, 全路径悬浮提示)`。
     ///
     /// - 用户重命名过：用自定义标题；
-    /// - 多窗格：各窗格目录名以 `∙` 去重连接（Kaku 多窗格标签同款），
+    /// - 多窗格：各窗格目录标签以 `∙` 去重连接（Kaku 多窗格标签同款），
     ///   悬浮提示给出各自全路径；
-    /// - 本地单窗格：当前目录的**末级文件夹名**（与 zsh `%c` 一致，home
-    ///   显示 `~`）+ 全路径提示。目录以 shell 子进程的内核 cwd 为准
-    ///   （`Session::child_current_dir`）；**不**采用 shell 上报的窗口标题
-    ///   （oh-my-zsh 的标题是截断过的 `%15<..<%~%<<`，拿不到完整路径）。
+    /// - 本地单窗格：**父目录/当前目录**（Kaku `format-tab-title` 的默认
+    ///   语义，`tab_title_show_basename_only = false`：`/Users/me/www/Kaku`
+    ///   显示 `www/Kaku`，kaku.lua:3152-3157）；目录以 shell 子进程的内核
+    ///   cwd 为准（`Session::child_current_dir`）；**不**采用 shell 上报的
+    ///   窗口标题（oh-my-zsh 的标题是截断过的 `%15<..<%~%<<`，拿不到完整
+    ///   路径）。
+    /// - 放大态：末尾追加 ` [Z]`（Kaku `active_pane.is_zoomed` 同款）。
     /// - 远程标签：主机名（远端目录由 sshd 决定、本地跟踪器不适用）。
     fn title(&self) -> (String, Option<String>) {
-        if let Some(custom) = &self.title_override {
-            return (custom.clone(), None);
+        let (text, tooltip) = if let Some(custom) = &self.title_override {
+            (custom.clone(), None)
+        } else {
+            self.auto_title()
+        };
+        if self.zoomed.is_some() && !text.ends_with(" [Z]") {
+            (format!("{text} [Z]"), tooltip)
+        } else {
+            (text, tooltip)
         }
+    }
+
+    /// 自动标题（不含放大标记）：多窗格 / 本地单窗格 / 远程标签三态分支。
+    fn auto_title(&self) -> (String, Option<String>) {
         let dirs: Vec<(String, String)> = self
             .panes
             .iter()
             .filter_map(|pane| {
                 pane.view
                     .effective_local_directory()
-                    .map(|full| (dir_display_name(&full), full))
+                    .map(|full| (tab_dir_label(&full), full))
             })
             .collect();
         if dirs.len() >= 2 {
@@ -597,7 +662,7 @@ impl TerminalTab {
         }
     }
 
-    /// 本地会话的 `(末级目录名, 全路径)`；远程会话返回 `None`。
+    /// 本地会话的 `(目录标签, 全路径)`；远程会话返回 `None`。
     ///
     /// 数据源是 `TerminalView::effective_local_directory`（内核 cwd 优先、
     /// 跟踪值回退）：输入跟踪在粘贴/补全/别名等场景下会停在旧目录，
@@ -605,7 +670,7 @@ impl TerminalTab {
     /// 截断过的 `%15<..<%~%<<`）。
     fn local_dir(&self) -> Option<(String, String)> {
         let full = self.active_view().effective_local_directory()?;
-        Some((dir_display_name(&full), full))
+        Some((tab_dir_label(&full), full))
     }
 }
 
@@ -712,25 +777,50 @@ fn paint_workspace_row(
         .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-/// 目录的展示名：只保留最末级文件夹名（与 zsh `%c` 提示符语义一致）。
+/// 目录的标签展示名（Kaku `format-tab-title` 的路径语义）。
 ///
-/// - home 显示 `~`、根目录显示 `/`（`%c` 同样如此，避免标签写着用户名）；
-/// - 尾随 `/` 先剥掉，`/Users/me/proj/` 与 `/Users/me/proj` 同名。
-fn dir_display_name(path: &str) -> String {
+/// 默认显示**父目录/当前目录**：`/Users/me/www/Kaku` → `www/Kaku`
+/// （kaku.lua:3152-3157 的 `parent .. '/' .. current`，Kaku 默认
+/// `tab_title_show_basename_only = false`，其 README 截图的标签即为
+/// `www/Kaku` 形态）。父目录不存在（根、单级路径）时只显示当前目录；
+/// 根目录显示 `/`；尾随 `/` 先剥掉（`/Users/me/proj/` 与 `/Users/me/proj`
+/// 同名）。
+fn tab_dir_label(path: &str) -> String {
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() {
         return "/".to_string();
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = home.to_string_lossy();
-        if !home.is_empty() && trimmed == home.trim_end_matches('/') {
-            return "~".to_string();
-        }
+    let current = std::path::Path::new(trimmed)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| trimmed.to_string());
+    let parent = std::path::Path::new(trimmed)
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if parent.is_empty() {
+        current
+    } else {
+        format!("{parent}/{current}")
     }
-    match Path::new(trimmed).file_name() {
-        Some(name) => name.to_string_lossy().into_owned(),
-        None => trimmed.to_string(),
-    }
+}
+
+/// 分屏间隙（点）：Kaku `split_pane_gap = 2` 的视觉等效值。
+///
+/// 取活动窗格的实测字宽 × `PANE_GAP_CELLS`（5 字符宽）；字宽尚未测量
+/// （字体初始化首帧）时退回 `PANE_GAP_FALLBACK`。窗格字宽一致，用活动
+/// 窗格即可（活动窗格缺失时退回第一个窗格）。
+fn pane_gap(tab: Option<&TerminalTab>) -> f32 {
+    tab.and_then(|tab| {
+        tab.panes
+            .iter()
+            .find(|pane| pane.id == tab.active_pane)
+            .or_else(|| tab.panes.first())
+    })
+    .and_then(|pane| pane.view.cell_metrics())
+    .map(|(width, _)| width * PANE_GAP_CELLS)
+    .unwrap_or(PANE_GAP_FALLBACK)
 }
 
 /// 一次 SSH/SFTP 连接的身份与状态。
@@ -774,6 +864,9 @@ pub struct MinoApp {
     workspace_selected: usize,
     /// 最近一帧的 egui::Context（`new_local_tab` 等非 UI 闭包内构造时使用）。
     last_ctx: egui::Context,
+    /// 最后写入窗口的标题（Kaku `format-window-title`；只在变化时下发
+    /// `ViewportCommand::Title`，避免每帧重设）。
+    window_title: Option<String>,
     config: HostConfig,
     config_path: PathBuf,
     /// 原配置无法读取且备份也失败时，禁止用空配置覆盖原文件。
@@ -894,11 +987,27 @@ fn local_session_options_at(dir: Option<PathBuf>) -> SessionOptions {
             // 只在 Mino 会话里加载 zsh 集成与 Smart Tab，其它终端不受影响。
             ("TERM_PROGRAM".to_string(), "Mino".to_string()),
             ("MINO_SHELL_INTEGRATION".to_string(), "1".to_string()),
+            // COLORFGBG（Kaku `set_environment_variables['COLORFGBG']` 同款）：
+            // 浅色主题 `0;15`、深色 `15;0`。程序（vim、tmux、部分 TUI）据此
+            // 判断浅/深底，缺了它在浅色主题下会按深底配色。
+            ("COLORFGBG".to_string(), colorfgbg().to_string()),
             ("CLICOLOR".to_string(), "1".to_string()),
             ("LSCOLORS".to_string(), "Gxfxcxdxbxegedabagacad".to_string()),
         ]
         .into(),
         ..Default::default()
+    }
+}
+
+/// 当前主题对应的 `COLORFGBG`（Kaku：浅色 `0;15`、深色 `15;0`）。
+///
+/// 只在会话创建时注入（Kaku 同样在配置加载时定值），创建后切换外观不会
+/// 改写已存在会话的环境变量。
+fn colorfgbg() -> &'static str {
+    if crate::theme::current_theme_index() == 0 {
+        "15;0"
+    } else {
+        "0;15"
     }
 }
 
@@ -1226,6 +1335,8 @@ impl MinoApp {
 
         // 加载失败不能静默按空配置启动：文件存在但解析失败时先备份原文，
         // 避免后续保存把用户主机列表覆盖掉。
+        // 窗口不透明度先落地到进程级绘制参数（Kaku `window_background_opacity`）：
+        // 终端背景、标题条、标签栏、面板取色时统一经 `apply_window_alpha`。
         let (config, load_message, config_write_blocked) = match HostConfig::load(&config_path) {
             Ok(c) => (c, None, false),
             Err(e) => {
@@ -1290,6 +1401,9 @@ impl MinoApp {
             &ctx,
             crate::theme::resolve_appearance(config.appearance.trim(), system_dark),
         );
+        // 窗口不透明度（Kaku `window_background_opacity`）：进程级绘制参数，
+        // 终端背景/chrome 取色时统一叠加（窗口本身是否透明在 main 创建时定）。
+        crate::theme::set_window_opacity(config.window_background_opacity);
         if (config.font_size - 13.0).abs() < 0.01 {
             config.font_size = if ctx.pixels_per_point() <= 1.0 {
                 15.0
@@ -1314,6 +1428,7 @@ impl MinoApp {
             workspace_filter: String::new(),
             workspace_selected: 0,
             last_ctx: cc.egui_ctx.clone(),
+            window_title: None,
             config,
             config_path,
             config_write_blocked,
@@ -1514,8 +1629,10 @@ impl MinoApp {
         let mut view = TerminalView::new(session);
         view.set_gpu(self.terminal_gpu.clone());
         // 新标签继承当前全局字号（启动恢复/快捷键/滑杆都只改 `config` +
-        // 存量标签；新建标签必须跟上，否则新旧标签字不一样大）。
+        // 存量标签；新建标签必须跟上，否则新旧标签字不一样大）与文件链接
+        // 编辑器设置。
         view.set_font_size(self.config.font_size);
+        view.set_file_link_editor(&self.config.file_link_editor);
         // 启动命令只取首个非空行：多行粘贴会被 shell 逐行执行，
         // 配置里换行只可能是误粘贴，不应多行注入。
         if let Some(line) = command.lines().map(str::trim).find(|l| !l.is_empty()) {
@@ -1787,7 +1904,21 @@ impl MinoApp {
                 }
             })
             .collect();
-        let snapshot = WindowSnapshot { tabs };
+        // 窗口几何（Kaku `state.json` 的 window_geometry/window_position）：
+        // 外框位置 + 内框尺寸，退出时记下、下次启动恢复。
+        let (window_size, window_position) = self.last_ctx.input(|i| {
+            let viewport = i.viewport();
+            let size = viewport
+                .inner_rect
+                .map(|rect| [rect.width(), rect.height()]);
+            let position = viewport.outer_rect.map(|rect| [rect.min.x, rect.min.y]);
+            (size, position)
+        });
+        let snapshot = WindowSnapshot {
+            tabs,
+            window_size,
+            window_position,
+        };
         let path = self.snapshot_path();
         if let Err(e) = save_private_toml(&snapshot, &path) {
             log::warn!("保存窗口快照失败：{e}");
@@ -1978,16 +2109,43 @@ impl MinoApp {
         ctx.request_repaint();
     }
 
+    /// 窗口标题（Kaku `format-window-title` 语义）。
+    ///
+    /// 取活动标签的显示标题（已含放大 ` [Z]` 后缀）；多标签时前缀
+    /// `[活动序号/总数]`（Kaku 只在多标签时加，单标签就是纯标题）。
+    /// 没有标签（全部关完）时退回产品名。只在标题变化时下发
+    /// `ViewportCommand::Title`：它每帧重设会白刷一次窗口系统调用。
+    fn sync_window_title(&mut self, ctx: &egui::Context) {
+        let wanted = match self.tabs.get(self.active_tab) {
+            Some(tab) => {
+                let (title, _) = tab.title();
+                if self.tabs.len() > 1 {
+                    format!("[{}/{}] {}", self.active_tab + 1, self.tabs.len(), title)
+                } else {
+                    title
+                }
+            }
+            None => PRODUCT_NAME.to_string(),
+        };
+        if self.window_title.as_deref() != Some(wanted.as_str()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(wanted.clone()));
+            self.window_title = Some(wanted);
+        }
+    }
+
     /// 渲染活动标签的全部分屏窗格。
     ///
-    /// - 布局：`pane_tree::layout` 按窗口可用区分配（相邻窗格间留
-    ///   `PANE_GAP`；Kaku/WezTerm 的 split gap 同构）；
+    /// - 布局：`pane_tree::layout` 按窗口可用区分配（相邻窗格间留 Kaku
+    ///   默认 `split_pane_gap = 2` 的视觉等效值——5 个字符宽，见
+    ///   `PANE_GAP_CELLS`；字宽随字号变化，按活动窗格实测字宽换算）；
     /// - 放大态：只渲染被放大的窗格、独占整个区域；
     /// - 输入：只有活动窗格消费键盘/鼠标（Kaku `swallow_mouse_click_on_pane_focus`
     ///   同款——点击非活动窗格先聚焦、点击内容不透传给程序）；
     /// - 焦点跟随：egui 焦点落在哪个窗格，活动窗格就切到哪个（点击/导航/新
     ///   分屏统一收敛到这一处）。
     fn render_tab_panes(&mut self, ui: &mut egui::Ui, input_enabled: bool) {
+        // 间隙在借用 `tabs` 之前算好（需要活动窗格的字宽）。
+        let gap = pane_gap(self.tabs.get(self.active_tab).map(|tab| &**tab));
         let Some(tab) = self.tabs.get_mut(self.active_tab) else {
             return;
         };
@@ -1996,7 +2154,7 @@ impl MinoApp {
         if let Some(zoom) = tab.zoomed {
             rects.push((zoom, area));
         } else {
-            pane_tree::layout(&tab.layout, area, PANE_GAP, &mut rects);
+            pane_tree::layout(&tab.layout, area, gap, &mut rects);
         }
         let active = tab.active_pane;
         tab.pane_rects = rects.clone();
@@ -2378,6 +2536,66 @@ impl MinoApp {
     /// （见 `mount_local_session`/`poll_connection`）。落盘只写 `font_size`
     /// 一个字段的变化，不碰主机/项目。`silent` 为 true 时不弹 toast（快捷键
     /// 连续缩放每步都弹会刷屏；滑杆拖动中同样静默，释放后再提示）。
+    /// 应用窗口不透明度/毛玻璃并落盘（设置弹窗滑杆）。
+    ///
+    /// 不透明度立即作用于绘制颜色（终端背景/chrome）；**窗口本身**是否透明
+    /// 由创建时决定，因此从 1.0 调低需要重启窗口才看得到透过桌面——这种情况
+    /// 提示用户（`theme::window_opacity` 已在进程内生效，重启后即完整生效）。
+    fn apply_window_effects_and_persist(&mut self, ctx: &egui::Context, opacity: f32, blur: f32) {
+        let opacity = opacity.clamp(0.5, 1.0);
+        let blur = blur.max(0.0);
+        if (opacity - self.config.window_background_opacity).abs() < f32::EPSILON
+            && (blur - self.config.macos_window_background_blur).abs() < f32::EPSILON
+        {
+            return;
+        }
+        let previous = (
+            self.config.window_background_opacity,
+            self.config.macos_window_background_blur,
+        );
+        self.config.window_background_opacity = opacity;
+        self.config.macos_window_background_blur = blur;
+        crate::theme::set_window_opacity(opacity);
+        if !self.save_config() {
+            self.config.window_background_opacity = previous.0;
+            self.config.macos_window_background_blur = previous.1;
+            crate::theme::set_window_opacity(previous.0);
+            return;
+        }
+        if opacity < 1.0 || blur > 0.0 {
+            // 窗口创建时若还是全不透明，这里的改动只能看到配色变淡。
+            self.show_toast("窗口透明度/毛玻璃：重启应用后完整生效", false);
+        }
+        ctx.request_repaint();
+    }
+
+    /// 应用文件链接编辑器命令并落盘（设置弹窗输入框；空串 = 自动探测）。
+    ///
+    /// 与字号同款：写入 `config` → 全部存量窗格 → 落盘失败则整体回滚。
+    fn apply_file_link_editor_and_persist(&mut self, ctx: &egui::Context, editor: String) {
+        let editor = editor.trim().to_string();
+        if editor == self.config.file_link_editor {
+            return;
+        }
+        let previous = self.config.file_link_editor.clone();
+        self.config.file_link_editor = editor.clone();
+        for tab in &mut self.tabs {
+            for pane in &mut tab.panes {
+                pane.view.set_file_link_editor(&editor);
+            }
+        }
+        if !self.save_config() {
+            self.config.file_link_editor = previous.clone();
+            for tab in &mut self.tabs {
+                for pane in &mut tab.panes {
+                    pane.view.set_file_link_editor(&previous);
+                }
+            }
+            return;
+        }
+        ctx.request_repaint();
+    }
+
     fn apply_font_size_and_persist(&mut self, ctx: &egui::Context, size: f32, silent: bool) {
         let size = size.clamp(TerminalView::MIN_FONT_SIZE, TerminalView::MAX_FONT_SIZE);
         if (size - self.config.font_size).abs() < f32::EPSILON
@@ -2876,6 +3094,7 @@ impl MinoApp {
                     let mut view = TerminalView::new(session);
                     view.set_gpu(self.terminal_gpu.clone());
                     view.set_font_size(self.config.font_size);
+                    view.set_file_link_editor(&self.config.file_link_editor);
                     let origin = self
                         .pending_profile
                         .take()
@@ -3544,6 +3763,113 @@ impl MinoApp {
                                                 .color(theme.text_muted),
                                         );
                                     });
+                                    ui.add_space(10.0);
+                                    // 文件链接编辑器（Kaku `file_link_editor`）：
+                                    // ⌘+点击终端里的文件链接（可带 `:行:列`）
+                                    // 用它打开；留空自动探测 VS Code 系 →
+                                    // `$VISUAL`/`$EDITOR` → 系统默认程序。
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new("文件链接编辑器")
+                                                .size(12.0)
+                                                .color(theme.text_muted),
+                                        );
+                                        ui.add_space(8.0);
+                                        let mut editor = self.config.file_link_editor.clone();
+                                        let edit = ui.add(
+                                            egui::TextEdit::singleline(&mut editor)
+                                                .desired_width(240.0)
+                                                .hint_text("留空自动探测（如 zed、cursor --goto）"),
+                                        );
+                                        if edit.changed() {
+                                            let editor_ctx = ui.ctx().clone();
+                                            self.apply_file_link_editor_and_persist(
+                                                &editor_ctx,
+                                                editor,
+                                            );
+                                        }
+                                    });
+                                    ui.add_space(2.0);
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "⌘+点击文件链接在编辑器里打开（路径:行:列）；留空则探测 code/cursor → $EDITOR",
+                                        )
+                                        .size(10.0)
+                                        .color(theme.text_muted),
+                                    );
+                                    ui.add_space(10.0);
+                                    // 窗口透明度与毛玻璃（Kaku
+                                    // `window_background_opacity` /
+                                    // `macos_window_background_blur`）：颜色即时
+                                    // 生效，窗口透明与否需重启（创建时决定）。
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new("窗口不透明度")
+                                                .size(12.0)
+                                                .color(theme.text_muted),
+                                        );
+                                        ui.add_space(8.0);
+                                        let mut opacity = self.config.window_background_opacity;
+                                        let slider = egui::Slider::new(&mut opacity, 0.5..=1.0)
+                                            .step_by(0.05)
+                                            .fixed_decimals(2)
+                                            .show_value(true);
+                                        let changed = ui
+                                            .scope(|ui| {
+                                                crate::theme::apply_slider_style(
+                                                    ui.style_mut(),
+                                                    theme,
+                                                );
+                                                ui.add(slider)
+                                            })
+                                            .inner
+                                            .changed();
+                                        if changed {
+                                            let effect_ctx = ui.ctx().clone();
+                                            self.apply_window_effects_and_persist(
+                                                &effect_ctx,
+                                                opacity,
+                                                self.config.macos_window_background_blur,
+                                            );
+                                        }
+                                        ui.add_space(8.0);
+                                        ui.label(
+                                            egui::RichText::new("毛玻璃")
+                                                .size(12.0)
+                                                .color(theme.text_muted),
+                                        );
+                                        let mut blur = self.config.macos_window_background_blur;
+                                        let blur_slider = egui::Slider::new(&mut blur, 0.0..=100.0)
+                                            .step_by(1.0)
+                                            .fixed_decimals(0)
+                                            .show_value(true);
+                                        let blur_changed = ui
+                                            .scope(|ui| {
+                                                crate::theme::apply_slider_style(
+                                                    ui.style_mut(),
+                                                    theme,
+                                                );
+                                                ui.add(blur_slider)
+                                            })
+                                            .inner
+                                            .changed();
+                                        if blur_changed {
+                                            let effect_ctx = ui.ctx().clone();
+                                            self.apply_window_effects_and_persist(
+                                                &effect_ctx,
+                                                self.config.window_background_opacity,
+                                                blur,
+                                            );
+                                        }
+                                    });
+                                    ui.add_space(2.0);
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "不透明度 < 1 或毛玻璃 > 0 时窗口透明（重启后完整生效）；macOS 不暴露模糊半径，毛玻璃只区分开/关",
+                                        )
+                                        .size(10.0)
+                                        .color(theme.text_muted),
+                                    );
                                 });
                                 ui.add_space(10.0);
 
@@ -6092,7 +6418,8 @@ impl eframe::App for MinoApp {
             crate::theme::set_theme(&ctx, want_theme);
         }
         let theme = crate::theme::current_theme();
-        let titlebar_frame = egui::Frame::new().fill(theme.bg_app);
+        let titlebar_frame =
+            egui::Frame::new().fill(crate::theme::apply_window_alpha(theme.bg_app));
         egui::Panel::top("titlebar")
             .exact_size(TITLEBAR_HEIGHT)
             .frame(titlebar_frame)
@@ -6103,7 +6430,7 @@ impl eframe::App for MinoApp {
         // ==================== 底部标签栏（Kaku `tab_bar_at_bottom = true`） ====================
         // Kaku 的标签栏在窗口最底部、与终端同底色；标签栏右侧承载 Mino 的
         // 入口按钮（工作区 / 设置）与会话状态指示（不再有独立状态栏）。
-        let tab_frame = egui::Frame::new().fill(theme.bg_header);
+        let tab_frame = egui::Frame::new().fill(crate::theme::apply_window_alpha(theme.bg_header));
         egui::Panel::bottom("tab_bar")
             .frame(tab_frame)
             .show(ui, |ui| {
@@ -6115,6 +6442,11 @@ impl eframe::App for MinoApp {
                 pane.view.clear_attention();
             }
         }
+        // 窗口标题（Kaku `format-window-title`）：活动标签的显示标题（含
+        // 放大 ` [Z]`），多标签时前缀 `[i/n]`。标题文本在本应用里被隐藏
+        // （titlebar 只留红绿灯），但它是 Mission Control / 窗口菜单看到的
+        // 名字；只在变化时下发，避免每帧重设 viewport 命令。
+        self.sync_window_title(&ctx);
 
         // ==================== 中央区：当前标签页 ====================
         // SFTP 面板必须是顶层面板（先于 CentralPanel 注册）：
@@ -6135,7 +6467,7 @@ impl eframe::App for MinoApp {
             let terminal_cwd = tab.active_view().current_directory();
             if let Some(sftp) = &mut tab.sftp {
                 let sftp_frame = egui::Frame::new()
-                    .fill(theme.bg_panel)
+                    .fill(crate::theme::apply_window_alpha(theme.bg_panel))
                     .inner_margin(egui::Margin::symmetric(12, 10));
                 let mut locate_requested = false;
                 egui::Panel::right("sftp_panel")
@@ -7124,6 +7456,79 @@ mod connect_tests {
 mod snapshot_tests {
     use super::*;
 
+    /// 窗口几何记忆（Kaku `state.json` 的 window_geometry/window_position）：
+    /// 记录存在 → 启动按记录恢复；损坏/越界 → 按"没有记录"处理（默认居中）。
+    #[test]
+    fn 窗口几何记忆() {
+        let config_path = test_config_path("geometry");
+        let snapshot = config_path.with_file_name("snapshot.toml");
+        // 标量必须写在任何表之前（TOML：表头之后的键归属该表）。
+        std::fs::write(
+            &snapshot,
+            "window_size = [1280.0, 800.0]\nwindow_position = [120.0, 60.0]\n",
+        )
+        .expect("写快照失败");
+        assert_eq!(
+            restored_window_geometry(&config_path),
+            Some(([1280.0, 800.0], Some([120.0, 60.0]))),
+            "应读出尺寸与位置"
+        );
+        // 位置越界（手改/坏数据）→ 只恢复尺寸，位置回到居中。
+        std::fs::write(
+            &snapshot,
+            "window_size = [1280.0, 800.0]\nwindow_position = [99999.0, 0.0]\n",
+        )
+        .expect("写快照失败");
+        assert_eq!(
+            restored_window_geometry(&config_path),
+            Some(([1280.0, 800.0], None)),
+            "越界位置应被忽略"
+        );
+        // 尺寸无效 → 整体按无记录（用默认尺寸居中）。
+        std::fs::write(&snapshot, "window_size = [10.0, 800.0]\n").expect("写快照失败");
+        assert!(restored_window_geometry(&config_path).is_none());
+        // 老快照（没有几何字段）/文件缺失 → None。
+        std::fs::write(&snapshot, "\n").expect("写快照失败");
+        assert!(restored_window_geometry(&config_path).is_none());
+        std::fs::remove_file(&snapshot).ok();
+        assert!(
+            restored_window_geometry(&config_path).is_none(),
+            "缺失文件按无记录"
+        );
+    }
+
+    /// 退出保存时应把当前窗口几何写进快照（字段存在且来自 viewport 信息）。
+    #[test]
+    fn 退出保存写入窗口几何() {
+        let config_path = test_config_path("geometry-save");
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            MinoApp::new_with_config(cc, config_path.clone())
+        });
+        harness.run_steps(6);
+        let expected = harness.state().last_ctx.input(|i| {
+            let viewport = i.viewport();
+            (
+                viewport
+                    .inner_rect
+                    .map(|rect| [rect.width(), rect.height()]),
+                viewport.outer_rect.map(|rect| [rect.min.x, rect.min.y]),
+            )
+        });
+        harness.state().save_window_snapshot();
+        let text = std::fs::read_to_string(config_path.with_file_name("snapshot.toml"))
+            .expect("快照文件应已写出");
+        let snapshot: WindowSnapshot = toml::from_str(&text).expect("快照应可解析");
+        assert_eq!(
+            snapshot.window_size, expected.0,
+            "快照应记录当前窗口尺寸（viewport inner_rect）"
+        );
+        assert_eq!(
+            snapshot.window_position, expected.1,
+            "快照应记录当前窗口位置（viewport outer_rect）"
+        );
+        std::fs::remove_file(config_path.with_file_name("snapshot.toml")).ok();
+    }
+
     /// 与 connect_tests::init_test_env 相同（每模块独立 Once）。
     static KNOWN_HOSTS_INIT: std::sync::Once = std::sync::Once::new();
     fn init_test_env() {
@@ -7310,6 +7715,116 @@ mod theme_tests {
     /// 本模块两个测试串行化，避免"单跑过、并跑随机挂"。
     static THEME_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    /// 窗口不透明度（Kaku `window_background_opacity`）：主题色按不透明度
+    /// 等比叠加成半透明（预乘 alpha 通道一起缩放），1.0 时原样返回。
+    #[test]
+    fn 窗口不透明度叠加到主题色() {
+        // 中毒也继续（`unwrap_or_else(into_inner)`）：某个测试失败后，
+        // 其它测试不应跟着以 PoisonError 失败（曾连带 3 条一起红）。
+        let _guard = THEME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let base = egui::Color32::from_rgb(21, 20, 27);
+        crate::theme::set_window_opacity(1.0);
+        assert_eq!(
+            crate::theme::apply_window_alpha(base),
+            base,
+            "1.0 应原样返回"
+        );
+        crate::theme::set_window_opacity(0.6);
+        let translucent = crate::theme::apply_window_alpha(base);
+        assert!(
+            (translucent.a() as i32 - 153).abs() <= 1,
+            "alpha 应约为 0.6×255，实际 {}",
+            translucent.a()
+        );
+        assert_eq!(
+            crate::theme::window_opacity(),
+            0.6,
+            "不透明度应记录为设置值"
+        );
+        // 钳制下界：0.2 这种不可读的值会被抬到 0.5。
+        crate::theme::set_window_opacity(0.2);
+        assert_eq!(crate::theme::window_opacity(), 0.5);
+        crate::theme::set_window_opacity(1.0);
+    }
+
+    /// 窗口特效配置读取：不透明度钳到 0.5..=1.0、模糊非负；缺字段按默认
+    /// （不透明、无模糊）——启动时据此决定是否创建透明窗口。
+    #[test]
+    fn 窗口特效配置读取() {
+        let config_path = test_config_path("window-effects");
+        std::fs::write(
+            &config_path,
+            "window_background_opacity = 0.8\nmacos_window_background_blur = 20.0\n",
+        )
+        .expect("写配置失败");
+        assert_eq!(
+            window_effects_from_config(&config_path),
+            (0.8, 20.0),
+            "应读出不透明度与模糊"
+        );
+        std::fs::write(
+            &config_path,
+            "window_background_opacity = 0.2\nmacos_window_background_blur = -5.0\n",
+        )
+        .expect("写配置失败");
+        assert_eq!(
+            window_effects_from_config(&config_path),
+            (0.5, 0.0),
+            "不透明度下界 0.5、模糊不为负"
+        );
+        std::fs::write(&config_path, "appearance = \"auto\"\n").expect("写配置失败");
+        assert_eq!(
+            window_effects_from_config(&config_path),
+            (1.0, 0.0),
+            "缺字段按默认：不透明、无模糊"
+        );
+        std::fs::remove_file(&config_path).ok();
+        assert_eq!(
+            window_effects_from_config(&config_path),
+            (1.0, 0.0),
+            "配置缺失按默认"
+        );
+    }
+
+    /// 设置弹窗「外观」卡片包含本轮 B 对齐新增的控件：文件链接编辑器输入框
+    /// 与窗口不透明度/毛玻璃滑杆（Kaku `file_link_editor` /
+    /// `window_background_opacity` / `macos_window_background_blur`）。
+    #[test]
+    fn 外观卡片含链接编辑器与窗口特效控件() {
+        use kittest::Queryable;
+
+        // 中毒也继续（`unwrap_or_else(into_inner)`）：某个测试失败后，
+        // 其它测试不应跟着以 PoisonError 失败（曾连带 3 条一起红）。
+        let _guard = THEME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let config_path = test_config_path("appearance-controls");
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            MinoApp::new_with_config(cc, config_path.clone())
+        });
+        harness.run_steps(6);
+        harness.event(egui::Event::Key {
+            key: egui::Key::Comma,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        for _ in 0..4 {
+            harness.step();
+        }
+        for label in ["文件链接编辑器", "窗口不透明度", "毛玻璃"] {
+            // `>= 1`：说明文字里也会出现同样的词（如「毛玻璃」）。
+            assert!(
+                harness.query_all_by_label_contains(label).count() >= 1,
+                "设置弹窗应包含控件：{label}"
+            );
+        }
+        std::fs::remove_file(&config_path).ok();
+    }
+
     /// 回归：设置弹窗里的字号滑块必须画得出轨道（egui 滑块的轨道固定取
     /// 全局 `widgets.inactive.bg_fill`＝面板色，而弹窗卡片底同为面板色，
     /// 轨道与卡片完全同色——用户反馈「轨道看不清」，肉眼只剩手柄的 1px
@@ -7318,7 +7833,11 @@ mod theme_tests {
     fn 字号滑块轨道在卡片上可辨() {
         use kittest::Queryable;
 
-        let _guard = THEME_TEST_LOCK.lock().unwrap();
+        // 中毒也继续（`unwrap_or_else(into_inner)`）：某个测试失败后，
+        // 其它测试不应跟着以 PoisonError 失败（曾连带 3 条一起红）。
+        let _guard = THEME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let config_path = test_config_path("slider-rail");
         let mut harness = egui_kittest::Harness::new_eframe(|cc| {
             MinoApp::new_with_config(cc, config_path.clone())
@@ -7335,9 +7854,13 @@ mod theme_tests {
         for _ in 0..3 {
             harness.step();
         }
+        // 卡片里现在有三个滑块（字号/不透明度/毛玻璃）：按角色单选会命中
+        // 多个，取**第一个**——外观卡片里字号滑块最先出现（控件树顺序＝
+        // 插入顺序）。
         harness
             .root()
-            .query_by_role(accesskit::Role::Slider)
+            .query_all_by_role(accesskit::Role::Slider)
+            .next()
             .expect("设置弹窗里应存在字号滑块")
             .scroll_to_me();
         for _ in 0..3 {
@@ -7345,7 +7868,8 @@ mod theme_tests {
         }
         let rect = harness
             .root()
-            .query_by_role(accesskit::Role::Slider)
+            .query_all_by_role(accesskit::Role::Slider)
+            .next()
             .expect("设置弹窗里应存在字号滑块")
             .rect();
         let img = harness.render().expect("渲染失败");
@@ -7383,7 +7907,11 @@ mod theme_tests {
     fn 深浅外观渲染截图() {
         use kittest::Queryable;
 
-        let _guard = THEME_TEST_LOCK.lock().unwrap();
+        // 中毒也继续（`unwrap_or_else(into_inner)`）：某个测试失败后，
+        // 其它测试不应跟着以 PoisonError 失败（曾连带 3 条一起红）。
+        let _guard = THEME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let config_path = test_config_path("theme-shots");
         let mut harness = egui_kittest::Harness::new_eframe(|cc| {
             MinoApp::new_with_config(cc, config_path.clone())
@@ -7466,7 +7994,11 @@ mod theme_tests {
     /// 回归：切换外观偏好后重启应用，应恢复上次所选偏好而非跟随系统默认。
     #[test]
     fn 外观偏好重启后保持() {
-        let _guard = THEME_TEST_LOCK.lock().unwrap();
+        // 中毒也继续（`unwrap_or_else(into_inner)`）：某个测试失败后，
+        // 其它测试不应跟着以 PoisonError 失败（曾连带 3 条一起红）。
+        let _guard = THEME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let config_path = test_config_path("theme-persist");
         HostConfig {
             hosts: Vec::new(),
@@ -7727,11 +8259,16 @@ mod tab_tests {
 
         let mut harness = egui_kittest::Harness::new_eframe(|cc| MinoApp::new(cc));
         harness.run_steps(6);
-        // 本地标签标题 = 当前目录末级名（启动即 home → `~`），
-        // 不采用 shell 上报的窗口标题（oh-my-zsh 的标题是截断过的路径）。
+        // 本地标签标题 = 父目录/当前目录（Kaku `format-tab-title` 默认语义；
+        // 启动即 home），不采用 shell 上报的窗口标题（oh-my-zsh 的标题是
+        // 截断过的路径）。
         let (title, tooltip) = harness.state().tabs[0].title();
         let home = std::env::var("HOME").expect("测试环境应有 HOME");
-        assert_eq!(title, "~", "启动目录 home 应显示为 `~`");
+        assert_eq!(
+            title,
+            tab_dir_label(&home),
+            "启动目录 home 应显示父/子两级目录"
+        );
         assert_eq!(
             tooltip.as_deref(),
             Some(home.as_str()),
@@ -7829,25 +8366,28 @@ mod tab_tests {
         assert!(saw_minimized, "⌘W 在唯一标签上应发出 Minimized(true)");
     }
 
-    /// 目录展示名 = 最末级文件夹名（zsh `%c` 语义）。
+    /// 目录标签 = 父目录/当前目录（Kaku `format-tab-title` 默认语义）。
     #[test]
-    fn 目录展示名只保留末级() {
-        assert_eq!(dir_display_name("/Users/me/proj"), "proj");
-        assert_eq!(dir_display_name("/Users/me/proj/"), "proj");
-        assert_eq!(dir_display_name("/"), "/");
-        assert_eq!(dir_display_name(""), "/");
+    fn 目录标签采用父目录斜杠末级() {
+        assert_eq!(tab_dir_label("/Users/me/proj"), "me/proj");
+        assert_eq!(tab_dir_label("/Users/me/proj/"), "me/proj");
+        assert_eq!(tab_dir_label("/"), "/");
+        assert_eq!(tab_dir_label(""), "/");
+        // 单级路径没有父目录名 → 只显示当前目录。
+        assert_eq!(tab_dir_label("/Users"), "Users");
         let home = std::env::var("HOME").expect("测试环境应有 HOME");
-        assert_eq!(dir_display_name(&home), "~");
-        assert_eq!(dir_display_name(&format!("{home}/")), "~");
-        // home 内的子目录仍只显示末级名（不缩写为 `~/x`）。
-        assert_eq!(dir_display_name(&format!("{home}/proj")), "proj");
+        assert_eq!(tab_dir_label(&home), tab_dir_label(&format!("{home}/")));
+        assert_eq!(tab_dir_label(&format!("{home}/proj")), {
+            let last = home.rsplit('/').next().unwrap_or("").to_string();
+            format!("{last}/proj")
+        });
     }
 
-    /// 本地标签标题跟随终端当前目录：只显示末级文件夹名，悬浮提示给全路径。
+    /// 本地标签标题跟随终端当前目录：显示父目录/当前目录，悬浮提示给全路径。
     ///
     /// 目录来源是 shell 子进程的内核 cwd（每帧实时读取），不再依赖脆弱的
     /// 终端输入跟踪；不采用 shell 上报的窗口标题——oh-my-zsh 的标题是
-    /// 截断过的 `%15<..<%~%<<`，既非末级目录名也拿不到完整路径。
+    /// 截断过的 `%15<..<%~%<<`，拿不到完整路径。
     #[test]
     fn 本地标签标题跟随当前目录() {
         use std::cell::RefCell;
@@ -7882,10 +8422,10 @@ mod tab_tests {
         });
         harness.run_steps(6);
 
-        // 启动目录 = home → `~`（与 zsh 提示符一致），提示为全路径。
+        // 启动目录 = home → 父/子两级（Kaku 默认），提示为全路径。
         let home = std::env::var("HOME").expect("测试环境应有 HOME");
         let (title, tooltip) = tab.borrow().title();
-        assert_eq!(title, "~", "启动目录 home 应显示为 `~`");
+        assert_eq!(title, tab_dir_label(&home), "启动目录 home 应显示父/子两级");
         assert_eq!(tooltip.as_deref(), Some(home.as_str()));
 
         // 等 shell 就绪（独立哨兵输出，不依赖目录名）。
@@ -7911,7 +8451,7 @@ mod tab_tests {
         }
         assert!(ready, "zsh 未就绪");
 
-        // cd 进嵌套目录：标题只显示末级名，提示给完整（已规范化）路径。
+        // cd 进嵌套目录：标题显示父/子两级，提示给完整（已规范化）路径。
         harness.event(egui::Event::Text(format!("cd {}", project.display())));
         harness.event(egui::Event::Key {
             key: egui::Key::Enter,
@@ -7924,12 +8464,13 @@ mod tab_tests {
             .expect("规范化测试目录失败")
             .to_string_lossy()
             .into_owned();
+        let expected_label = tab_dir_label(&expected);
         let deadline = Instant::now() + Duration::from_secs(8);
         let mut followed = false;
         while Instant::now() < deadline {
             harness.step();
             let (title, tooltip) = tab.borrow().title();
-            if title == "proj-alpha" && tooltip.as_deref() == Some(expected.as_str()) {
+            if title == expected_label && tooltip.as_deref() == Some(expected.as_str()) {
                 followed = true;
                 break;
             }
@@ -7938,12 +8479,13 @@ mod tab_tests {
         let (title, tooltip) = tab.borrow().title();
         assert!(
             followed,
-            "cd 后标题未跟随目录：title={title:?} tooltip={tooltip:?}（期望 proj-alpha / {expected}）"
+            "cd 后标题未跟随目录：title={title:?} tooltip={tooltip:?}（期望 {expected_label} / {expected}）"
         );
         std::fs::remove_dir_all(base).ok();
     }
 
-    /// 标签栏渲染当前目录的末级名（不再是固定 "本地终端"），悬浮标题显示全路径。
+    /// 标签栏渲染当前目录的父/子两级名（不再是固定 "本地终端"），悬浮标题
+    /// 显示全路径。
     ///（状态栏已随 Kaku 化移除：状态指示并入标签栏右端。）
     #[test]
     fn 标签栏显示当前目录名() {
@@ -7983,11 +8525,12 @@ mod tab_tests {
             .expect("规范化测试目录失败")
             .to_string_lossy()
             .into_owned();
+        let expected_label = tab_dir_label(&expected);
         let deadline = Instant::now() + Duration::from_secs(8);
         let mut shown = false;
         while Instant::now() < deadline {
             harness.step();
-            if harness.query_all_by_label("proj-beta").count() == 1 {
+            if harness.query_all_by_label(&expected_label).count() == 1 {
                 shown = true;
                 break;
             }
@@ -7998,13 +8541,13 @@ mod tab_tests {
         );
         assert!(
             shown,
-            "标签栏应显示目录名，实际 “proj-beta” 出现 {} 次；终端内容：\n{tab_title}",
-            harness.query_all_by_label("proj-beta").count()
+            "标签栏应显示目录名，实际 {expected_label:?} 出现 {} 次；终端内容：\n{tab_title}",
+            harness.query_all_by_label(&expected_label).count()
         );
 
         // 悬浮标签标题 → 全路径提示。
         harness
-            .query_all_by_label("proj-beta")
+            .query_all_by_label(&expected_label)
             .next()
             .expect("标签标题节点缺失")
             .hover();
@@ -8017,6 +8560,56 @@ mod tab_tests {
             "悬浮标签标题应显示全路径 {expected}"
         );
         std::fs::remove_dir_all(base).ok();
+    }
+
+    /// 窗口标题跟随活动标签（Kaku `format-window-title`）：单标签是纯标题，
+    /// 多标签加 `[i/n]` 前缀，放大态带 ` [Z]`。
+    #[test]
+    fn 窗口标题跟随标签与放大态() {
+        let config_path = test_config_path("window-title");
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            MinoApp::new_with_config(cc, config_path.clone())
+        });
+        harness.run_steps(6);
+        let tab_title = harness.state().tabs[0].title().0;
+        assert_eq!(
+            harness.state().window_title.as_deref(),
+            Some(tab_title.as_str()),
+            "单标签窗口标题应等于标签标题（无 [i/n] 前缀）"
+        );
+
+        // 分屏 + 放大 → 标题追加 ` [Z]`（Kaku `active_pane.is_zoomed`）。
+        kaku_feature_tests::key(&mut harness, egui::Key::D, egui::Modifiers::COMMAND);
+        kaku_feature_tests::key(
+            &mut harness,
+            egui::Key::Enter,
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+        );
+        let zoomed = harness
+            .state()
+            .window_title
+            .clone()
+            .expect("窗口标题应已下发");
+        assert!(
+            zoomed.ends_with(" [Z]"),
+            "放大态窗口标题应带 ` [Z]`：{zoomed:?}"
+        );
+
+        // 第二个标签 → `[2/2]` 前缀（Kaku 多标签才有）。
+        kaku_feature_tests::key(&mut harness, egui::Key::T, egui::Modifiers::COMMAND);
+        let multi = harness
+            .state()
+            .window_title
+            .clone()
+            .expect("窗口标题应已下发");
+        assert!(
+            multi.starts_with("[2/2] "),
+            "多标签窗口标题应带 `[2/2]` 前缀：{multi:?}"
+        );
+        assert!(
+            !multi.ends_with(" [Z]"),
+            "新标签未放大，不应带 ` [Z]`：{multi:?}"
+        );
     }
 
     /// 跟踪器失效时标题仍跟随：`source` 别名/函数等场景下输入跟踪早已
@@ -8047,7 +8640,7 @@ mod tab_tests {
             .into_owned();
         // 子 shell 启动需要时间（login shell 先跑完 rc 再 chdir 到启动目录）：
         // 轮询等内核 cwd 落到启动目录，避免把启动瞬间 home 误判为 bug。
-        let start_name = dir_display_name(&start.to_string_lossy());
+        let start_name = tab_dir_label(&start.to_string_lossy());
         let start_full = start.to_string_lossy().into_owned();
         let deadline = Instant::now() + Duration::from_secs(8);
         loop {
@@ -8067,11 +8660,12 @@ mod tab_tests {
         tab.active_view()
             .session()
             .write(format!("mygoto() {{ cd {} ; }}; mygoto\n", project.display()).as_bytes());
+        let expected_label = tab_dir_label(&expected);
         let deadline = Instant::now() + Duration::from_secs(8);
         let mut followed = false;
         while Instant::now() < deadline {
             let (title, tooltip) = tab.title();
-            if title == "proj-gamma" && tooltip.as_deref() == Some(expected.as_str()) {
+            if title == expected_label && tooltip.as_deref() == Some(expected.as_str()) {
                 followed = true;
                 break;
             }
@@ -8080,7 +8674,7 @@ mod tab_tests {
         let (title, tooltip) = tab.title();
         assert!(
             followed,
-            "跟踪失效后标题未跟随内核目录：title={title:?} tooltip={tooltip:?}（期望 proj-gamma / {expected}）"
+            "跟踪失效后标题未跟随内核目录：title={title:?} tooltip={tooltip:?}（期望 {expected_label} / {expected}）"
         );
         std::fs::remove_dir_all(base).ok();
     }
@@ -8200,6 +8794,20 @@ mod tab_tests {
             opts.env.get("COLORTERM").map(String::as_str),
             Some("truecolor"),
             "本地会话必须注入 COLORTERM=truecolor（omp 24-bit 开关）"
+        );
+        // COLORFGBG（Kaku 同款）：程序（vim/tmux/TUI）据此判浅深底；取值
+        // 跟随当前主题，浅色 `0;15`、深色 `15;0`。
+        assert_eq!(
+            opts.env.get("COLORFGBG").map(String::as_str),
+            Some(colorfgbg()),
+            "本地会话必须注入与当前主题一致的 COLORFGBG"
+        );
+        assert!(
+            matches!(
+                opts.env.get("COLORFGBG").map(String::as_str),
+                Some("0;15") | Some("15;0")
+            ),
+            "COLORFGBG 只应是 Kaku 的两种取值"
         );
     }
 
@@ -9430,7 +10038,8 @@ mod workspace_test_support {
 mod kaku_feature_tests {
     use super::*;
 
-    fn key(
+    /// 注入一次按键（标签页/分屏等测试共用；同 crate 其它测试模块也复用）。
+    pub(crate) fn key(
         harness: &mut egui_kittest::Harness<MinoApp>,
         key: egui::Key,
         modifiers: egui::Modifiers,
@@ -9466,6 +10075,19 @@ mod kaku_feature_tests {
         // 新窗格在右：布局矩形 x 更大。
         let rects = harness.state().tabs[0].pane_rects.clone();
         assert_eq!(rects.len(), 2);
+        // 窗格间隙 = 5 个字符宽（Kaku `split_pane_gap = 2` 的
+        // `gutter = 1 + 2 × gap` 语义），字宽随字号变化。
+        let (cell_w, _) = harness.state().tabs[0]
+            .active_view()
+            .cell_metrics()
+            .expect("窗格字宽应在渲染后测得");
+        let mut sorted = rects.clone();
+        sorted.sort_by(|a, b| a.1.left().partial_cmp(&b.1.left()).unwrap());
+        let actual_gap = sorted[1].1.left() - sorted[0].1.right();
+        assert!(
+            (actual_gap - cell_w * 5.0).abs() < 1.5,
+            "窗格间隙应为 5 字符宽（Kaku 默认）：实际 {actual_gap}，字宽 {cell_w}"
+        );
         let right = rects
             .iter()
             .max_by(|a, b| a.1.left().partial_cmp(&b.1.left()).unwrap())

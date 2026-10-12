@@ -92,6 +92,11 @@ pub enum SessionEvent {
     /// alacritty 的 `Event::ResetTitle`，此前在 `_ => false` 被静默丢弃，
     /// 标题会永久停在程序设置过的旧值）。
     ResetTitle,
+    /// 进度上报状态（`OSC 9;4;<state>`，ConEmu 扩展）。
+    ///
+    /// 0=清除、1=进行中、2=出错、3=不确定、4=暂停；UI 侧把出错/暂停翻成
+    /// 标签注意力点（Kaku 的 `bell_tab_indicator` 同源语义）。
+    Progress(u8),
     /// 程序请求写入系统剪贴板（OSC52 store，`]`+`c`/`p`/`s` 剪贴板类型已由
     /// VT 层解析为 `ClipboardType`，这里只透传文本；默认配置只接受 copy）。
     ClipboardStore {
@@ -135,6 +140,7 @@ impl std::fmt::Debug for SessionEvent {
                 .field("index", index)
                 .finish(),
             SessionEvent::TextAreaSizeRequest(_) => f.write_str("TextAreaSizeRequest"),
+            SessionEvent::Progress(state) => f.debug_tuple("Progress").field(state).finish(),
             SessionEvent::ClipboardStore { text, .. } => {
                 f.debug_tuple("ClipboardStore").field(text).finish()
             }
@@ -173,6 +179,7 @@ pub(crate) fn marker_to_event(marker: sniffer::Marker) -> SessionEvent {
         sniffer::Marker::PromptReady => SessionEvent::PromptReady,
         sniffer::Marker::CommandStart => SessionEvent::CommandStart,
         sniffer::Marker::CommandFinished(code) => SessionEvent::CommandFinished(code),
+        sniffer::Marker::Progress(state) => SessionEvent::Progress(state),
     }
 }
 
@@ -880,6 +887,27 @@ impl Session {
         });
     }
 
+    /// 测试用：按生产读取路径处理一段字节——VT 解析器 + OSC 嗅探器。
+    ///
+    /// `OSC 9;4`（进度上报）只经过嗅探器、不进 VT 解析器，用
+    /// `inject_program_output_for_test` 注入不会产生会话事件，必须走这里。
+    /// 嗅探器状态跨调用持久（与 `SniffingPty` 的读取路径一致）。
+    pub fn inject_sniffed_bytes_for_test(&self, bytes: &[u8]) {
+        thread_local! {
+            static SNIFFER: std::cell::RefCell<sniffer::OscSniffer> =
+                std::cell::RefCell::new(sniffer::OscSniffer::new());
+        }
+        let mut markers = Vec::new();
+        SNIFFER.with(|sniffer| sniffer.borrow_mut().feed(bytes, &mut markers));
+        // 事件入口与生产一致（含队列折叠与上限）；回调用空实现——测试
+        // 手动驱动帧，不需要重绘唤醒。
+        let noop: EventHandler = Arc::new(|_event: &SessionEvent| {});
+        for marker in markers {
+            push_marker_event(&self.shared, &noop, marker_to_event(marker));
+        }
+        self.inject_program_output_for_test(bytes);
+    }
+
     /// 当前窗口标题。
     pub fn title(&self) -> String {
         self.shared.title.lock().unwrap().clone()
@@ -1218,5 +1246,45 @@ mod tests {
         shared.wakeup.store(false, Ordering::Release);
         notify_wakeup(&shared, &on_event);
         assert_eq!(callback_count.load(Ordering::Relaxed), 2);
+    }
+
+    /// 替代屏（alt screen）没有可滚动历史——这是滚轮策略决策的依据。
+    ///
+    /// Kaku 的 `alternate_screen_wheel_scrolls_terminal` 默认 false，即滚轮在
+    /// 替代屏应用（vim/less）里"窥视"终端自己的回滚缓冲。Mino 的 VT 引擎
+    /// （alacritty）在替代屏下 `display_offset` 恒为 0（本测试断言），照搬
+    /// 那个默认只会让滚轮**变成空操作**；因此 Mino 采用 Kaku 的另一种模式
+    /// （等价于其配置设为 true）：未开鼠标上报的替代屏应用把滚轮映射为
+    /// 方向键（见 `TerminalView::handle_input` 的 `WheelTarget::AlternateScroll`）。
+    ///
+    /// 该断言若失败（替代屏开始保留历史），说明上游引擎行为变了，滚轮策略
+    /// 需要重新评估——这条测试是那个决策的哨兵。
+    #[test]
+    fn 替代屏没有可滚动历史() {
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        for index in 0..40 {
+            session.inject_program_output_for_test(format!("line {index}\r\n").as_bytes());
+        }
+        let primary = {
+            let term = session.term();
+            let mut guard = term.lock();
+            guard.scroll_display(alacritty_terminal::grid::Scroll::Delta(3));
+            guard.grid().display_offset()
+        };
+        session.inject_program_output_for_test(b"\x1b[?1049h\x1b[?1007h");
+        let alt = {
+            let term = session.term();
+            let mut guard = term.lock();
+            guard.scroll_display(alacritty_terminal::grid::Scroll::Delta(5));
+            guard.grid().display_offset()
+        };
+        assert!(primary > 0, "主屏应有可滚历史（前置条件）");
+        assert_eq!(alt, 0, "替代屏不应有可滚历史（滚轮映射方向键的依据）");
     }
 }

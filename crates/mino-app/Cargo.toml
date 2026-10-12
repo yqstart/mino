@@ -27,9 +27,9 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # macOS 原生窗口圆角（无边框窗口 contentView layer cornerRadius）。
 # features 全局合并：追加 objc2-quartz-core 不会影响 eframe/winit 的既有实例。
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2-app-kit = { version = "0.3.2", features = ["std", "NSColor", "NSPasteboard", "NSPasteboardItem", "NSView", "NSWindow", "objc2-quartz-core"] }
+objc2-app-kit = { version = "0.3.2", features = ["std", "NSColor", "NSPasteboard", "NSPasteboardItem", "NSView", "NSWindow", "NSVisualEffectView", "objc2-quartz-core"] }
 objc2 = "0.6.4"
-objc2-foundation = "0.3.2"
+objc2-foundation = { version = "0.3.2", features = ["NSGeometry"] }
 raw-window-handle = "0.6.2"
 
 [dev-dependencies]

@@ -3,6 +3,8 @@
 //! 窗口使用透明的全尺寸标题栏，隐藏标题文字但保留 macOS 原生按钮；
 //! 这里通过 AppKit 给窗口 contentView 的 layer 设置圆角 + 裁切，
 //! 并将窗口背景设为透明，使圆角外侧露出桌面，形成整体圆角观感。
+//! 开了毛玻璃（Kaku `macos_window_background_blur` > 0）时，再在 contentView
+//! 下方铺一层 `NSVisualEffectView` 材质。
 //!
 //! 只应在真实 AppKit 窗口环境调用（eframe 主线程创建期）；
 //! kittest 测试环境没有真实 NSWindow（句柄匹配失败），静默跳过。
@@ -21,6 +23,67 @@ pub fn apply_rounded_window(cc: &eframe::CreationContext<'_>) {
     apply_rounded_window_macos(cc);
     #[cfg(not(target_os = "macos"))]
     let _ = cc;
+}
+
+/// 给窗口铺一层毛玻璃材质（Kaku `macos_window_background_blur`）。
+///
+/// 失败（非 macOS / 无 AppKit 句柄）时静默忽略——没有材质就是普通透明窗口，
+/// 不影响功能。
+pub fn apply_window_blur(cc: &eframe::CreationContext<'_>) {
+    #[cfg(target_os = "macos")]
+    apply_window_blur_macos(cc);
+    #[cfg(not(target_os = "macos"))]
+    let _ = cc;
+}
+
+/// macOS 实现：拿到 contentView → 在其**最底层**插入 `NSVisualEffectView`
+/// （窗口背景模糊材质），窗口背景本身保持透明。
+///
+/// 说明：AppKit 不公开模糊半径，`macos_window_background_blur` 的数值在这里
+/// 只表示"开"（> 0），材质取 `UnderWindowBackground`（随系统深浅色自适应）。
+#[cfg(target_os = "macos")]
+fn apply_window_blur_macos(cc: &eframe::CreationContext<'_>) {
+    use objc2_app_kit::{
+        NSAutoresizingMaskOptions, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
+        NSVisualEffectState, NSVisualEffectView, NSWindowOrderingMode,
+    };
+    use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+
+    let Ok(handle) = cc.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return;
+    };
+    let ns_view_ptr = handle.ns_view.as_ptr().cast::<NSView>();
+    if ns_view_ptr.is_null() {
+        return;
+    }
+    // SAFETY: 句柄来自窗口系统，指针在窗口生命周期内有效（与 eframe 内部一致）。
+    let ns_view: &NSView = unsafe { ns_view_ptr.as_ref() }.unwrap();
+
+    // SAFETY: `NSVisualEffectView` 是 AppKit 的普通视图，在窗口创建期、
+    // 主线程上构造与插入子视图是常规用法。
+    unsafe {
+        let effect = NSVisualEffectView::new(objc2_foundation::MainThreadMarker::new_unchecked());
+        effect.setFrame(ns_view.bounds());
+        // 跟随父视图尺寸变化（全尺寸铺满）。
+        effect.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable
+                | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
+        effect.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+        effect.setMaterial(NSVisualEffectMaterial::UnderWindowBackground);
+        effect.setState(NSVisualEffectState::Active);
+        // 插到最底层：它在内容视图（wgpu 的 CAMetalLayer）之下，只有窗口
+        // 背景透明处才透出材质。
+        let relative_to = ns_view.subviews().firstObject();
+        ns_view.addSubview_positioned_relativeTo(
+            &effect,
+            NSWindowOrderingMode::Below,
+            relative_to.as_deref(),
+        );
+    }
 }
 
 /// macOS 实现：拿到 contentView → 打开 layer 支持 → 设圆角 + 裁切 → 窗口背景透明。

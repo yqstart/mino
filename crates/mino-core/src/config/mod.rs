@@ -173,6 +173,11 @@ fn default_font_size() -> f32 {
     DEFAULT_FONT_SIZE
 }
 
+/// serde 默认：老配置缺 `window_background_opacity` 时按不透明（Kaku 默认 1.0）。
+fn default_window_opacity() -> f32 {
+    1.0
+}
+
 /// 全部工作区配置。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HostConfig {
@@ -188,6 +193,25 @@ pub struct HostConfig {
     /// 兼容约定：缺字段不报错、启动按默认处理）。
     #[serde(default = "default_font_size")]
     pub font_size: f32,
+    /// 打开终端里文件链接用的编辑器命令（Kaku `file_link_editor`）。
+    ///
+    /// 空 = 自动探测（VS Code 系 `code`/`cursor` → `$VISUAL`/`$EDITOR` →
+    /// 系统默认程序）。命令可带参数（如 `cursor --goto`，支持引号）。
+    #[serde(default)]
+    pub file_link_editor: String,
+    /// 窗口背景不透明度（Kaku `window_background_opacity`，默认 1.0 不透明）。
+    ///
+    /// 只在启动时决定窗口是否透明（< 1.0 时创建透明窗口）；运行中改这个值
+    /// 立刻影响绘制颜色，但**窗口本身**要重启才变成透明（窗口透明与否由
+    /// 系统在创建时确定）。钳到 0.5..=1.0：更低会让文字对比度不可读。
+    #[serde(default = "default_window_opacity")]
+    pub window_background_opacity: f32,
+    /// 窗口背景模糊（Kaku `macos_window_background_blur`，0 = 关闭）。
+    ///
+    /// macOS 走 `NSVisualEffectView` 材质；系统不暴露模糊半径，因此该值只
+    /// 表示"开/关"（> 0 即开启）。
+    #[serde(default)]
+    pub macos_window_background_blur: f32,
     /// 统一工作区列表（本地目录 + SSH 主机，侧栏展示顺序）。
     #[serde(default)]
     pub workspaces: Vec<Workspace>,
@@ -204,6 +228,9 @@ impl Default for HostConfig {
         Self {
             appearance: String::new(),
             font_size: DEFAULT_FONT_SIZE,
+            file_link_editor: String::new(),
+            window_background_opacity: 1.0,
+            macos_window_background_blur: 0.0,
             workspaces: Vec::new(),
             hosts: Vec::new(),
             projects: Vec::new(),
@@ -350,8 +377,7 @@ mod tests {
             appearance: "light".into(),
             font_size: 15.0,
             workspaces: vec![local_workspace(), ssh_workspace(default_ssh_port())],
-            hosts: Vec::new(),
-            projects: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -424,8 +450,7 @@ mod tests {
                     command: String::new(),
                 },
             ],
-            hosts: Vec::new(),
-            projects: Vec::new(),
+            ..Default::default()
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
         for expected in [

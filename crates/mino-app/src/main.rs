@@ -445,8 +445,25 @@ fn main() -> eframe::Result {
         }
     }));
 
+    // 窗口特效（Kaku `window_background_opacity` / `macos_window_background_blur`）：
+    // **必须在创建窗口前读**——窗口透明与否由系统在创建时确定（运行中改配置
+    // 只影响绘制颜色，窗口本身要重启才变透明）。
+    let (window_opacity, window_blur) =
+        app::window_effects_from_config(&mino_core::config::default_config_path());
+    let wants_transparency = window_opacity < 1.0 || window_blur > 0.0;
+    if wants_transparency {
+        log::info!(
+            "窗口特效：不透明度 {window_opacity:.2}、毛玻璃 {}（透明窗口）",
+            if window_blur > 0.0 { "开" } else { "关" }
+        );
+    }
+
+    // 窗口尺寸/位置记忆（Kaku `state.json` 的 window_geometry/window_position）：
+    // 退出时写入快照文件（与 hosts.toml 同目录），启动时按记录恢复；没有
+    // 记录（首次启动/快照损坏）时用默认尺寸 + 居中。
+    let restored = app::restored_window_geometry(&mino_core::config::default_config_path());
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([960.0, 640.0])
+        .with_inner_size(restored.map(|(size, _)| size).unwrap_or([960.0, 640.0]))
         .with_min_inner_size([400.0, 300.0])
         .with_title(PRODUCT_NAME)
         // 保留 macOS 的 Titled 窗口样式，避免无边框窗口退出时触发 AppKit 的
@@ -456,7 +473,21 @@ fn main() -> eframe::Result {
         .with_fullsize_content_view(true)
         .with_title_shown(false)
         .with_titlebar_buttons_shown(true)
-        .with_titlebar_shown(false);
+        .with_titlebar_shown(false)
+        // 透明绘制目标：不透明度 < 1 或开了毛玻璃才要（否则保持系统默认的
+        // 不透明 surface，避免无谓的合成开销）。
+        .with_transparent(wants_transparency);
+    if let Some((size, position)) = restored {
+        log::info!(
+            "恢复窗口几何：{}×{}@{:?}",
+            size[0] as i32,
+            size[1] as i32,
+            position
+        );
+        if let Some(position) = position {
+            viewport = viewport.with_position(position);
+        }
+    }
     // 设置应用图标（macOS Dock 图标由 eframe 运行时写入 NSApp）。
     if let Some(icon) = load_icon() {
         viewport = viewport.with_icon(icon);
@@ -465,7 +496,8 @@ fn main() -> eframe::Result {
         viewport,
         // 每次新建应用窗口时由 eframe 在主显示器上计算居中位置。
         // 不设置时 macOS/winit 可能沿用系统默认的左侧摆放位置。
-        centered: true,
+        // 有上次的位置记录时不再居中（居中会覆盖恢复出来的位置）。
+        centered: !matches!(restored, Some((_, Some(_)))),
         // macOS 15/26 在退出阶段保存 NSWindow 的位置和尺寸时，可能触发
         // AppKit 的 NSTouchBarFinderObservation 重复移除观察者，最终以
         // SIGABRT 退出。mino 没有依赖 eframe 的窗口位置持久化，关闭它可
@@ -486,6 +518,11 @@ fn main() -> eframe::Result {
             let cjk_fonts = setup_fonts(&cc.egui_ctx);
             // 应用窗口圆角与透明背景（非 macOS/测试环境静默跳过）。
             native::apply_rounded_window(cc);
+            // 毛玻璃（Kaku `macos_window_background_blur` > 0）：contentView
+            // 下方铺一层 NSVisualEffectView 材质。
+            if window_blur > 0.0 {
+                native::apply_window_blur(cc);
+            }
             let mut app = MinoApp::new(cc);
             app.set_cjk_font_loader(cjk_fonts);
             Ok(Box::new(app))

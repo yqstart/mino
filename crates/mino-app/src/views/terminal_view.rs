@@ -456,6 +456,13 @@ pub struct TerminalView {
     pending_backend_resize: Option<(u16, u16)>,
     /// 上次通知后台尺寸的时刻（节流基准）。
     last_backend_resize_at: Option<std::time::Instant>,
+    /// 打开文件链接用的编辑器命令（Kaku `file_link_editor`；空 = 自动探测）。
+    /// 由 `MinoApp` 在配置加载/修改时注入（`set_file_link_editor`）。
+    file_link_editor: String,
+    /// 当前按下的 Option 键是哪一侧（Kaku：左 Option = Meta、右 Option =
+    /// 组合字符；egui 的 `Modifiers::alt` 不带左右信息，只能自己跟踪
+    /// `Key::AltLeft`/`Key::AltRight` 的按下与抬起）。
+    option_side: Option<egui::Key>,
     /// 当前终端选区（⌘C / Ctrl+Shift+C 复制）。
     selection: Option<TerminalSelection>,
     /// 是否正在进行鼠标拖选。
@@ -571,6 +578,8 @@ impl TerminalView {
             },
             pending_backend_resize: None,
             last_backend_resize_at: None,
+            file_link_editor: String::new(),
+            option_side: None,
             selection: None,
             selecting: false,
             copy_flash_until: None,
@@ -827,6 +836,74 @@ impl TerminalView {
         (self.cell_width > 0.0).then_some((self.cell_width, self.cell_height))
     }
 
+    /// 设置文件链接编辑器命令（Kaku `file_link_editor`；空 = 自动探测）。
+    pub fn set_file_link_editor(&mut self, editor: &str) {
+        self.file_link_editor = editor.to_string();
+    }
+
+    /// 当前文件链接编辑器命令（空 = 自动探测）。
+    pub fn file_link_editor(&self) -> &str {
+        &self.file_link_editor
+    }
+
+    /// 本地文件链接 → 编辑器（Kaku `file_link_editor` 语义）。
+    ///
+    /// 命中条件：本会话是**本地**会话（远程路径在本机不存在）、目标是文件
+    /// 路径（`/…`、`./…`、`../…`、`~/…`、`file://…`，可带 `:行[:列]`）、
+    /// 路径真实存在、且能找到编辑器命令（配置 → VS Code 系 → `$VISUAL`/
+    /// `$EDITOR`）。命中并成功启动返回 true；否则 false，调用方回退
+    /// `open_url`（系统默认程序，与改动前一致）。
+    pub fn open_local_file_link(&self, raw: &str) -> bool {
+        if self.session.is_remote() {
+            return false;
+        }
+        let Some((path, line, column)) = resolve_local_file_link(raw) else {
+            return false;
+        };
+        // 相对路径按窗格当前目录解析（`effective_local_directory` 优先内核
+        // cwd：粘贴/补全场景下输入跟踪会停在旧目录）。
+        let path = if path.is_absolute() {
+            path
+        } else {
+            match self.effective_local_directory() {
+                Some(cwd) => std::path::Path::new(&cwd).join(path),
+                None => return false,
+            }
+        };
+        if !path.exists() {
+            return false;
+        }
+        let Some(editor) = editor_command(&self.file_link_editor) else {
+            return false;
+        };
+        let argv = parse_command_line(&editor);
+        let Some((program, args)) = argv.split_first() else {
+            return false;
+        };
+        // Kaku：把 `path[:行[:列]]` 作为一个参数追加（zed / cursor / `code`
+        // 都认这种写法）。
+        let mut target = path.to_string_lossy().into_owned();
+        match (line, column) {
+            (Some(line), Some(column)) => target.push_str(&format!(":{line}:{column}")),
+            (Some(line), None) => target.push_str(&format!(":{line}")),
+            _ => {}
+        }
+        match std::process::Command::new(program)
+            .args(args)
+            .arg(&target)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(_) => true,
+            Err(error) => {
+                log::warn!("文件链接编辑器启动失败（{program}）：{error}");
+                false
+            }
+        }
+    }
+
     /// 命令是否正在执行（shell 集成 133;C 之后未见 133;D/A）。
     ///
     /// 用于关闭确认（Kaku `SmartPrompt`）：命令运行中关闭标签/窗格先确认。
@@ -1067,6 +1144,16 @@ impl TerminalView {
                 SessionEvent::CommandStart => {
                     self.shell_running = true;
                 }
+                // 进度上报（OSC 9;4，ConEmu 扩展）：**出错(2)/暂停(4)** 视为
+                // "需要用户注意" → 标签琥珀点（Kaku 文档：背景标签的琥珀点
+                // 由 BEL 或 OSC 9;4 的 error/paused 点亮）。进行中(1)/不确定(3)
+                // 不上点——Kaku 明确不上"运行中"点，否则要求持续喂进度事件
+                // 才诚实；清除(0) 也不撤点（注意力点由"查看标签"清除）。
+                SessionEvent::Progress(state) => {
+                    if state == 2 || state == 4 {
+                        self.attention = true;
+                    }
+                }
                 // shell 集成：命令结束与退出码（133;D）：交给应用层消费
                 //（AI 失败建议、标签注意力点）。
                 SessionEvent::CommandFinished(code) => {
@@ -1210,7 +1297,10 @@ impl TerminalView {
         self.shapes_scratch.push(egui::Shape::rect_filled(
             outer,
             0.0,
-            Color32::from_rgb(term_bg.r, term_bg.g, term_bg.b),
+            // Kaku `window_background_opacity`：只作用于终端默认背景（显式
+            // 着色的 cell 背景保持不透明，与其 `text_background_opacity`
+            // 默认 1.0 的分工一致）。
+            crate::theme::apply_window_alpha(Color32::from_rgb(term_bg.r, term_bg.g, term_bg.b)),
         ));
         // 终端内容区域：背景铺满面板，文本/光标在内边距内绘制（Kaku 风格：
         // 左右上 40 设备像素、底边 0——标签栏在最底部）。
@@ -2559,9 +2649,24 @@ impl TerminalView {
                             need_repaint = true;
                             continue;
                         }
+                        // Option 键本身：记录侧别（左 = Meta、右 = 组合字符，
+                        // Kaku `send_composed_key_when_left_alt_is_pressed = false`
+                        // / `..._right_alt_... = true`）。按键本身不产生字节，
+                        // 但按下/抬起必须更新状态，否则右 Option 的组合语义
+                        // 无从判断。
+                        if matches!(key, egui::Key::AltLeft | egui::Key::AltRight) {
+                            if *pressed {
+                                self.option_side = Some(*key);
+                            } else if self.option_side == Some(*key) {
+                                self.option_side = None;
+                            }
+                            continue;
+                        }
                         // Ctrl/Alt 修饰的字母与符号键：直接编码为控制字符/转义前缀
                         // （egui 0.36 的 Text 事件与 Key 事件独立，这里处理并让 Text 事件跳过）。
-                        if mods.ctrl || mods.alt {
+                        // 右 Option 例外：它要的是组合字符（`⌥2` → `™`），交给 Text 事件。
+                        if mods.ctrl || (mods.alt && self.option_side != Some(egui::Key::AltRight))
+                        {
                             if let Some(k) = map_char_key(key, modifiers.shift) {
                                 if let Some(bytes) = keys::encode_key(k, mods, mode) {
                                     pending_writes.extend_from_slice(&bytes);
@@ -2596,9 +2701,12 @@ impl TerminalView {
                         {
                             continue;
                         }
-                        // Ctrl/Alt 组合已在 Key 事件处理，跳过避免重复写入。
+                        // Ctrl/Alt 组合已在 Key 事件处理，跳过避免重复写入；
+                        // 右 Option 是例外——组合字符只经 Text 事件到达
+                        // （Kaku：右 Option 输入组合字符）。
                         let mods = i.modifiers;
-                        if mods.ctrl || mods.alt {
+                        if mods.ctrl || (mods.alt && self.option_side != Some(egui::Key::AltRight))
+                        {
                             continue;
                         }
                         // 过滤不可打印字符（控制符/私有区/零宽字符等）。
@@ -2789,11 +2897,37 @@ impl TerminalView {
 
         // 闭包外统一执行滚动（见函数头注释）：此时已释放 Context 写锁，
         // 再拿 Term 锁不会形成 AB-BA。
+        let mut scrolled = false;
         if !pending_scroll.is_empty() {
             let term_arc = self.session.term();
             let mut guard = term_arc.lock();
             for scroll in pending_scroll {
                 guard.scroll_display(scroll);
+            }
+            scrolled = true;
+        }
+        // Kaku `selection_wheel_scroll_behavior = "Extend"`（默认）：拖选时滚轮
+        // 滚动视口，选区端点跟着光标走——跨屏选择不用"松手、滚动、重选"。
+        // 拖动期间 egui 不再发 PointerMoved，端点停在滚动前的格子上；滚动
+        // 改了视口偏移，必须用**新偏移**按当前指针位置重算（Kaku 与 macOS
+        // 原生文本控件同款：滚轮滚动的同时选区跟随光标扩大）。
+        if scrolled && self.selecting {
+            let pointer = ui.input(|i| i.pointer.hover_pos());
+            if let Some(pos) = pointer.filter(|pos| inner.contains(*pos)) {
+                let display_offset = self.session.term().lock().grid().display_offset();
+                let point = selection_point_from_screen(
+                    pos,
+                    inner,
+                    self.cell_width,
+                    self.cell_height,
+                    display_offset,
+                    self.cols as usize,
+                    self.rows as usize,
+                );
+                if let Some(selection) = &mut self.selection {
+                    selection.focus = point;
+                }
+                ui.ctx().request_repaint();
             }
         }
         // 闭包内攒的字节（按键/鼠标/IME/粘贴）一次写入：一次通道发送、一次
@@ -3086,6 +3220,10 @@ impl TerminalView {
     fn apply_menu_choice(&mut self, ctx: &egui::Context, choice: MenuChoice) {
         match choice {
             MenuChoice::OpenLink(url) => {
+                // 与单击同一条路径：本地文件 → 编辑器，其余交系统默认程序。
+                if self.open_local_file_link(&url) {
+                    return;
+                }
                 if let Some(target) = open_target_url(&url) {
                     ctx.open_url(egui::OpenUrl::same_tab(target));
                 }
@@ -3646,6 +3784,12 @@ impl TerminalView {
             return;
         }
         if !ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Primary)) {
+            return;
+        }
+        // 本地文件链接先交给编辑器（Kaku `file_link_editor`：编辑器 +
+        // `path:行:列`）；未命中（编辑器未配置/路径不存在/远程会话）再
+        // 回退系统默认程序。
+        if self.open_local_file_link(&url) {
             return;
         }
         let Some(target) = open_target_url(&url) else {
@@ -4528,6 +4672,162 @@ fn strip_line_suffix(path: &str) -> &str {
     } else {
         path
     }
+}
+
+/// 文件链接的目标解析：`路径` + 可选的 `:行[:列]`。
+///
+/// 接受 `/…`、`./…`、`../…`、`~/…` 与 `file://…`（后者解码百分号编码，
+/// 与 `open_target_url` 的编码方向互逆）；其它形态返回 None（URL / 域名
+/// 走 `open_url`，不属于文件链接）。
+fn resolve_local_file_link(raw: &str) -> Option<(std::path::PathBuf, Option<u32>, Option<u32>)> {
+    let trimmed = raw.trim();
+    let path_text = match trimmed.strip_prefix("file://") {
+        Some(rest) => {
+            // `file://host/path` 或 `file:///path`：丢掉主机名段。
+            let decoded = percent_decode_text(rest);
+            let index = decoded.find('/')?;
+            decoded[index..].to_string()
+        }
+        None => trimmed.to_string(),
+    };
+    let is_path = path_text.starts_with('/')
+        || path_text.starts_with("./")
+        || path_text.starts_with("../")
+        || path_text.starts_with("~/");
+    if !is_path {
+        return None;
+    }
+    let (without_suffix, line, column) = split_line_suffix(&path_text);
+    let expanded = crate::views::link_detect::normalize_target(without_suffix, None);
+    Some((std::path::PathBuf::from(expanded), line, column))
+}
+
+/// `路径:行` / `路径:行:列` → `(路径, 行, 列)`（无后缀时后两项为 None）。
+fn split_line_suffix(path: &str) -> (&str, Option<u32>, Option<u32>) {
+    let bytes = path.as_bytes();
+    let mut end = bytes.len();
+    let mut numbers: Vec<u32> = Vec::new();
+    // 从尾部最多剥两段 `:数字`（先列后行）；任何一段不成立就停手，
+    // 已剥到的段保留（`a.rs:12` 只有行号也要认）。
+    while numbers.len() < 2 {
+        let digits_end = end;
+        let mut digits_start = end;
+        while digits_start > 0 && bytes[digits_start - 1].is_ascii_digit() {
+            digits_start -= 1;
+        }
+        if digits_start == digits_end || digits_start == 0 || bytes[digits_start - 1] != b':' {
+            break;
+        }
+        let Ok(value) = path[digits_start..digits_end].parse::<u32>() else {
+            break;
+        };
+        numbers.push(value);
+        end = digits_start - 1;
+    }
+    numbers.reverse();
+    match numbers.len() {
+        1 => (&path[..end], Some(numbers[0]), None),
+        2 => (&path[..end], Some(numbers[0]), Some(numbers[1])),
+        _ => (path, None, None),
+    }
+}
+
+/// 文件 URL 的百分号解码（`%20` → 空格；非法序列原样保留）。
+fn percent_decode_text(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let high = (bytes[index + 1] as char).to_digit(16);
+            let low = (bytes[index + 2] as char).to_digit(16);
+            if let (Some(high), Some(low)) = (high, low) {
+                out.push((high * 16 + low) as u8);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 编辑器命令解析顺序（Kaku 同款）：配置的 `file_link_editor` → VS Code 系
+/// 命令行（`code` / `cursor`）→ `$VISUAL` / `$EDITOR`。都没有返回 None
+/// （调用方回退系统默认程序）。
+fn editor_command(configured: &str) -> Option<String> {
+    let configured = configured.trim();
+    if !configured.is_empty() {
+        return Some(configured.to_string());
+    }
+    for candidate in ["code", "cursor"] {
+        if command_on_path(candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+    for key in ["VISUAL", "EDITOR"] {
+        if let Some(value) = std::env::var_os(key) {
+            let value = value.to_string_lossy().trim().to_string();
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+/// PATH 上是否存在可执行文件（`which` 的最小实现，不启动子进程）。
+fn command_on_path(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        let candidate = dir.join(name);
+        candidate.is_file()
+    })
+}
+
+/// 命令串 → `argv`（支持单/双引号；未闭合引号按到串尾处理）。
+///
+/// Kaku 的 `file_link_editor` 支持带参数与 shell 风格引号（如
+/// `cursor --goto`、`"/Applications/My Editor/bin/open"`）。
+fn parse_command_line(command: &str) -> Vec<String> {
+    let mut argv: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut has_token = false;
+    for ch in command.chars() {
+        match quote {
+            Some(open) => {
+                if ch == open {
+                    quote = None;
+                } else {
+                    current.push(ch);
+                }
+            }
+            None => match ch {
+                '\'' | '"' => {
+                    quote = Some(ch);
+                    has_token = true;
+                }
+                c if c.is_whitespace() => {
+                    if has_token {
+                        argv.push(std::mem::take(&mut current));
+                        has_token = false;
+                    }
+                }
+                c => {
+                    current.push(c);
+                    has_token = true;
+                }
+            },
+        }
+    }
+    if has_token {
+        argv.push(current);
+    }
+    argv
 }
 
 /// 文件 URL 的百分号编码（保留 `/` 与 URL 未保留字符集）。
@@ -5446,6 +5746,340 @@ mod tests {
         harness.step();
 
         assert!(view.borrow().selection.is_some(), "拖选后应存在终端选区");
+    }
+
+    /// Option 键的左右分工（Kaku：左 = Meta、右 = 组合字符）。
+    ///
+    /// egui 的 `Modifiers::alt` 不带左右信息，靠 `Key::AltLeft`/`AltRight`
+    /// 的按下与抬起跟踪：右 Option 的 `⌥2` 必须上屏组合字符 `™`
+    /// （Text 事件），左 Option 仍是 Meta（只发 ESC 前缀、不上屏组合字符）。
+    #[test]
+    fn 右option输入组合字符() {
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+        });
+        assert!(wait_text(&view, &mut harness, "mino"), "zsh 未就绪");
+
+        let alt = egui::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        let option_key =
+            |harness: &mut egui_kittest::Harness<()>, key: egui::Key, pressed: bool| {
+                harness.event(egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers: alt,
+                });
+            };
+        // 右 Option：组合字符经 Text 事件上屏。
+        harness.event(egui::Event::ModifiersChanged(alt));
+        option_key(&mut harness, egui::Key::AltRight, true);
+        option_key(&mut harness, egui::Key::Num2, true);
+        harness.event(egui::Event::Text("™".into()));
+        option_key(&mut harness, egui::Key::AltRight, false);
+        option_key(&mut harness, egui::Key::Num2, false);
+        harness.event(egui::Event::ModifiersChanged(egui::Modifiers::default()));
+        assert!(
+            wait_text(&view, &mut harness, "™"),
+            "右 Option 应输入组合字符，终端内容：\n{}",
+            grid_text(view.borrow().session())
+        );
+
+        // 左 Option：Meta 语义，组合字符不上屏（只发 ESC 前缀）。
+        harness.event(egui::Event::ModifiersChanged(alt));
+        option_key(&mut harness, egui::Key::AltLeft, true);
+        option_key(&mut harness, egui::Key::Num2, true);
+        harness.event(egui::Event::Text("™".into()));
+        option_key(&mut harness, egui::Key::AltLeft, false);
+        option_key(&mut harness, egui::Key::Num2, false);
+        harness.event(egui::Event::ModifiersChanged(egui::Modifiers::default()));
+        for _ in 0..6 {
+            harness.step();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let text = grid_text(view.borrow().session());
+        assert_eq!(
+            text.matches('™').count(),
+            1,
+            "左 Option 不应再上屏组合字符（Meta 语义）：\n{text}"
+        );
+    }
+
+    /// 块字形（`█` 满块）按行高无缝拼接——像素级回归。
+    ///
+    /// Kaku 用 `custom_block_glyphs` 自绘块/制表字形来保证"无缝"；Mino 依赖
+    /// 打包的 JetBrains Mono（块字形覆盖整个行高、相邻行自然重叠），实测
+    /// 同样无缝：连排满块里不允许出现整行/整列的背景色（接缝），否则 TUI
+    /// 进度条、表格边框、`neofetch` 图形会裂开。字号/行高/字体链改动若
+    /// 破坏这个性质，这条测试必须失败（本轮 B 对齐审计中已用像素实测确认）。
+    #[test]
+    fn 块字形无缝拼接() {
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+        });
+        // 真实字体链（JetBrains Mono + 符号兜底）：块字形由打包字体提供，
+        // 不能用测试默认字体链断言。
+        crate::setup_fonts(&harness.ctx);
+        harness.run_steps(6);
+        // 清屏 + 4 行 × 8 列满块。
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b[2J\x1b[H");
+        for _ in 0..4 {
+            payload.extend_from_slice("████████\r\n".as_bytes());
+        }
+        view.borrow()
+            .session()
+            .inject_program_output_for_test(&payload);
+        for _ in 0..4 {
+            harness.step();
+        }
+
+        let inner = view.borrow().terminal_inner();
+        let (cell_w, cell_h) = view.borrow().cell_metrics().expect("字宽应已测量");
+        let image = harness.render().expect("渲染失败");
+        let width = image.width() as usize;
+        let height = image.height() as usize;
+        let theme = crate::theme::current_theme();
+        let luminance =
+            |c: [u8; 4]| 0.299 * c[0] as f32 + 0.587 * c[1] as f32 + 0.114 * c[2] as f32;
+        // 前景判定按"与背景亮度差明显"而不是"比背景亮"：主题可能是浅色
+        // （浅底深字），比亮更亮会一个像素都判不出来（此前在该测试里踩过）。
+        let bg_luminance = luminance([theme.term_bg.r, theme.term_bg.g, theme.term_bg.b, 255]);
+        let pixel = |x: usize, y: usize| image.get_pixel(x as u32, y as u32).0;
+        let is_ink = |x: usize, y: usize| (luminance(pixel(x, y)) - bg_luminance).abs() > 60.0;
+        // 块区域：从内容左上角起 8 列 × 4 行。
+        let x0 = inner.left().round() as usize;
+        let y0 = inner.top().round() as usize;
+        let x1 = x0 + (cell_w * 8.0).round() as usize;
+        let y1 = y0 + (cell_h * 4.0).round() as usize;
+        // 横向：块区域内每一行都要有亮像素（行间没有接缝）。
+        for y in y0..y1.min(height) {
+            let ink = (x0..x1.min(width)).filter(|x| is_ink(*x, y)).count();
+            assert!(
+                ink > 0,
+                "满块区域第 {y} 行整行无前景像素（行间接缝）：x {x0}..{x1}"
+            );
+        }
+        // 纵向：每一列都要有亮像素（列间没有接缝）。
+        for x in x0..x1.min(width) {
+            let ink = (y0..y1.min(height)).filter(|y| is_ink(x, *y)).count();
+            assert!(
+                ink > 0,
+                "满块区域第 {x} 列整列无前景像素（列间接缝）：y {y0}..{y1}"
+            );
+        }
+        // 覆盖高度接近整块（块字形铺满行高，而不是只盖住 em 盒的一半）。
+        let covered = (y0..y1.min(height))
+            .filter(|y| (x0..x1.min(width)).any(|x| is_ink(x, *y)))
+            .count();
+        assert!(
+            covered as f32 >= (cell_h * 4.0) - 2.0,
+            "满块应铺满行高：覆盖 {covered}px，期望约 {}px",
+            cell_h * 4.0
+        );
+    }
+
+    /// 文件链接（Kaku `file_link_editor`）：`路径:行:列` 拆解与命令解析。
+    #[test]
+    fn 文件链接命令解析() {
+        assert_eq!(
+            split_line_suffix("/src/main.rs:12:3"),
+            ("/src/main.rs", Some(12), Some(3))
+        );
+        assert_eq!(
+            split_line_suffix("/src/main.rs:12"),
+            ("/src/main.rs", Some(12), None)
+        );
+        assert_eq!(
+            split_line_suffix("/src/main.rs"),
+            ("/src/main.rs", None, None)
+        );
+        // 只有数字、没有冒号：不是行号后缀。
+        assert_eq!(split_line_suffix("/tmp/a123"), ("/tmp/a123", None, None));
+        // 命令解析：参数、引号（编辑器路径带空格）。
+        assert_eq!(
+            parse_command_line("cursor --goto"),
+            vec!["cursor", "--goto"]
+        );
+        assert_eq!(
+            parse_command_line("\"/Applications/My Editor/bin/open\" -n"),
+            vec!["/Applications/My Editor/bin/open", "-n"]
+        );
+        assert!(parse_command_line("   ").is_empty());
+        // 配置优先于自动探测。
+        assert_eq!(editor_command("zed").as_deref(), Some("zed"));
+        // 非文件链接不是文件目标。
+        assert!(resolve_local_file_link("https://example.com").is_none());
+        assert_eq!(
+            resolve_local_file_link("file:///tmp/a%20b.rs"),
+            Some((std::path::PathBuf::from("/tmp/a b.rs"), None, None))
+        );
+    }
+
+    /// 文件链接交给编辑器打开：编辑器命令（含空格路径）+ `路径:行:列`
+    /// 作为单个参数传给编辑器；不存在的路径与 URL 回退（返回 false）。
+    #[test]
+    fn 文件链接用编辑器打开() {
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let mut view = TerminalView::new(session);
+        let dir = std::env::temp_dir().join(format!("mino-editor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("创建测试目录失败");
+        let out = dir.join("args.txt");
+        let script = dir.join("fake editor.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n", out.display()),
+        )
+        .expect("写脚本失败");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod 失败");
+        }
+        let file = dir.join("main.rs");
+        std::fs::write(&file, "fn main() {}\n").expect("写文件失败");
+
+        // 编辑器路径带空格：引号解析 + `:行:列` 后缀。
+        view.set_file_link_editor(&format!("\"{}\"", script.display()));
+        let target = format!("{}:12:3", file.display());
+        assert!(view.open_local_file_link(&target), "应命中编辑器打开路径");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while !out.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "假编辑器未收到参数（脚本未执行？）"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        let args = std::fs::read_to_string(&out).expect("读参数失败");
+        assert_eq!(args.trim(), target, "编辑器应收到 `路径:行:列` 单个参数");
+
+        // 不存在的路径：不启动编辑器（回退系统默认程序）。
+        assert!(
+            !view.open_local_file_link("/definitely/not/here-mino.rs"),
+            "不存在的路径不应命中编辑器"
+        );
+        // URL / 域名不是文件链接。
+        assert!(!view.open_local_file_link("https://example.com/a/b"));
+        // 远程会话不由本地编辑器打开（本地路径在远端不存在）。
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Kaku `selection_wheel_scroll_behavior = "Extend"`（默认）：拖选过程中
+    /// 滚轮滚动视口，选区端点跟着光标走——跨屏选择不用"松手、滚动、重选"。
+    ///
+    /// 拖动期间 egui 不再发 PointerMoved，端点必须按**滚动后的视口偏移**
+    /// 重算，否则选区停在滚动前的格子上（表现为滚轮后选区不跟着长）。
+    #[test]
+    fn 拖选时滚轮扩展选区() {
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let view = Rc::new(RefCell::new(TerminalView::new(session)));
+        let view_show = view.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            view_show.borrow_mut().show(ui);
+        });
+        assert!(wait_text(&view, &mut harness, "mino"), "zsh 未就绪");
+        // 造 scrollback（60 行 > 24 行视口），否则滚轮无历史可滚。
+        let mut payload = Vec::new();
+        for line in 0..60 {
+            payload.extend_from_slice(format!("line {line}\r\n").as_bytes());
+        }
+        view.borrow()
+            .session()
+            .inject_program_output_for_test(&payload);
+        for _ in 0..8 {
+            harness.step();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+
+        // 拖选：按下 → 移动（建立选区）。y 取终端内边距之下（滚轮只在指针
+        // 位于终端内容区时处理，y=14 落在顶部内边距里会被跳过）。
+        let start = egui::pos2(12.0, 100.0);
+        let end = egui::pos2(150.0, 100.0);
+        harness.event(egui::Event::PointerMoved(start));
+        harness.event(egui::Event::PointerButton {
+            pos: start,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+        harness.event(egui::Event::PointerMoved(end));
+        harness.step();
+        let before = view
+            .borrow()
+            .selection
+            .as_ref()
+            .expect("拖选后应存在选区")
+            .focus;
+
+        // 按住不放，滚轮上滚 3 行：端点应随视口上移（grid_line 变小）。
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::Vec2::new(0.0, 3.0),
+            modifiers: egui::Modifiers::default(),
+            phase: egui::TouchPhase::Move,
+        });
+        harness.step();
+        harness.step();
+        let offset = view
+            .borrow()
+            .session()
+            .term()
+            .lock()
+            .grid()
+            .display_offset();
+        assert!(offset > 0, "拖选中的滚轮也应滚动视口（offset={offset}）");
+        let after = view
+            .borrow()
+            .selection
+            .as_ref()
+            .expect("滚轮后选区应保留")
+            .focus;
+        assert!(
+            after.grid_line < before.grid_line,
+            "滚轮后端点应跟着视口上移：{} → {}",
+            before.grid_line,
+            after.grid_line
+        );
+        assert_eq!(
+            before.grid_line - after.grid_line,
+            offset as i32,
+            "端点位移应等于滚动的行数（selection_wheel_scroll_behavior=Extend）"
+        );
     }
 
     /// 退格键应删除已输入字符（回归测试：曾出现删除键异常）。
@@ -6667,6 +7301,57 @@ mod mouse_wheel_tests {
             "ResetTitle 应清空标题缓存，实际：{:?}",
             view.session_title()
         );
+    }
+
+    /// 进度上报（`OSC 9;4`）：出错(2)/暂停(4) 点亮标签注意力点，进行中(1)
+    /// 与普通通知（`OSC 9;<message>`）不点亮（Kaku 的琥珀点语义）。
+    #[test]
+    fn 进度上报点亮注意力点() {
+        use mino_core::terminal::{Session, SessionOptions};
+        use std::sync::Arc;
+        let session = Session::spawn_local(
+            SessionOptions::default(),
+            80,
+            24,
+            Arc::new(|_ev: &SessionEvent| {}),
+        )
+        .expect("创建本地终端失败");
+        let mut view = TerminalView::new(session);
+        assert!(!view.attention(), "初始不应有点亮");
+
+        // 进行中：不上点（要点必须持续喂进度事件才诚实，Kaku 明确不上）。
+        view.session()
+            .inject_sniffed_bytes_for_test(b"\x1b]9;4;1;50\x07");
+        view.drain_background_events();
+        assert!(!view.attention(), "进行中(1) 不应点亮注意力点");
+
+        // 出错 / 暂停：上点（用户需要回来看看）。
+        view.session()
+            .inject_sniffed_bytes_for_test(b"\x1b]9;4;2;0\x07");
+        view.drain_background_events();
+        assert!(view.attention(), "出错(2) 应点亮注意力点");
+
+        view.clear_attention();
+        view.session()
+            .inject_sniffed_bytes_for_test(b"\x1b]9;4;4\x07");
+        view.drain_background_events();
+        assert!(view.attention(), "暂停(4) 应点亮注意力点");
+
+        // 桌面通知（`OSC 9;<message>`）不是进度，不能误判。
+        view.clear_attention();
+        view.session()
+            .inject_sniffed_bytes_for_test(b"\x1b]9;build finished\x07");
+        view.drain_background_events();
+        assert!(!view.attention(), "通知序列不应点亮注意力点");
+
+        // 清除(0) 不撤点：注意力点由"查看标签"清（Kaku 同款）。
+        view.session()
+            .inject_sniffed_bytes_for_test(b"\x1b]9;4;2\x07");
+        view.drain_background_events();
+        view.session()
+            .inject_sniffed_bytes_for_test(b"\x1b]9;4;0\x07");
+        view.drain_background_events();
+        assert!(view.attention(), "清除(0) 不应撤掉已有的注意力点");
     }
 
     /// 回归：程序订阅 kitty 键盘（`CSI > 1 u`）后按键按协议分流——

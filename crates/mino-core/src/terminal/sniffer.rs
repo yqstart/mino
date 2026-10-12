@@ -8,7 +8,8 @@
 //!   来源，远程会话尤其重要——此前远程目录只能靠 `cd` 文本跟踪）；
 //! - `OSC 133;A/B` → 提示符就绪（shell 空闲待输入）；
 //! - `OSC 133;C` → 命令开始执行；
-//! - `OSC 133;D;<exit>` → 命令结束与退出码（AI 失败建议、标签注意力点）。
+//! - `OSC 133;D;<exit>` → 命令结束与退出码（AI 失败建议、标签注意力点）；
+//! - `OSC 9;4;<state>` → 进度上报（出错/暂停 → 标签注意力点；Kaku 同源）。
 //!
 //! 实现为逐字节状态机：Ground 态线性跳到下一个 ESC（普通文本零解析
 //! 成本）；OSC 载荷在缓冲里累积（跨 read 分片的半截序列可靠补齐），
@@ -25,6 +26,13 @@ pub enum Marker {
     CommandStart,
     /// 命令结束（OSC 133;D;<exit_code>）。
     CommandFinished(i32),
+    /// 进度上报状态（`OSC 9;4;<state>[;<pct>]`，ConEmu/WezTerm 扩展）。
+    ///
+    /// 状态取值：0=清除、1=进行中、2=出错、3=不确定、4=暂停。Kaku 只把
+    /// **出错(2)/暂停(4)** 当"需要用户注意"（其文档：标签上的琥珀点由 BEL
+    /// 或 OSC 9;4 的 error/paused 点亮），进行中不上点（否则要点必须持续
+    /// 喂进度事件才诚实）。
+    Progress(u8),
 }
 
 /// OSC 载荷缓冲上限（畸形序列防护；正常标记 < 200 字节）。
@@ -134,6 +142,16 @@ fn parse_osc(payload: &[u8]) -> Option<Marker> {
     let (code, rest) = text.split_once(';')?;
     match code {
         "7" => parse_osc7(rest).map(Marker::Cwd),
+        "9" => {
+            // `OSC 9` 也是桌面通知序列（`9;<message>`）；只有 `9;4;<state>`
+            // 是进度上报（ConEmu 扩展，WezTerm/Kaku 同源），其余忽略——
+            // 通知横幅不在 Mino 的能力范围内，不能被误当成进度。
+            let mut fields = rest.split(';');
+            if fields.next()? != "4" {
+                return None;
+            }
+            Some(Marker::Progress(fields.next()?.trim().parse().ok()?))
+        }
         "133" => {
             let (kind, arg) = match rest.split_once(';') {
                 Some((kind, arg)) => (kind, arg),
@@ -366,6 +384,28 @@ mod tests {
                 Marker::PromptReady,
                 Marker::CommandStart,
                 Marker::CommandFinished(1),
+            ]
+        );
+    }
+
+    /// `OSC 9;4;<state>` 是进度上报（ConEmu 扩展）；`OSC 9;<message>` 是
+    /// 桌面通知，不能误判成进度（Kaku/WezTerm 把两者分开处理）。
+    #[test]
+    fn 解析osc9进度上报() {
+        let mut sniffer = OscSniffer::new();
+        let mut out = Vec::new();
+        sniffer.feed(b"\x1b]9;4;1;50\x07", &mut out);
+        sniffer.feed(b"\x1b]9;4;2;0\x07", &mut out);
+        sniffer.feed(b"\x1b]9;4;4\x07", &mut out);
+        // 通知（无 `4;` 前缀）与畸形状态：不进事件流。
+        sniffer.feed(b"\x1b]9;build finished\x07", &mut out);
+        sniffer.feed(b"\x1b]9;4;nope\x07", &mut out);
+        assert_eq!(
+            out,
+            vec![
+                Marker::Progress(1),
+                Marker::Progress(2),
+                Marker::Progress(4),
             ]
         );
     }

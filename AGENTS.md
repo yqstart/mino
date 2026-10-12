@@ -162,11 +162,26 @@ crates/
 ## 分屏（Panes，v2.0）
 
 - 数据结构：`TerminalTab { panes: Vec<Pane>, layout: PaneNode, active_pane, zoomed, origin, .. }`；`Pane { id, view: TerminalView }`；布局树（`views/pane_tree.rs`）叶子 id 与 panes 一一对应；`SessionOrigin::{Local, Remote(HostProfile)}` 记录来源（分屏继承：本地按活动窗格 cwd 新起本地 shell、SSH 重连同主机；快照恢复也用它）
-- 几何：`pane_tree::layout(tree, rect, gap, &mut out)` 相邻窗格间隙恰为 `gap`（`PANE_GAP = 10`），外缘贴齐；比例调整取「离目标窗格最近的同轴 Split」钳 0.1..0.9
+- 几何：`pane_tree::layout(tree, rect, gap, &mut out)` 相邻窗格间隙恰为 `gap`，外缘贴齐；比例调整取「离目标窗格最近的同轴 Split」钳 0.1..0.9。**间隙 = 5 个字宽**（Kaku `split_pane_gap = 2` 的渲染语义 `gutter = 1 + 2 × gap`，其默认配置注释与 README 截图实测同量级）：`pane_gap()` 用活动窗格实测字宽换算（`PANE_GAP_CELLS`，字宽未测量时退回 `PANE_GAP_FALLBACK`），随字号变化；曾固定 10px（比 Kaku 明显窄）
 - 渲染：`MinoApp::render_tab_panes` 按 rect 分配子 Ui（`UiBuilder::max_rect` + `set_clip_rect`），各窗格独立 `show_with_input`；渲染时写回 `tab.pane_rects`（邻居查找用真实几何）
 - **焦点铁律**：egui 键盘焦点决定活动窗格（渲染后焦点跟随），**任何程序化切换活动窗格必须同时 `request_pane_focus`**（⌘⌥方向键/关闭窗格/新分屏挂载），否则下一帧焦点跟随把活动窗格拉回旧窗格（"⌘⌥← 没反应"的根因）；`TerminalView::focus_id` 每实例唯一（`NEXT_VIEW_ID` 自增；曾是常量 Id，分屏后互相顶焦点）
 - 快捷键：⌘D 左右 / ⌘⇧D 上下 / ⌘⇧S 翻转最近一层方向 / ⌘⇧Enter 放大还原 / ⌘⌥←→↑↓ 移焦 / ⌘⌃←→↑↓ 调整比例（每次 5 列，按窗格尺寸换算比例增量）；⌘W 智能关闭（多窗格→关窗格；多标签→关标签；最后一个→最小化窗口——Kaku 是 hide，Mino 用最小化保证一定找得回）
 - 右键菜单（`MenuChoice`）：复制/粘贴/全选/搜索/打开链接 + 分屏/关窗格/新建标签/关闭标签/清屏/重置字号；本地动作在 `TerminalView::apply_menu_choice` 内执行，跨窗格动作经 `take_menu_choices()` 交应用层
+
+## Kaku 行为与渲染对齐（B 组，v2.0）
+
+按「以 Kaku 自带默认配置（`/Applications/Kaku.app/Contents/Resources/kaku.lua`）+ 官方 docs 为基准」逐项对齐的终端行为；每条都带回归测试。
+
+- **标签/窗口标题**：标签标题默认「父目录/当前目录」（`tab_dir_label`，Kaku `format-tab-title` 默认语义，`/Users/me/www/Kaku` → `www/Kaku`），放大态追加 ` [Z]`；多窗格按窗格目录标签以 `∙` 去重连接；**窗口标题**每帧同步（`sync_window_title`，多标签前缀 `[i/n]`，只在变化时下发 `ViewportCommand::Title`）——标题条文字本身隐藏，但 Mission Control/窗口菜单看到的是它
+- **`COLORFGBG` 注入**（`colorfgbg()`）：仅本地会话（Kaku 的 `set_environment_variables` 同样只作用于本地 pty），浅色 `0;15`、深色 `15;0`，会话创建时定值
+- **`OSC 9;4` 进度上报**：`sniffer::Marker::Progress` → `SessionEvent::Progress`，出错(2)/暂停(4) 点亮标签注意力点（Kaku 的琥珀点语义）；进行中(1)/不确定(3) 不上点（Kaku 明确不上"运行中"点），`OSC 9;<message>`（桌面通知）不误判成进度；测试注入走 `Session::inject_sniffed_bytes_for_test`（`inject_program_output_for_test` 绕过嗅探器，收不到这类事件）
+- **拖选时滚轮**（Kaku `selection_wheel_scroll_behavior = "Extend"` 默认）：滚轮滚动视口后，用**新** `display_offset` 按当前指针位置重算选区端点（拖动期间 egui 不发 PointerMoved），跨屏选择不用松手重选；实现在 `handle_input` 的 pending_scroll 之后
+- **替代屏滚轮**：维持「映射方向键」（`WheelTarget::AlternateScroll`）。Kaku 的 `alternate_screen_wheel_scrolls_terminal` 默认 false（窥视回滚缓冲）在 Mino 引擎下不可实现——alacritty 的替代屏 `display_offset` 恒为 0（`替代屏没有可滚动历史` 哨兵测试），照搬只会让滚轮变空操作
+- **文件链接编辑器**（Kaku `file_link_editor`）：`open_local_file_link` 命中条件＝本地会话 + 文件路径（含 `file://`、`:行[:列]`）+ 路径存在 + 能解析出编辑器；编辑器解析顺序＝配置 → `code`/`cursor`（PATH 探测）→ `$VISUAL`/`$EDITOR` → 回退 `open_url`（系统默认程序）；命令串支持引号（`parse_command_line`），`路径:行:列` 作为**单个参数**追加；远程会话不打开本地编辑器
+- **右 Option 组合字符**（Kaku：左 Meta、右 Compose）：`option_side` 字段跟踪 `Key::AltLeft`/`AltRight` 的按下抬起；右 Option 的组合字符经 Text 事件上屏，左 Option 保持 ESC 前缀（egui 的 `Modifiers::alt` 不带左右信息，只能自己跟踪）
+- **窗口不透明度 / 毛玻璃**（Kaku `window_background_opacity` / `macos_window_background_blur`）：`theme::window_opacity()` 进程级静态 + `apply_window_alpha()`，终端背景与标题条/标签栏/SFTP 面板取色统一叠加（只作用于终端**默认背景**，显式着色的 cell 背景保持不透明——对应 Kaku 的 `window_background_opacity` 与 `text_background_opacity = 1.0` 分工）；< 1.0 或模糊 > 0 时 `main` 以 `with_transparent(true)` 建窗口（**窗口是否透明在创建时定死**，运行中改配置只改配色，提示重启）；macOS 毛玻璃用 `NSVisualEffectView`（`native::apply_window_blur`，插在 contentView 最底层）；AppKit 不暴露模糊半径，数值只区分开/关
+- **窗口尺寸/位置记忆**（Kaku `state.json` 的 `window_geometry`/`window_position`）：退出时写入 `snapshot.toml`（`window_size`/`window_position`，外框位置 + 内框尺寸），启动 `restored_window_geometry()` 读取并 `with_inner_size`/`with_position`（有位置记录时不再 `centered`）；越界坐标（\|x\|,\|y\| > 32000）与不合理尺寸（< 200×150）按无记录处理
+- **块字形无缝**：Kaku 用 `custom_block_glyphs` 自绘块/制表字形；Mino 依赖打包的 JetBrains Mono（块字形覆盖整行高、相邻行自然重叠），像素级回归测试 `块字形无缝拼接` 守卫（满块区域内不许出现整行/整列的背景色）。注意该测试按"与背景亮度差"判定前景（主题可能是浅底深字）
 
 ## 覆盖层（v2.0）
 
@@ -195,12 +210,12 @@ crates/
 
 ## 窗口快照（v2.0）
 
-- `App::on_exit` 保存 `snapshot.toml`（与 hosts.toml 同目录，0600 原子写）：每个标签记 `SessionOrigin`（本地含目录；SSH 含完整档案）——**含明文认证信息**，权限与 hosts.toml 同级；⌘⌥⇧T `restore_window_snapshot` 追加式恢复（不销毁当前会话）；损坏/缺失按「没有快照」处理
+- `App::on_exit` 保存 `snapshot.toml`（与 hosts.toml 同目录，0600 原子写）：每个标签记 `SessionOrigin`（本地含目录；SSH 含完整档案）——**含明文认证信息**，权限与 hosts.toml 同级；另记 `window_size`/`window_position`（窗口几何记忆，启动恢复）；⌘⌥⇧T `restore_window_snapshot` 追加式恢复（不销毁当前会话）；损坏/缺失按「没有快照」处理
 
 ## 关键约定
 
 - 集成测试依赖本地测试 sshd：`/usr/sbin/sshd -f /tmp/mino-test-sshd/sshd_config`（端口 2222、公钥认证、含 sftp subsystem）；启动方式 `bash scripts/test-sshd.sh start`
-- 配置文件：`~/.config/mino/hosts.toml`（统一 `[[workspaces]]`，`kind = "local" | "ssh"`；SSH 认证枚举用内部标记：`[workspaces.auth.Key]`；旧 `hosts`/`projects` 只读迁移、保存不再写回）；**保存走原子写**（临时文件带 pid + fsync + rename 覆盖 + 父目录条目同步，进程被杀/磁盘满不会截断或清空配置）；**加载失败绝不静默清空**——文件存在但解析失败时先备份为 `hosts.toml.bak` 再按空配置启动并 toast 提示（`MinoApp::new_with_config`）
+- 配置文件：`~/.config/mino/hosts.toml`（统一 `[[workspaces]]`，`kind = "local" | "ssh"`；SSH 认证枚举用内部标记：`[workspaces.auth.Key]`；旧 `hosts`/`projects` 只读迁移、保存不再写回）。**偏好字段**与工作区同文件：`appearance`、`font_size`、`file_link_editor`、`window_background_opacity`、`macos_window_background_blur`（都在设置弹窗「外观」卡片里可改，滑杆/输入框即时落盘）；**保存走原子写**（临时文件带 pid + fsync + rename 覆盖 + 父目录条目同步，进程被杀/磁盘满不会截断或清空配置）；**加载失败绝不静默清空**——文件存在但解析失败时先备份为 `hosts.toml.bak` 再按空配置启动并 toast 提示（`MinoApp::new_with_config`）
 - **崩溃日志 `~/.config/mino/crash.log`**（`main.rs::crash_log_path`，**追加**写入，保留多次崩溃历史；写失败回落 `/tmp/mino-panic.log`）——Finder/Dock 启动时 stderr 无人接收，闪退现场只能靠文件留存。下次启动 `take_crash_report`（与配置同目录，测试传隔离路径）**归档为 `crash.log.1` 并 toast 提示路径**（归档而非删除：日志是用户报告闪退的唯一证据；归档保证同一个崩溃不反复提示）；测试构建跳过该检查（`#[cfg(not(test))]`），行为由 `崩溃日志取走后归档` 单测覆盖
 - **测试绝不能读写用户真实配置**：`MinoApp::new` 使用 `default_config_path()`（用户真实 `~/.config/mino/hosts.toml`），涉及配置读写的测试必须走 `MinoApp::new_with_config(cc, test_config_path("标签"))`（`/tmp/mino-test-config-{tag}-{pid}.toml` 隔离路径）——**曾发生测试直接 save + remove_file 用户真实 hosts.toml：跑一次 `cargo test` 就覆盖并删除用户主机列表一次（表现为"每次更新新版本后主机全部消失"）**
 - 应用图标：`assets/icon.png`（**黑底圆角 + 白色 `>` + 磷光绿光标块，四周留透明边距**，`scripts/make-icon.swift` 绘制，与应用内品牌 logo 同构图）→ `load_icon()` 解码为 IconData → `ViewportBuilder::with_icon`——**eframe 在 macOS 上通过 NSApp 运行时设置 Dock 图标**，无 .app bundle 的 debug 构建也能生效；`.app` 安装版的 Dock 图标由 package-macos.sh 的 mino.icns 提供（同一绘制源）。**图标必须留透明边距：占满画布的无边距图标会被 macOS Dock 放大显示（比邻图标大一圈）**。**make-icon.swift 必须用 `NSBitmapImageRep` 位图上下文渲染（`NSImage.lockFocus` 在 Retina 屏按 2x 渲染导致输出尺寸翻倍）**
@@ -216,7 +231,11 @@ crates/
 ## 验证
 
 ```bash
- cargo test --workspace -- --test-threads=1   # 单元 + ssh/sftp 集成（需 scripts/test-sshd.sh start）+ UI 渲染 + 字体链 + 标签页（标题条双击 zoom/拖拽）+ 分屏拆分与关闭窗格 + Kaku 快捷键族（⌘F 搜索/⌘K/⌘L/⌘O）+ 标签导航与命令面板 + 窗口快照保存恢复 + 工作区（菜单/面板/管理器/收藏/迁移）+ AI 面板与建议路径 + 表单默认值 + 设置弹窗 + scrollback + 完整应用回车 + TOFU 主机密钥校验 + F 键修饰编码 + SFTP 时间换算/列对齐 + 单击选中双击目录进入 + 中文宽字符列对齐（像素级）+ 字号滑块轨道可辨（像素级）+ 标签标题跟随当前目录 + IME 候选窗跟随光标 + 终端能力应答（OSC 颜色查询/焦点上报/同步更新 2026 混包改写，需 python3）+ 全屏程序字节流下行缓存一致（5 字节分片注入 vim/omp 类序列）+ 崩溃日志归档 + 后台会话异步挂载 + 写回队列有界 + 死锁回归；注意 sftp/ssh 集成测试需先 `bash scripts/test-sshd.sh start`
+ cargo test --workspace -- --test-threads=1   # 单元 + ssh/sftp 集成（需 scripts/test-sshd.sh start）+ UI 渲染
+#   B 组对齐（v2.0）新增/守卫：分屏间隙 5 字宽、标签「父/子」与 [Z]、窗口标题 [i/n]、
+#   COLORFGBG、OSC 9;4 注意力点、拖选滚轮扩展、替代屏无可滚历史（哨兵）、文件链接编辑器
+#   （真实启动假编辑器收参数）、右 Option 组合字符、窗口不透明度叠加、窗口特效配置、
+#   窗口几何记忆与保存、外观卡片控件、块字形无缝（像素级，真实字体链） + 字体链 + 标签页（标题条双击 zoom/拖拽）+ 分屏拆分与关闭窗格 + Kaku 快捷键族（⌘F 搜索/⌘K/⌘L/⌘O）+ 标签导航与命令面板 + 窗口快照保存恢复 + 工作区（菜单/面板/管理器/收藏/迁移）+ AI 面板与建议路径 + 表单默认值 + 设置弹窗 + scrollback + 完整应用回车 + TOFU 主机密钥校验 + F 键修饰编码 + SFTP 时间换算/列对齐 + 单击选中双击目录进入 + 中文宽字符列对齐（像素级）+ 字号滑块轨道可辨（像素级）+ 标签标题跟随当前目录 + IME 候选窗跟随光标 + 终端能力应答（OSC 颜色查询/焦点上报/同步更新 2026 混包改写，需 python3）+ 全屏程序字节流下行缓存一致（5 字节分片注入 vim/omp 类序列）+ 崩溃日志归档 + 后台会话异步挂载 + 写回队列有界 + 死锁回归；注意 sftp/ssh 集成测试需先 `bash scripts/test-sshd.sh start`
 cargo clippy --workspace --all-targets   # 零警告
 cargo fmt --all
 ```
