@@ -221,6 +221,16 @@ cargo clippy --workspace --all-targets   # 零警告
 cargo fmt --all
 ```
 
+**自管 GPU 路径（v2.0 起）**：kittest 默认 harness 没有 wgpu 后端（`terminal_gpu = None`，
+走 egui 回退），实机验证用其一：
+- 真实应用：`cargo run -p mino-app` 目视（窗口截图需屏幕录制权限，
+  `screencapture -l <CGWindowID>` 同样受该权限约束）；
+- 临时 wgpu 测试：`egui_kittest::Harness::builder().wgpu().build_eframe(|cc| MinoApp::new_with_config(...))`
+  —— `.wgpu()` 注入 `cc.wgpu_render_state`，应用走自管 GPU 回调路径，
+  `harness.render()` 返回 Metal 渲染的真实像素（可断言行内容/叠加层；已实测
+  命令输出/分屏/搜索浮层/右键菜单/标签导航均正常）。该测试依赖本机 GPU 适配器，
+  **不要提交进常驻套件**（无适配器环境会挂）。
+
 ## 发布流程
 
 - 版本发布必须先把代码合并到 `main`，再在 `main` 上打 `v<主>.<次>.<补丁>` 标签触发 Release 工作流；禁止在功能/诊断分支上直接打 tag 发布

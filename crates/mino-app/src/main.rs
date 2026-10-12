@@ -610,6 +610,14 @@ mod font_tests {
                     "JetBrains Mono 应自带 {ch} 字形"
                 );
             }
+            // 箭头（搜索浮层 ↑/↓ 与设置列表按钮）：等宽链里必须有字形——
+            // 缺了它界面会静默显示方块（按 label 断言的测试不会发现）。
+            for ch in ["↑", "↓"] {
+                assert!(
+                    f.has_glyphs(&egui::FontId::monospace(13.0), ch),
+                    "等宽链应覆盖 {ch}（符号兜底字体的职责）"
+                );
+            }
             // 浅色主题粗体（SemiBold 命名族）链路完整：常见字符 + Nerd 图标。
             let semi = egui::FontId::new(13.0, FontFamily::Name(MONO_FAMILY_LIGHT_BOLD.into()));
             for ch in ["A", "中", "\u{f08c0}"] {
